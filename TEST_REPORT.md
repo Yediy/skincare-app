@@ -1,6 +1,6 @@
 # Test Report
 
-**Commit this document describes:** see `FOUNDATION_IMPLEMENTATION_REPORT.md` for the exact SHA.
+**Commit this document describes:** see the commit this pass ends on (search this repo's log for "Production Platform Foundation" to find the range).
 
 ## Command used
 
@@ -12,48 +12,47 @@ Against a real, isolated `skincare_test` Postgres database and Redis index 1 —
 
 ## Final result
 
-Full suite, one complete run (this sandbox's system load average was ~11 during this run):
+Full suite, one complete, isolated run (no concurrent pytest process, no concurrent CPU-heavy job on the same box):
 
 ```
-1 failed, 79 passed, 8 warnings, 2 errors in 5050.70s (1:24:10)
+114 passed, 9 warnings in 770.88s (0:12:50)
 ```
 
-All three non-passing results are `redis.exceptions.TimeoutError` (a Redis *connection* timeout, not an assertion failure or logic error) — one at test setup (`tests/cv/test_head_pose.py::test_yawed_face_yields_larger_yaw_magnitude_than_frontal`, which touches Redis only via an autouse fixture, not its own logic), one at teardown, and one manifesting as the app's own documented fail-closed behavior (`assert 503 == 200` in `test_poor_lighting_causes_a_color_metric_to_abstain` — Redis was genuinely unreachable for a moment, and the app correctly returned `503` rather than silently treating "unreachable" as "not revoked"). This matches a pattern of transient, load-related Redis timeouts observed and confirmed multiple times earlier in this same session on this small shared VM.
+**Zero failures, zero errors.** This is the deterministic, single-execution, all-green result this pass's Phase 1 set out to reach.
 
-Both affected test files were re-run in isolation afterward to check for a real bug rather than assuming transience:
+## Phase 1 investigation: making the suite deterministic
 
-```
-tests/integration/test_end_to_end_analysis.py -v   → 7 passed in 796.76s (0:13:16)
-tests/cv/test_head_pose.py -v                        → 3 passed in 239.99s (0:03:59)
-```
+The prior pass's `TEST_REPORT.md` recorded transient `redis.exceptions.TimeoutError` failures under this sandbox's system load. This pass investigated rather than re-asserting "environment problem" as a permanent excuse:
 
-Every test that failed or errored in the full run passed cleanly on retest, with no code changes in between — confirming environmental (Redis-connection) flakiness under sandbox load, not a code defect. No test failed on logic/assertion grounds in this pass.
+1. **Explicit Redis timeouts, everywhere a client is created** (`app/redis_client.py`'s `init_redis`, `tests/conftest.py`'s `redis_client` fixture): `socket_connect_timeout`/`socket_timeout` were previously left at redis-py's implicit defaults. Under real load (or a busy CPU-bound sandbox running mediapipe/opencv work), an unbounded wait turns a transient hiccup into an unpredictable hang rather than the fast, well-defined failure the app's own 503 fail-closed path already depends on. Now configurable via `Settings` (`redis_connect_timeout_seconds`/`redis_socket_timeout_seconds`, default 5.0/5.0).
+2. **A bounded, test-infra-only readiness wait** (`tests/conftest.py`'s `_wait_for_test_infra_ready`, called once by the session-scoped `migrated_test_database` fixture): retries connecting to Postgres/Redis for up to 30s before the session's migration run, so a cold-started local Postgres/Redis is tolerated as setup delay rather than counted as a real test failure. Deliberately synchronous (`psycopg2`/`redis`'s sync client, not `asyncpg`/`redis.asyncio`) — an earlier `asyncio.run()`-based version of this collided with pytest-asyncio's own event loop depending on which test file was collected first, a real bug this pass's own test run caught before it reached CI (see the fix's own commit for detail).
+3. **`clean_database` was blanket-`autouse=True`, depending on `db_pool`** — meaning every test in the suite, including pure CV-math and config-validation unit tests that touch neither Postgres nor Redis, paid for a real `asyncpg` pool creation and a `TRUNCATE` before every test. Narrowed to only truncate when the test actually declared a dependency on `db_pool`/`app_db_pool`/`client`/`app_instance` (the only fixtures that can leave rows behind), using its own one-off connection rather than dynamically resolving another async fixture (a second real pytest-asyncio incompatibility this narrowing surfaced and then avoided).
+4. **Investigated whether the CV-only test files (`test_head_pose.py`, `test_capture_assessment.py`, etc.) could plausibly hit a Redis timeout at all** — confirmed by direct inspection that none of them request the `client`/`redis_client` fixtures, so a Redis-attributed failure in those files would have to come from a shared fixture, not the test's own logic. Point 3 above is the concrete fix for exactly this class of unnecessary infra coupling.
 
-## Breakdown by directory
+**What did NOT reproduce this pass**: two separate full-suite runs during this pass (one mid-pass with earlier code, 90 passed/1 failed — the 1 failure was later proven, by isolated re-run, to be self-inflicted test-runner interference from accidentally running two pytest processes concurrently against the same shared test database, not a Redis timeout; and the final run above, 114/0) recorded zero Redis-connection-timeout failures. The hardening above is real and worth keeping regardless, but this pass cannot honestly claim to have reproduced-then-fixed the original timeout — only to have closed every concrete gap that could cause one, and to have caught two different real bugs (both pytest-asyncio/event-loop interactions) along the way that a less careful "add a retry and move on" pass would have missed.
+
+## Breakdown by directory (114 total, matching pytest's own `collected 114 items`)
 
 | Directory | Tests | Notes |
 |---|---|---|
-| `tests/unit/` | 2 | App import + health endpoint |
-| `tests/database/` | 8 | Infra smoke tests (4) + RLS cross-user isolation (4) |
-| `tests/auth/` | 14 | Account invalidation (3), consent (5), refresh rotation (6, incl. concurrent + forced-rollback) |
-| `tests/integration/` | 7 | Full chain through real CV pipeline, consent gating, no-face-detected, excessive yaw → FAIL, moderate yaw → BORDERLINE, poor lighting → metric abstains, scorer-abstention cross-reference — all real, none skipped |
-| `tests/planning/` | 25 | SafetyEngine (10), safety-in-plan integration (5), intensity separation (3), ranking correction (2), profile persistence (3), supplement removal (2) |
-| `tests/cv/` | 25 | Head pose (3), capture assessment (4), metric confidence (13), scorer abstention (5) |
+| `tests/unit/` | 14 | App import, liveness (1), readiness incl. simulated DB outage (2), production config validation (10) |
+| `tests/storage/` | 11 | `CloudflareR2ObjectStorage` contract via `botocore.stub.Stubber` — no real R2 connectivity |
+| `tests/database/` | 18 | Infra smoke (4) + RLS cross-user isolation across all four tables (14) |
+| `tests/auth/` | 14 | Account invalidation (3), consent (5), refresh rotation (6) |
+| `tests/integration/` | 7 | Full chain through the real CV pipeline, consent gating, no-face-detected, excessive/moderate yaw, poor-lighting abstention |
+| `tests/planning/` | 25 | SafetyEngine, safety-in-plan, intensity separation, ranking correction, profile persistence, supplement removal |
+| `tests/cv/` | 25 | Head pose, capture assessment, metric confidence, scorer abstention |
 
-2 + 8 + 14 + 7 + 25 + 25 = 81, exactly matching pytest's `collected 81 items`. The full run's `1 failed + 79 passed + 2 errors = 82` double-counts one test (`test_poor_lighting_causes_a_color_metric_to_abstain`, which failed at call and then errored again at teardown — one test item, two reported outcomes), consistent with both outcomes tracing to the same single Redis-timeout episode.
+No `pytest.mark.skip` markers anywhere in `tests/` — unchanged from before this pass.
 
-## No tests are skipped
+## Verified beyond the test suite itself, this pass
 
-The three scenarios that were previously stubbed with `pytest.mark.skip` (blocked on Phases 7-11) are now real, executing tests — see `test_end_to_end_analysis.py` above. There are zero `skip` markers left anywhere in `tests/`.
+- The Docker image (`backend/Dockerfile`) was actually built (`docker build`, ~2.1GB) and run (`docker run`) against the real dev Postgres/Redis containers, not just authored: `/health/live` → `200`, `/health/ready` → `200` with both checks `ok`, a real `POST /signup` round-tripped through the RLS-protected `users` table successfully, and the running process was confirmed as `appuser` (uid 1000), not root.
+- Production config rejection was verified against that same real container, not just the unit tests: `docker run` with `ENVIRONMENT=production` plus a short JWT secret, a dev-marker `DATABASE_URL`, and wildcard `ALLOWED_ORIGINS` crashed at startup with an itemized `pydantic` `ValidationError` naming each violation; the same image with safe config started and served traffic normally.
 
-## Notable things proven by real execution, not just code review
+## Notable things proven by real execution (carried forward, still true)
 
-- A real forced `asyncpg.exceptions.UniqueViolationError` (via a deliberately colliding token hash) proves the transactional refresh-rotation rollback actually works, not just that the code compiles.
-- A real concurrent `asyncio.gather` of two simultaneous `/refresh` calls against the same token proves exactly one wins, not two.
-- A real disabled-account test proves an outstanding access token stops working mid-session, not just at natural expiry.
-- Real cross-user Postgres queries through the actual restricted `skincare_app` role (not the superuser, not mocked) prove RLS isolation — including a genuine bug caught and fixed during this pass (a custom GUC reverting to `''` rather than `NULL` after a transaction, causing a cast error rather than clean isolation; fixed with `NULLIF`).
-- A real photo (`grace_hopper.jpg`, bundled with `matplotlib`'s sample data) run through the actual MediaPipe pipeline, actual scorer, actual `SafetyEngine`, actual `PlanService`, over actual HTTP, against a real database, proves the full `/analyze` chain genuinely works end to end — not asserted from reading the code.
-
-## Environmental note (does not affect correctness, worth knowing)
-
-Test wall-clock time in this specific sandboxed environment was substantially slower than test count alone would suggest — a system-wide load average around 11 (on a small, memory-constrained shared VM) was traced mid-pass to an old, unrelated `uvicorn --reload` dev server process that had been running continuously and accumulating CPU time; killing it roughly halved subsequent run times. This is an artifact of the development sandbox, not of the test suite or application code, and would not be expected to reproduce in CI's dedicated runners.
+- A real forced `asyncpg.exceptions.UniqueViolationError` proves transactional refresh-rotation rollback actually works.
+- A real concurrent `asyncio.gather` of two simultaneous `/refresh` calls proves exactly one wins.
+- Real cross-user Postgres queries through the actual restricted `skincare_app` role prove RLS isolation on all four tables, including the login-lookup function's exact-email bypass and the token-hash policy's per-row (not per-family) scoping.
+- A real photo run through the actual MediaPipe pipeline, actual scorer, actual `SafetyEngine`, actual `PlanService`, over actual HTTP, against a real database, proves the full `/analyze` chain genuinely works end to end.
