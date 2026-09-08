@@ -31,7 +31,6 @@ class PlanService:
         eye_care = self._build_eye_care(priority_ids, categories)
         facial_toning = self._build_facial_toning(priority_ids)
         lifestyle = self._build_lifestyle(priority_ids)
-        supplement_recommendations = self._build_supplement_recommendations(priority_ids)
 
         plan = {
             "top_priorities": [
@@ -50,7 +49,6 @@ class PlanService:
             "eye_care": eye_care,
             "facial_toning": facial_toning,
             "lifestyle": lifestyle,
-            "supplement_recommendations": supplement_recommendations,
             "capture_quality": {
                 "score": capture_quality,
                 "assessment": self._assess_capture_quality(capture_quality),
@@ -292,33 +290,6 @@ class PlanService:
         return {
             "recommendations_by_category": grouped,
             "quick_wins": [rec for rec in lifestyle_recs if rec["impact"] == "high"][:3]
-        }
-
-    def _build_supplement_recommendations(self, priority_ids: List[str]) -> Optional[Dict]:
-        supplement_map = {
-            "EVENNESS_TONE": ["Vitamin C (1000mg)", "Glutathione"],
-            "REDNESS_CONTROL": ["Omega-3 fatty acids", "Probiotics"],
-            "TEXTURE_SMOOTHING": ["Collagen peptides", "Vitamin A"],
-            "UNDER_EYE_SHADOWS": ["Iron (if deficient)", "Vitamin K"],
-            "FEATURE_DEFINITION": ["Protein powder", "Creatine"]
-        }
-
-        supplements = []
-        seen = set()
-
-        for pid in priority_ids:
-            if pid in supplement_map:
-                for supp in supplement_map[pid]:
-                    if supp not in seen:
-                        seen.add(supp)
-                        supplements.append({"name": supp, "purpose": f"Supports {PRIORITIES[pid].label.lower()}", "priority_link": pid})
-
-        if not supplements:
-            return None
-
-        return {
-            "supplements": supplements,
-            "disclaimer": "Consult healthcare provider before starting any supplement regimen. These are suggestions based on common deficiencies related to your priorities."
         }
 
     def _assess_capture_quality(self, quality: float) -> str:
