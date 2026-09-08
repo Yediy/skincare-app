@@ -107,15 +107,6 @@ async def analyze(request: AnalyzeRequest, user_id: str = Depends(get_current_us
     }
 
 
-@app.get("/db-check")
-async def db_check():
-    from app.db.connection import get_db_pool
-    pool = get_db_pool()
-    async with pool.acquire() as conn:
-        count = await conn.fetchval("SELECT COUNT(*) FROM users")
-    return {"user_count": count}
-
-
 class SignupRequest(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8, max_length=72)
@@ -123,16 +114,30 @@ class SignupRequest(BaseModel):
 
 @app.post("/signup")
 async def signup(request: SignupRequest):
+    """
+    The new user's id is generated here in Python (not left to the
+    table's default gen_random_uuid()) so that app.current_user_id can
+    be set to it *before* the INSERT, in the same transaction. That's
+    required, not cosmetic: Postgres RLS applies the table's
+    SELECT-applicable policy to `RETURNING` too, so an INSERT whose
+    row doesn't satisfy that policy fails on RETURNING even though
+    WITH CHECK already passed -- a server-generated id could never be
+    known in advance to pre-satisfy it.
+    """
     from app.db.connection import get_db_pool
+    new_id = uuid.uuid4()
     password_hash = hash_password(request.password)
     pool = get_db_pool()
     try:
         async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id, email, created_at",
-                request.email,
-                password_hash,
-            )
+            async with conn.transaction():
+                await conn.execute("SELECT set_config('app.current_user_id', $1, true)", str(new_id))
+                row = await conn.fetchrow(
+                    "INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3) RETURNING id, email, created_at",
+                    new_id,
+                    request.email,
+                    password_hash,
+                )
     except UniqueViolationError:
         raise HTTPException(status_code=409, detail="An account with this email already exists.")
     return {"id": str(row["id"]), "email": row["email"], "created_at": row["created_at"].isoformat()}
@@ -151,11 +156,22 @@ class LoginRequest(BaseModel):
 
 @app.post("/login")
 async def login(request: LoginRequest):
+    """
+    The email lookup below goes through `login_lookup_by_email`, a
+    SECURITY DEFINER function (migration feb038fd05bd), not a direct
+    SELECT -- at this point in the flow no user_id/session context
+    exists yet for RLS to scope a direct table read by, and email
+    itself is caller-supplied rather than a secret, so it can't be
+    used as an RLS session-context key without that being no
+    restriction at all. Once the row is found, the rest of this
+    function knows a real user_id and sets app.current_user_id before
+    the refresh_tokens insert, same pattern as everywhere else.
+    """
     from app.db.connection import get_db_pool
     pool = get_db_pool()
     async with pool.acquire() as conn:
         user = await conn.fetchrow(
-            "SELECT id, password_hash FROM users WHERE email = $1",
+            "SELECT id, password_hash FROM login_lookup_by_email($1)",
             request.email,
         )
 
@@ -172,10 +188,12 @@ async def login(request: LoginRequest):
     expires_at = datetime.now(timezone.utc) + timedelta(days=settings.refresh_token_expire_days)
 
     async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO refresh_tokens (user_id, family_id, token_hash, expires_at) VALUES ($1, $2, $3, $4)",
-            user["id"], family_id, refresh_hash, expires_at,
-        )
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.current_user_id', $1, true)", str(user["id"]))
+            await conn.execute(
+                "INSERT INTO refresh_tokens (user_id, family_id, token_hash, expires_at) VALUES ($1, $2, $3, $4)",
+                user["id"], family_id, refresh_hash, expires_at,
+            )
 
     return {"access_token": access_token, "refresh_token": refresh_raw, "token_type": "bearer"}
 
@@ -197,6 +215,16 @@ async def refresh(request: RefreshRequest):
     used) is a separate transaction, deliberately opened after the first
     one has closed -- it must commit its family-wide revocation even
     though this request is about to fail with a 401.
+
+    refresh_tokens has row-level security (migration feb038fd05bd).
+    Both lookups by raw token below are genuinely pre-identity -- the
+    caller has proven nothing but possession of that one hash -- so
+    each sets app.current_token_hash (not app.current_user_id) as the
+    transaction's first statement, matching the token_hash-scoped
+    policy. Once a row is found, the owning user_id is known, so
+    app.current_user_id is set from it before any subsequent write
+    that touches other rows in the same family (which don't share that
+    one hash and need the user_id-scoped policy instead).
     """
     from app.db.connection import get_db_pool
     token_hash = hash_refresh_token(request.refresh_token)
@@ -204,6 +232,7 @@ async def refresh(request: RefreshRequest):
 
     async with pool.acquire() as conn:
         async with conn.transaction():
+            await conn.execute("SELECT set_config('app.current_token_hash', $1, true)", token_hash)
             row = await conn.fetchrow(
                 """
                 UPDATE refresh_tokens
@@ -220,6 +249,7 @@ async def refresh(request: RefreshRequest):
                 new_refresh_raw, new_refresh_hash = generate_refresh_token()
                 new_expires_at = datetime.now(timezone.utc) + timedelta(days=settings.refresh_token_expire_days)
 
+                await conn.execute("SELECT set_config('app.current_user_id', $1, true)", str(user_id))
                 await conn.execute(
                     "INSERT INTO refresh_tokens (user_id, family_id, token_hash, expires_at) VALUES ($1, $2, $3, $4)",
                     user_id, family_id, new_refresh_hash, new_expires_at,
@@ -231,12 +261,14 @@ async def refresh(request: RefreshRequest):
         # runs in its own transaction so the revocation below commits
         # even though we raise immediately after.
         async with conn.transaction():
+            await conn.execute("SELECT set_config('app.current_token_hash', $1, true)", token_hash)
             existing = await conn.fetchrow(
-                "SELECT family_id, used_at, revoked_at FROM refresh_tokens WHERE token_hash = $1",
+                "SELECT user_id, family_id, used_at, revoked_at FROM refresh_tokens WHERE token_hash = $1",
                 token_hash,
             )
             if existing is not None and existing["used_at"] is not None and existing["revoked_at"] is None:
                 family_id = existing["family_id"]
+                await conn.execute("SELECT set_config('app.current_user_id', $1, true)", str(existing["user_id"]))
                 await conn.execute(
                     "UPDATE refresh_tokens SET revoked_at = now() WHERE family_id = $1 AND revoked_at IS NULL",
                     family_id,
@@ -253,19 +285,30 @@ class LogoutRequest(BaseModel):
 
 @app.post("/logout")
 async def logout(request: LogoutRequest):
+    """
+    Both statements now run inside one explicit transaction (not two
+    separate implicit ones) so that app.current_token_hash, set before
+    the lookup, and app.current_user_id, set from its result before
+    the family-wide revocation, are both still in scope for the
+    UPDATE -- see the /refresh docstring for why refresh_tokens needs
+    two different session GUCs.
+    """
     from app.db.connection import get_db_pool
     token_hash = hash_refresh_token(request.refresh_token)
     pool = get_db_pool()
 
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT family_id FROM refresh_tokens WHERE token_hash = $1", token_hash)
-        if row is None:
-            raise HTTPException(status_code=401, detail="Invalid refresh token")
-        family_id = row["family_id"]
-        await conn.execute(
-            "UPDATE refresh_tokens SET revoked_at = now() WHERE family_id = $1 AND revoked_at IS NULL",
-            family_id,
-        )
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.current_token_hash', $1, true)", token_hash)
+            row = await conn.fetchrow("SELECT user_id, family_id FROM refresh_tokens WHERE token_hash = $1", token_hash)
+            if row is None:
+                raise HTTPException(status_code=401, detail="Invalid refresh token")
+            family_id = row["family_id"]
+            await conn.execute("SELECT set_config('app.current_user_id', $1, true)", str(row["user_id"]))
+            await conn.execute(
+                "UPDATE refresh_tokens SET revoked_at = now() WHERE family_id = $1 AND revoked_at IS NULL",
+                family_id,
+            )
 
     r = get_redis()
     await r.set(f"revoked_family:{family_id}", "1", ex=settings.access_token_expire_minutes * 60)
@@ -291,10 +334,12 @@ async def logout_all(user_id: str = Depends(get_current_user)):
 
     pool = get_db_pool()
     async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL",
-            uuid.UUID(user_id),
-        )
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.current_user_id', $1, true)", user_id)
+            await conn.execute(
+                "UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL",
+                uuid.UUID(user_id),
+            )
 
     return {"detail": "Logged out of all sessions"}
 
@@ -309,20 +354,26 @@ async def delete_account(user_id: str = Depends(get_current_user)):
     revoked and the Redis family/user markers are set as defense in
     depth, but a stale/expired Redis key can never leave a deleted
     account's existing access tokens usable, unlike the reverse.
+
+    Both tables' RLS policies key off the same app.current_user_id GUC,
+    so one set_config() at the top of one explicit transaction covers
+    both statements.
     """
     from app.db.connection import get_db_pool
     pool = get_db_pool()
     user_uuid = uuid.UUID(user_id)
 
     async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE users SET is_active = false, deleted_at = now() WHERE id = $1",
-            user_uuid,
-        )
-        await conn.execute(
-            "UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL",
-            user_uuid,
-        )
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.current_user_id', $1, true)", user_id)
+            await conn.execute(
+                "UPDATE users SET is_active = false, deleted_at = now() WHERE id = $1",
+                user_uuid,
+            )
+            await conn.execute(
+                "UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL",
+                user_uuid,
+            )
 
     r = get_redis()
     now_ts = datetime.now(timezone.utc).timestamp()

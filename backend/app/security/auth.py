@@ -40,12 +40,23 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> str:
     # request from the moment the DB row changes, with no dependency on
     # any TTL surviving long enough to cover the access token's own
     # remaining lifetime.
+    #
+    # users has row-level security (see migration feb038fd05bd): this
+    # is the self-lookup-by-id path, so app.current_user_id is set to
+    # the JWT's own claimed subject as the first statement of an
+    # explicit transaction, same pattern as profile_repository.py. The
+    # JWT signature is already verified above -- RLS here is defense
+    # in depth against a query bug reading another user's row, not the
+    # authentication step itself.
     try:
         pool = get_db_pool()
-        user = await pool.fetchrow(
-            "SELECT is_active, deleted_at FROM users WHERE id = $1",
-            uuid.UUID(user_id),
-        )
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("SELECT set_config('app.current_user_id', $1, true)", user_id)
+                user = await conn.fetchrow(
+                    "SELECT is_active, deleted_at FROM users WHERE id = $1",
+                    uuid.UUID(user_id),
+                )
     except (asyncpg.PostgresError, OSError):
         raise HTTPException(status_code=503, detail="Authentication service temporarily unavailable")
 
