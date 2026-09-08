@@ -1,91 +1,50 @@
-# Architecture — As It Actually Exists
+# Architecture — Current State
 
-**This describes only what is present in the repository at commit `f9dc5cd`, verified by direct file inspection.** It intentionally does not describe any planned auth, database, billing, or mobile architecture — none of that exists yet.
+**Commit this document describes:** see `FOUNDATION_IMPLEMENTATION_REPORT.md` for the exact SHA (this file and that one were written/committed together, at the end of the same pass).
 
-## What this repository actually is
+This describes the application as it **actually exists right now**, verified by direct inspection and, where noted, real test execution — not what was planned or described in any prior conversation. Status taxonomy used throughout: `VERIFIED_IMPLEMENTED`, `PARTIALLY_IMPLEMENTED`, `NOT_IMPLEMENTED`, `IMPLEMENTED_BUT_UNTESTED`, `IMPLEMENTED_INCORRECTLY`.
 
-A standalone Python **domain-logic prototype** for turning a face photo into a skincare plan. It is a set of plain, importable Python classes with no web framework wired up, no database, no tests, and no mobile client. It cannot currently be run as a service — there is no server entrypoint.
+## What this repository is
 
-## Directory layout (tracked code only)
+A FastAPI backend (`backend/app/main.py`) with real authentication, a real Postgres database (behind a restricted, non-superuser runtime role with row-level security on two tables), a real CV pipeline (MediaPipe landmarks → 8 skin/face metrics, still unstructured bare floats), a real domain-driven planning/safety layer, and a real pytest suite with CI. No mobile app exists (the `mobile/` directory is empty scaffolding). No offer/product catalog exists.
 
-```
-backend/
-  app/
-    cv/               ← real code: image → face landmarks → 8 skin metrics + a quality score
-      face_landmarks.py     FaceLandmarkExtractor (MediaPipe FaceMesh), region cropping
-      metric_extractors.py  SkinMetricExtractor: 8 metrics from landmark regions
-      capture_quality.py    CaptureQualityAssessor: single float quality score
-      pipeline.py           FacialAnalysisPipeline: orchestrates the above (UNUSED — no caller)
-    domain/
-      priorities.py    Static rule table: 8 PriorityDef entries across 4 pillars
-    ml/
-      scorer.py         FacialScorer/PriorityTrigger: metrics → triggered priorities + severity
-    services/
-      plan_service.py   PlanService: priorities → AM/PM routine, eye care, lifestyle, disclaimers
-    api/, api/v2/, db/, security/, middleware/, tasks/, schemas/, observability/
-                        ← all empty __init__.py stub packages, no content
-  requirements.txt      lists fastapi/pytest/alembic/jose/passlib/boto3/sentry/celery/cryptography
-                        — NONE of these are installed or imported anywhere in tracked code
-docker-compose.yml       postgres:15-alpine + redis:7-alpine only — no app container, no Dockerfile
-mobile/                  empty directory scaffolding, 0 files
-```
+## HTTP / API layer — `VERIFIED_IMPLEMENTED`
 
-## The one real data flow that exists (not wired to anything)
+Real FastAPI app (`app/main.py`), 15 routes: `/health`, `/signup`, `/login`, `/refresh`, `/logout`, `/logout-all`, `/me` (GET + DELETE), `/analyze`, `/profile` (GET + PUT), `/consent`, `/consent/withdraw`, `/db-check`. Startup wires a real Postgres pool and Redis client (`init_db_pool`/`init_redis`); `FacialAnalysisPipeline`, `FacialScorer`, `PlanService` are constructed once at import time and genuinely called from `/analyze` — this call chain is proven by a real end-to-end test running a real photo through it (`tests/integration/test_end_to_end_analysis.py::test_full_chain_good_capture_succeeds`).
 
-```
-image bytes
-  → FacialAnalysisPipeline.analyze()          [backend/app/cv/pipeline.py]
-      → FaceLandmarkExtractor.extract()       [cv/face_landmarks.py]  → MediaPipe FaceMesh landmarks
-      → CaptureQualityAssessor.assess()       [cv/capture_quality.py] → single float quality score
-          (raises LowQualityCaptureError if quality < 0.35 — analysis stops here)
-      → SkinMetricExtractor.compute_all_metrics() [cv/metric_extractors.py]
-          → 8 floats: evenness, redness, oiliness, texture, under_eye_darkness,
-                       puffiness, feature_definition, symmetry
-  → { metrics: {...8 floats...}, capture_quality: float }
-```
+## Authentication — `VERIFIED_IMPLEMENTED`
 
-**Nothing calls `FacialAnalysisPipeline`.** It is fully-formed, real image-processing code, but it is dead code from a running-system perspective — there is no route, no CLI, no test, nothing in the tracked repo that imports `app.cv.pipeline`.
+JWT access tokens + opaque, SHA-256-hashed refresh tokens with family IDs (`app/security/tokens.py`). Refresh rotation is transactional (`app/main.py`'s `/refresh`): old-token consumption and successor creation happen in one explicit Postgres transaction, proven to roll back coherently on a real forced `UniqueViolationError`, not a mock. Replay of a consumed token revokes the whole family via Redis (`revoked_family:{family_id}`), verified by minting a second token from the same family after a replay and confirming it's also rejected. `get_current_user` (`app/security/auth.py`) checks Redis revocation *and* `users.is_active`/`deleted_at` directly against Postgres on every request — a disabled/deleted account's outstanding access tokens stop working immediately, not just at natural JWT expiry, verified with a real test disabling an account mid-session. Redis unreachability fails closed (`503`), distinct from `401`, both tested.
 
-## The one other real data flow that exists (also not wired to an entrypoint, but self-consistent)
+## Consent — `VERIFIED_IMPLEMENTED`
 
-```
-{8 metric floats} + capture_quality + optional historical_priorities
-  → FacialScorer.compute_scores()             [backend/app/ml/scorer.py]
-      → for each of the 8 PriorityDef entries in domain/priorities.py:
-          PriorityTrigger.should_trigger() compares metric value to severity_threshold,
-          scales by capture_quality and historical persistence
-      → { scores: {4 pillar scores}, insights: {4 pillars: triggered priority IDs + severities} }
+`consent_events` (append-only; `withdrawn_at` on the active row is the one narrow, deliberate exception) gates `/analyze` on a valid, current-policy-version grant (`app/db/consent_repository.py`). An old policy version or a withdrawn grant both correctly deny analysis; re-consenting to the current version restores access. Verified with 5 real tests plus the E2E test.
 
-  → PlanService.generate_plan(scores, insights, user_profile, capture_quality)
-      [backend/app/services/plan_service.py]
-      → ranks triggered priorities by severity + pillar weight + display order
-      → _apply_compatibility_constraints(): drops priorities incompatible with
-          pregnancy/nursing (real exclusion) or beginner intensity (real exclusion);
-          allergy/avoid_ingredients data is captured into a constraints dict but never read
-      → builds AM routine, PM routine, eye care block, facial toning block, lifestyle
-          recommendations, and supplement recommendations (unconditional, from photo-derived
-          priorities — no gating flag exists to suppress this)
-      → returns one plan dict with disclaimers and metadata
-```
+## User profile persistence — `VERIFIED_IMPLEMENTED`
 
-Both `FacialScorer` and `PlanService` are plain, synchronous, framework-free Python classes. They accept plain dicts in and return plain dicts out — nothing here depends on FastAPI, a database, or any web concept. They could be called from a script or a notebook today, but there is no code anywhere in the repo that does so.
+`user_profiles` table + `app/db/profile_repository.py` replaces the old hardcoded placeholder profile in `/analyze` (`is_pregnant=False, has_sensitive_skin=False, experience_level="beginner"` for literally every user, regardless of who they were). A documented `DEFAULT_PROFILE` is used only when a user has never set one — never a silent, unlabeled guess.
 
-## What does not exist, at all
+## Database — `VERIFIED_IMPLEMENTED` (schema/migrations), `PARTIALLY_IMPLEMENTED` (isolation)
 
-- **No web/API layer.** `app/api/` and `app/api/v2/` are empty packages. No route, no request/response schema (`app/schemas/` is empty), no ASGI app object, no `main.py`.
-- **No database.** `app/db/` is empty. No SQLAlchemy/asyncpg models, no queries, no connection pooling code. `docker-compose.yml` starts a bare Postgres container with no app-level role, schema, or RLS policy — just the vendor default `postgres` superuser.
-- **No migrations.** `backend/migrations/versions/` exists as an empty directory; Alembic is not configured (no `alembic.ini`, no `env.py`).
-- **No auth.** `app/security/` is empty. No JWT issuance/verification, no refresh tokens, no session model, despite `python-jose` and `passlib` being requirements-listed.
-- **No middleware.** `app/middleware/` is empty — no rate limiting, no request logging, no auth guard.
-- **No background tasks.** `app/tasks/` is empty; `celery` is requirements-listed but never imported.
-- **No observability.** `app/observability/` is empty; `sentry-sdk` is requirements-listed but never imported or initialized.
-- **No billing/webhooks.** No RevenueCat, Stripe, or any payment-provider integration exists anywhere.
-- **No offer/product catalog.** No `offer_repository.py` or equivalent exists; there is nothing that maps a priority to an actual purchasable product, and no commission/affiliate concept exists.
-- **No safety engine.** No `SafetyEngine`/`SafetyDecision` abstraction exists — the only filtering logic is the inline `_apply_compatibility_constraints` method inside `PlanService`.
-- **No tests.** No `tests/` directory exists anywhere in the repository, for any layer.
-- **No mobile app.** `mobile/` is an empty directory tree (10 empty subdirectories, 0 files).
-- **No Docker image for the app itself.** `docker-compose.yml` only runs the two infra dependencies (Postgres, Redis); there is no `Dockerfile`, `.dockerignore`, or app container definition.
+7 migrations, clean chain from empty database to head, verified by a real Alembic run in CI and in this session. Tables: `users`, `refresh_tokens`, `user_profiles`, `consent_events`. The application's runtime connection now uses a restricted `skincare_app` role (`rolsuper=false, rolcreatedb=false, rolcreaterole=false, rolbypassrls=false`, owns no tables — confirmed by direct `pg_roles` query), not the `postgres` superuser. Row-level security is enabled on `user_profiles` and `consent_events` only, verified with real cross-user Postgres integration tests (User A cannot read/update/delete User B's rows; a reused pooled connection does not leak context between transactions). **`users` and `refresh_tokens` are explicitly not RLS-scoped** — see `SECURITY_AND_SAFETY_NOTES.md` for why, and `OPEN_ENGINEERING_ITEMS.md` for this as a tracked follow-up.
 
-## Practical implication
+## Computer vision — `PARTIALLY_IMPLEMENTED`, unchanged from before this pass
 
-This repo is at the stage of "the core scoring/planning math has a first draft," not "a service exists that can be deployed, hardened, or load-tested." Any discussion of auth hardening, RLS, encryption-at-rest, billing correctness, or rate-limiting is premature relative to what's on disk — those layers haven't been started, so there is nothing yet to harden. See `OPEN_ENGINEERING_ITEMS.md` for what's actually left, roughly in build order.
+MediaPipe FaceMesh landmarks → 8 metrics (`evenness_score`, `redness_score`, `oiliness_score`, `texture_score`, `under_eye_darkness`, `puffiness_score`, `feature_definition_score`, `symmetry_score`), each a bare float — no `MetricResult`, no per-metric confidence, no abstention. Capture quality is a single blended float from sharpness/brightness/face-size/detection-confidence — no `CaptureAssessment`, no PASS/BORDERLINE/FAIL, no head pose, no yaw/pitch/roll. **Phases 7-11 of this pass's brief were not implemented** — see `CV_VALIDATION_LIMITATIONS.md` for the full, honest breakdown of what each metric actually measures and what corrupts it. This is the single largest gap remaining after this pass.
+
+## Planning and safety — `VERIFIED_IMPLEMENTED`
+
+`SafetyEngine`/`SafetyDecision` (`app/domain/safety_engine.py`) is real and wired into `PlanService.generate_plan()` — replacing the old undocumented inline pregnancy/nursing exclusion. Every priority and product-category candidate gets a `SafetyDecision` recorded in `plan.metadata.safety_decisions`. Allergy/avoid-ingredient enforcement is real, operating against a category-level `ProductSafetyProfile` adapter (`app/domain/product_safety.py`) — **not per-product**, since no product catalog exists in this repository; a missing safety profile fails closed (`SAFETY_DATA_UNAVAILABLE`), never silently "safe". Sensitive skin genuinely caps active-ingredient frequency (routine text reflects the real cap) rather than only appending a disclaimer. A beginner's advanced-default concern stays visible with a capped `effective_intensity` instead of being dropped outright. Ranking's `display_order` bonus was reduced from a dominant factor (up to 0.45) to a true tie-break (0.001/step) — documented as still an interim additive model pending real per-metric confidence data from a future Phase 9/10.
+
+## What does not exist, at all (confirmed by direct inspection this pass, same as before)
+
+- No billing/subscription/webhook code of any kind.
+- No rate limiting or quota system of any kind.
+- No offer/product catalog (`offers` table or equivalent).
+- No mobile app source (`mobile/` is empty directory scaffolding).
+- No notification system.
+- No `Dockerfile`/`.dockerignore` for the application itself (only `docker-compose.yml`'s Postgres/Redis infra services).
+
+## Test foundation and CI — `VERIFIED_IMPLEMENTED`
+
+`backend/tests/{unit,integration,auth,cv,planning,database}/`, isolated from dev infra (separate `skincare_test` database, Redis index 1). GitHub Actions (`.github/workflows/ci.yml`) runs the full suite against real Postgres/Redis services on every push/PR. See `TEST_REPORT.md` for the exact test count and pass/fail breakdown from the final run of this pass.
