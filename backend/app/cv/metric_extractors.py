@@ -1,9 +1,12 @@
 import cv2
 import numpy as np
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 import logging
 
 from app.cv.face_landmarks import FACE_OVAL_INDICES, JAWLINE_CONTOUR_LEFT, JAWLINE_CONTOUR_RIGHT
+from app.cv.capture_assessment import CaptureAssessment
+from app.cv.metric_confidence import CONFIDENCE_FUNCTIONS, ABSTAIN_THRESHOLD, BORDERLINE_THRESHOLD
+from app.cv.metric_result import MetricResult, MetricStatus
 
 logger = logging.getLogger(__name__)
 
@@ -12,17 +15,52 @@ class SkinMetricExtractor:
     def __init__(self, landmark_extractor):
         self.extractor = landmark_extractor
 
-    def compute_all_metrics(self, image_bgr: np.ndarray, detection) -> dict:
-        metrics = {}
-        metrics["evenness_score"] = self._compute_evenness(image_bgr, detection)
-        metrics["redness_score"] = self._compute_redness(image_bgr, detection)
-        metrics["oiliness_score"] = self._compute_oiliness(image_bgr, detection)
-        metrics["texture_score"] = self._compute_texture(image_bgr, detection)
-        metrics["under_eye_darkness"] = self._compute_under_eye_darkness(image_bgr, detection)
-        metrics["puffiness_score"] = self._compute_puffiness(image_bgr, detection)
-        metrics["feature_definition_score"] = self._compute_feature_definition(detection)
-        metrics["symmetry_score"] = self._compute_symmetry(detection)
-        return metrics
+    def compute_all_metric_results(
+        self, image_bgr: np.ndarray, detection, capture: CaptureAssessment
+    ) -> Dict[str, MetricResult]:
+        """
+        Replaces the old compute_all_metrics() bare-float contract
+        (Phase 9): every metric now carries its own confidence
+        (Phase 10, computed from the real capture conditions -- not a
+        single blanket capture_quality applied to all 8 identically)
+        and can genuinely abstain (value=None) rather than silently
+        substituting a fallback number that looks like a measurement.
+        """
+        raw_values = {
+            "evenness_score": self._compute_evenness(image_bgr, detection),
+            "redness_score": self._compute_redness(image_bgr, detection),
+            "oiliness_score": self._compute_oiliness(image_bgr, detection),
+            "texture_score": self._compute_texture(image_bgr, detection),
+            "under_eye_darkness": self._compute_under_eye_darkness(image_bgr, detection),
+            "puffiness_score": self._compute_puffiness(image_bgr, detection),
+            "feature_definition_score": self._compute_feature_definition(detection),
+            "symmetry_score": self._compute_symmetry(detection),
+        }
+
+        results: Dict[str, MetricResult] = {}
+        for metric_name, raw_value in raw_values.items():
+            confidence_fn = CONFIDENCE_FUNCTIONS[metric_name]
+            confidence, uncertainty_reasons = confidence_fn(capture)
+
+            if confidence < ABSTAIN_THRESHOLD:
+                status = MetricStatus.ABSTAINED
+                value = None  # never a fallback midpoint -- an abstention has no value
+            elif confidence < BORDERLINE_THRESHOLD:
+                status = MetricStatus.BORDERLINE
+                value = raw_value
+            else:
+                status = MetricStatus.VALID
+                value = raw_value
+
+            results[metric_name] = MetricResult(
+                metric_name=metric_name,
+                value=value,
+                confidence=round(confidence, 3),
+                status=status,
+                uncertainty_reasons=uncertainty_reasons,
+            )
+
+        return results
 
     def _compute_evenness(self, image_bgr, detection):
         regions = ["forehead", "left_cheek", "right_cheek"]

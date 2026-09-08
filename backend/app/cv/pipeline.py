@@ -3,6 +3,8 @@ import numpy as np
 import logging
 from typing import Dict, Any
 
+from app.cv.capture_assessment import QualityStatus
+
 logger = logging.getLogger(__name__)
 
 
@@ -10,24 +12,30 @@ class NoFaceDetectedError(Exception):
     pass
 
 
-class LowQualityCaptureError(Exception):
-    def __init__(self, quality_score: float, threshold: float):
-        self.quality_score = quality_score
-        self.threshold = threshold
-        super().__init__(f"Capture quality {quality_score:.2f} below minimum {threshold:.2f}")
+class CaptureQualityFailedError(Exception):
+    """Raised when CaptureAssessment.quality_status == FAIL. Per Phase
+    7's explicit behavior contract: a FAILed capture must not proceed
+    to personalized measurement at all -- unlike BORDERLINE, which
+    still computes metrics but is flagged ineligible for longitudinal
+    comparison."""
+
+    def __init__(self, capture_assessment):
+        self.capture_assessment = capture_assessment
+        super().__init__(
+            f"Capture quality FAILED (overall_quality={capture_assessment.overall_quality:.2f}, "
+            f"reasons={capture_assessment.failure_reasons})"
+        )
 
 
 class FacialAnalysisPipeline:
-    MIN_ACCEPTABLE_QUALITY = 0.35
-
     def __init__(self):
         from app.cv.face_landmarks import FaceLandmarkExtractor
         from app.cv.metric_extractors import SkinMetricExtractor
-        from app.cv.capture_quality import CaptureQualityAssessor
+        from app.cv.capture_assessment import CaptureAssessor
 
         self.landmark_extractor = FaceLandmarkExtractor()
         self.metric_extractor = SkinMetricExtractor(self.landmark_extractor)
-        self.quality_assessor = CaptureQualityAssessor()
+        self.capture_assessor = CaptureAssessor()
 
     def analyze(self, image_bytes: bytes) -> Dict[str, Any]:
         image_bgr = self._decode_image(image_bytes)
@@ -36,15 +44,28 @@ class FacialAnalysisPipeline:
         if detection is None:
             raise NoFaceDetectedError("No face detected in the uploaded image")
 
-        quality_score = self.quality_assessor.assess(image_bgr, detection)
-        if quality_score < self.MIN_ACCEPTABLE_QUALITY:
-            raise LowQualityCaptureError(quality_score, self.MIN_ACCEPTABLE_QUALITY)
+        capture_assessment = self.capture_assessor.assess(image_bgr, detection)
+        if capture_assessment.quality_status == QualityStatus.FAIL:
+            raise CaptureQualityFailedError(capture_assessment)
 
-        metrics = self.metric_extractor.compute_all_metrics(image_bgr, detection)
+        metric_results = self.metric_extractor.compute_all_metric_results(
+            image_bgr, detection, capture_assessment
+        )
 
-        logger.info(f"Analysis complete: quality={quality_score:.2f}, metrics={metrics}")
+        logger.info(
+            f"Analysis complete: status={capture_assessment.quality_status.value}, "
+            f"overall_quality={capture_assessment.overall_quality:.2f}, "
+            f"yaw={capture_assessment.yaw:.1f} pitch={capture_assessment.pitch:.1f} roll={capture_assessment.roll:.1f}"
+        )
 
-        return {"metrics": metrics, "capture_quality": quality_score}
+        return {
+            "metric_results": metric_results,
+            "capture_assessment": capture_assessment,
+            # BORDERLINE captures still produce metrics (Phase 7's
+            # "limited feedback"), but must never be treated as a
+            # trustworthy baseline for future before/after comparison.
+            "eligible_for_longitudinal_comparison": capture_assessment.quality_status == QualityStatus.PASS,
+        }
 
     def _decode_image(self, image_bytes: bytes) -> np.ndarray:
         nparr = np.frombuffer(image_bytes, np.uint8)

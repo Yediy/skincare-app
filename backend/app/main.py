@@ -9,7 +9,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, EmailStr, Field
 
 from app.config import settings
-from app.cv.pipeline import FacialAnalysisPipeline, NoFaceDetectedError, LowQualityCaptureError
+from app.cv.pipeline import FacialAnalysisPipeline, NoFaceDetectedError, CaptureQualityFailedError
 from app.ml.scorer import FacialScorer
 from app.services.plan_service import PlanService
 from app.db.connection import init_db_pool, close_db_pool
@@ -71,16 +71,20 @@ async def analyze(request: AnalyzeRequest, user_id: str = Depends(get_current_us
         extraction_result = pipeline.analyze(image_bytes)
     except NoFaceDetectedError:
         raise HTTPException(status_code=422, detail="No face detected. Please retake the photo.")
-    except LowQualityCaptureError as e:
+    except CaptureQualityFailedError as e:
         raise HTTPException(
             status_code=422,
-            detail=f"Image quality too low (score: {e.quality_score:.2f}). Try better lighting."
+            detail={
+                "message": "Capture quality too low for analysis. Please retake the photo.",
+                "capture_assessment": e.capture_assessment.to_dict(),
+            },
         )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=f"Invalid image: {e}")
 
-    metrics = extraction_result["metrics"]
-    capture_quality = extraction_result["capture_quality"]
+    metric_results = extraction_result["metric_results"]
+    capture_assessment = extraction_result["capture_assessment"]
+    eligible_for_longitudinal_comparison = extraction_result["eligible_for_longitudinal_comparison"]
 
     # user_id is real, from a verified access token. The rest is now a
     # real persisted profile (app/db/profile_repository.py) -- falling
@@ -90,9 +94,17 @@ async def analyze(request: AnalyzeRequest, user_id: str = Depends(get_current_us
     profile = await get_profile(get_db_pool(), uuid.UUID(user_id))
     user_profile = {"user_id": user_id, **profile}
 
-    analysis = scorer.compute_scores(metrics, capture_quality=capture_quality)
-    plan = plan_service.generate_plan(analysis["scores"], analysis["insights"], user_profile, capture_quality)
-    return {"plan": plan, "scores": analysis["scores"]}
+    analysis = scorer.compute_scores(metric_results, capture_quality=capture_assessment.overall_quality)
+    plan = plan_service.generate_plan(
+        analysis["scores"], analysis["insights"], user_profile, capture_assessment.overall_quality
+    )
+    return {
+        "plan": plan,
+        "scores": analysis["scores"],
+        "metric_results": analysis["metric_results"],
+        "capture_assessment": capture_assessment.to_dict(),
+        "eligible_for_longitudinal_comparison": eligible_for_longitudinal_comparison,
+    }
 
 
 @app.get("/db-check")
