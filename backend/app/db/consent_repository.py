@@ -11,6 +11,11 @@ REQUIRED_CONSENT_TYPE / REQUIRED_POLICY_VERSION are the server's own
 single source of truth for what's currently required -- callers (this
 API, and eventually a mobile client) must defer to these values rather
 than hardcoding their own independent copy.
+
+consent_events has row-level security enabled (see the 7b38b717546e
+migration): every query here sets app.current_user_id via
+set_config() as the first statement of its transaction, same pattern
+and same fail-closed rationale as profile_repository.py.
 """
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -33,17 +38,19 @@ async def record_consent(
     platform: Optional[str] = None,
 ) -> Dict[str, Any]:
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            INSERT INTO consent_events
-                (user_id, consent_type, policy_version, purpose, jurisdiction,
-                 granted_at, app_version, platform)
-            VALUES ($1, $2, $3, $4, $5, now(), $6, $7)
-            RETURNING id, granted_at
-            """,
-            user_id, consent_type, policy_version, purpose, jurisdiction,
-            app_version, platform,
-        )
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.current_user_id', $1, true)", str(user_id))
+            row = await conn.fetchrow(
+                """
+                INSERT INTO consent_events
+                    (user_id, consent_type, policy_version, purpose, jurisdiction,
+                     granted_at, app_version, platform)
+                VALUES ($1, $2, $3, $4, $5, now(), $6, $7)
+                RETURNING id, granted_at
+                """,
+                user_id, consent_type, policy_version, purpose, jurisdiction,
+                app_version, platform,
+            )
     return {"id": str(row["id"]), "granted_at": row["granted_at"].isoformat()}
 
 
@@ -52,18 +59,20 @@ async def withdraw_consent(pool: asyncpg.Pool, user_id: UUID, consent_type: str)
     user+consent_type. Returns whether an active grant existed to
     withdraw."""
     async with pool.acquire() as conn:
-        result = await conn.execute(
-            """
-            UPDATE consent_events SET withdrawn_at = now()
-            WHERE id = (
-                SELECT id FROM consent_events
-                WHERE user_id = $1 AND consent_type = $2 AND withdrawn_at IS NULL
-                ORDER BY granted_at DESC
-                LIMIT 1
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.current_user_id', $1, true)", str(user_id))
+            result = await conn.execute(
+                """
+                UPDATE consent_events SET withdrawn_at = now()
+                WHERE id = (
+                    SELECT id FROM consent_events
+                    WHERE user_id = $1 AND consent_type = $2 AND withdrawn_at IS NULL
+                    ORDER BY granted_at DESC
+                    LIMIT 1
+                )
+                """,
+                user_id, consent_type,
             )
-            """,
-            user_id, consent_type,
-        )
     return result.endswith(" 1")
 
 
@@ -74,14 +83,16 @@ async def has_valid_consent(
     required_policy_version: str,
 ) -> bool:
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT 1 FROM consent_events
-            WHERE user_id = $1 AND consent_type = $2 AND policy_version = $3
-              AND withdrawn_at IS NULL
-            ORDER BY granted_at DESC
-            LIMIT 1
-            """,
-            user_id, consent_type, required_policy_version,
-        )
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.current_user_id', $1, true)", str(user_id))
+            row = await conn.fetchrow(
+                """
+                SELECT 1 FROM consent_events
+                WHERE user_id = $1 AND consent_type = $2 AND policy_version = $3
+                  AND withdrawn_at IS NULL
+                ORDER BY granted_at DESC
+                LIMIT 1
+                """,
+                user_id, consent_type, required_policy_version,
+            )
     return row is not None

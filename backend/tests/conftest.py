@@ -29,7 +29,16 @@ from httpx import ASGITransport, AsyncClient
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 
+# Superuser -- test harness use only (setup, assertions, TRUNCATE
+# cleanup, running migrations). The application itself never connects
+# this way; see APP_DATABASE_URL / app_db_pool below for what the
+# injected FastAPI app actually queries through.
 TEST_DATABASE_URL = os.environ["DATABASE_URL"]
+# The restricted, non-superuser role every real request goes through
+# (see migration 7b38b717546e). Using this, not TEST_DATABASE_URL, for
+# app_instance is what actually proves the app works correctly under
+# the same restricted role production uses, RLS included.
+APP_DATABASE_URL = "postgresql://skincare_app:skincare_app_dev_only@localhost:5432/skincare_test"
 TEST_REDIS_URL = os.environ["REDIS_URL"]
 
 
@@ -56,6 +65,17 @@ async def db_pool(migrated_test_database):
     await pool.close()
 
 
+@pytest_asyncio.fixture
+async def app_db_pool(migrated_test_database):
+    """The restricted skincare_app role's own pool -- separate from
+    db_pool (superuser) so tests can prove the app genuinely works,
+    and is genuinely isolated by RLS, through the same restricted
+    connection production uses."""
+    pool = await asyncpg.create_pool(dsn=APP_DATABASE_URL, min_size=1, max_size=5)
+    yield pool
+    await pool.close()
+
+
 @pytest_asyncio.fixture(autouse=True)
 async def clean_database(db_pool):
     """Truncates all app tables before each test so tests don't leak
@@ -77,17 +97,20 @@ async def redis_client():
 
 
 @pytest_asyncio.fixture
-async def app_instance(db_pool, redis_client):
-    """The real FastAPI app, wired to the test database pool and test
-    Redis client instead of running its own startup/shutdown events
-    (which would create a second, competing pool/client)."""
+async def app_instance(db_pool, app_db_pool, redis_client):
+    """The real FastAPI app, wired to the *restricted* app_db_pool
+    (the skincare_app role, not the superuser db_pool) and test Redis
+    client, instead of running its own startup/shutdown events (which
+    would create a second, competing pool/client). db_pool is still
+    depended on here so clean_database (which uses it) always runs
+    before app_instance is used."""
     from app import main as main_module
 
     main_module.app.dependency_overrides.clear()
     from app.db import connection as db_connection
     from app import redis_client as redis_module
 
-    db_connection._pool = db_pool
+    db_connection._pool = app_db_pool
     redis_module._redis_client = redis_client
 
     yield main_module.app
