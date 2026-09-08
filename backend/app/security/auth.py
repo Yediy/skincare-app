@@ -1,9 +1,12 @@
+import uuid
 from typing import Optional
 
+import asyncpg
 from fastapi import Header, HTTPException
 from jose import JWTError
 from redis.exceptions import RedisError
 
+from app.db.connection import get_db_pool
 from app.redis_client import get_redis
 from app.security.tokens import decode_access_token
 
@@ -31,5 +34,22 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> str:
             raise HTTPException(status_code=401, detail="Token has been revoked")
     except RedisError:
         raise HTTPException(status_code=503, detail="Authentication service temporarily unavailable")
+
+    # Account-state check happens against Postgres directly, not a
+    # Redis artifact -- a disabled/deleted account is rejected on every
+    # request from the moment the DB row changes, with no dependency on
+    # any TTL surviving long enough to cover the access token's own
+    # remaining lifetime.
+    try:
+        pool = get_db_pool()
+        user = await pool.fetchrow(
+            "SELECT is_active, deleted_at FROM users WHERE id = $1",
+            uuid.UUID(user_id),
+        )
+    except (asyncpg.PostgresError, OSError):
+        raise HTTPException(status_code=503, detail="Authentication service temporarily unavailable")
+
+    if user is None or not user["is_active"] or user["deleted_at"] is not None:
+        raise HTTPException(status_code=401, detail="Account is disabled or no longer exists")
 
     return user_id

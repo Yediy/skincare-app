@@ -167,22 +167,51 @@ class RefreshRequest(BaseModel):
 
 @app.post("/refresh")
 async def refresh(request: RefreshRequest):
+    """
+    The old-token consumption and successor creation happen inside one
+    explicit transaction. If successor insertion fails for any reason,
+    the whole transaction rolls back, so the old token's `used_at` reverts
+    to NULL -- the caller can safely retry with the same original token
+    instead of being left with no usable refresh token at all.
+
+    The replay-detection path (row is None because the token was already
+    used) is a separate transaction, deliberately opened after the first
+    one has closed -- it must commit its family-wide revocation even
+    though this request is about to fail with a 401.
+    """
     from app.db.connection import get_db_pool
     token_hash = hash_refresh_token(request.refresh_token)
     pool = get_db_pool()
 
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            UPDATE refresh_tokens
-            SET used_at = now()
-            WHERE token_hash = $1 AND used_at IS NULL AND revoked_at IS NULL AND expires_at > now()
-            RETURNING user_id, family_id
-            """,
-            token_hash,
-        )
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """
+                UPDATE refresh_tokens
+                SET used_at = now()
+                WHERE token_hash = $1 AND used_at IS NULL AND revoked_at IS NULL AND expires_at > now()
+                RETURNING user_id, family_id
+                """,
+                token_hash,
+            )
 
-        if row is None:
+            if row is not None:
+                user_id, family_id = row["user_id"], row["family_id"]
+                new_access_token = create_access_token(str(user_id), str(family_id))
+                new_refresh_raw, new_refresh_hash = generate_refresh_token()
+                new_expires_at = datetime.now(timezone.utc) + timedelta(days=settings.refresh_token_expire_days)
+
+                await conn.execute(
+                    "INSERT INTO refresh_tokens (user_id, family_id, token_hash, expires_at) VALUES ($1, $2, $3, $4)",
+                    user_id, family_id, new_refresh_hash, new_expires_at,
+                )
+                return {"access_token": new_access_token, "refresh_token": new_refresh_raw, "token_type": "bearer"}
+
+        # row was None: token never existed, is expired/revoked, or --
+        # the interesting case -- was already consumed (replay). This
+        # runs in its own transaction so the revocation below commits
+        # even though we raise immediately after.
+        async with conn.transaction():
             existing = await conn.fetchrow(
                 "SELECT family_id, used_at, revoked_at FROM refresh_tokens WHERE token_hash = $1",
                 token_hash,
@@ -195,19 +224,8 @@ async def refresh(request: RefreshRequest):
                 )
                 r = get_redis()
                 await r.set(f"revoked_family:{family_id}", "1", ex=settings.access_token_expire_minutes * 60)
-            raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
 
-        user_id, family_id = row["user_id"], row["family_id"]
-        new_access_token = create_access_token(str(user_id), str(family_id))
-        new_refresh_raw, new_refresh_hash = generate_refresh_token()
-        new_expires_at = datetime.now(timezone.utc) + timedelta(days=settings.refresh_token_expire_days)
-
-        await conn.execute(
-            "INSERT INTO refresh_tokens (user_id, family_id, token_hash, expires_at) VALUES ($1, $2, $3, $4)",
-            user_id, family_id, new_refresh_hash, new_expires_at,
-        )
-
-    return {"access_token": new_access_token, "refresh_token": new_refresh_raw, "token_type": "bearer"}
+    raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
 
 
 class LogoutRequest(BaseModel):
@@ -260,3 +278,39 @@ async def logout_all(user_id: str = Depends(get_current_user)):
         )
 
     return {"detail": "Logged out of all sessions"}
+
+
+@app.delete("/me")
+async def delete_account(user_id: str = Depends(get_current_user)):
+    """
+    Soft-deletes the authenticated user's own account. The primary
+    invalidation guarantee is the `is_active`/`deleted_at` check in
+    get_current_user, which reads Postgres directly on every request --
+    it does not depend on any Redis TTL. Refresh tokens are also
+    revoked and the Redis family/user markers are set as defense in
+    depth, but a stale/expired Redis key can never leave a deleted
+    account's existing access tokens usable, unlike the reverse.
+    """
+    from app.db.connection import get_db_pool
+    pool = get_db_pool()
+    user_uuid = uuid.UUID(user_id)
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET is_active = false, deleted_at = now() WHERE id = $1",
+            user_uuid,
+        )
+        await conn.execute(
+            "UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL",
+            user_uuid,
+        )
+
+    r = get_redis()
+    now_ts = datetime.now(timezone.utc).timestamp()
+    await r.set(
+        f"user_tokens_invalid_before:{user_id}",
+        str(now_ts),
+        ex=settings.access_token_expire_minutes * 60,
+    )
+
+    return {"detail": "Account deleted"}
