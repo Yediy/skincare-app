@@ -6,6 +6,7 @@ from typing import List, Literal
 
 from asyncpg.exceptions import UniqueViolationError
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
 
 from app.config import settings
@@ -18,10 +19,33 @@ from app.security.passwords import hash_password, verify_password
 from app.security.auth import get_current_user
 from app.security.tokens import create_access_token, generate_refresh_token, hash_refresh_token
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO))
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Skincare Priority Engine API", version="0.1.0")
+app = FastAPI(
+    title="Skincare Priority Engine API",
+    version="0.1.0",
+    # ENABLE_DOCS=false (the required posture in production, enforced
+    # by Settings itself) removes /docs, /redoc, and the raw OpenAPI
+    # schema entirely, rather than just hiding a link to them.
+    docs_url="/docs" if settings.enable_docs else None,
+    redoc_url="/redoc" if settings.enable_docs else None,
+    openapi_url="/openapi.json" if settings.enable_docs else None,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.allowed_origins,
+    # Auth here is a Bearer token in the Authorization header (set
+    # explicitly by the client), never a cookie -- CORS credentials
+    # mode governs cookies/TLS-client-certs/HTTP-auth-prompts, not
+    # explicit headers, so it's correctly left off. Leaving it on
+    # would also conflict with a wildcard origin, which browsers
+    # reject for credentialed requests anyway.
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.on_event("startup")
@@ -43,9 +67,47 @@ scorer = FacialScorer()
 plan_service = PlanService()
 
 
-@app.get("/health")
-async def health_check():
+@app.get("/health/live")
+async def liveness():
+    """Is the application process alive? Deliberately has no
+    dependency on Postgres/Redis/anything external -- a liveness probe
+    that can fail because a downstream dependency is briefly down
+    causes an orchestrator to restart-loop a perfectly healthy process
+    instead of just holding it out of rotation, which is what
+    readiness is for."""
     return {"status": "ok"}
+
+
+@app.get("/health/ready")
+async def readiness():
+    """Can this instance safely serve traffic right now? Checks the
+    two hard dependencies every real request needs. Either check
+    failing fails the whole probe -- a half-working instance should be
+    taken out of rotation, not left serving requests doomed to 503."""
+    from app.db.connection import get_db_pool
+
+    checks: dict[str, str] = {}
+    healthy = True
+
+    try:
+        pool = get_db_pool()
+        await pool.fetchval("SELECT 1")
+        checks["database"] = "ok"
+    except Exception as e:
+        checks["database"] = f"unavailable: {e.__class__.__name__}"
+        healthy = False
+
+    try:
+        r = get_redis()
+        await r.ping()
+        checks["redis"] = "ok"
+    except Exception as e:
+        checks["redis"] = f"unavailable: {e.__class__.__name__}"
+        healthy = False
+
+    if not healthy:
+        raise HTTPException(status_code=503, detail={"status": "not_ready", "checks": checks})
+    return {"status": "ready", "checks": checks}
 
 
 class AnalyzeRequest(BaseModel):
