@@ -2,17 +2,17 @@ import asyncpg
 import logging
 from typing import Optional
 
-logger = logging.getLogger(__name__)
+from app.config import settings
 
-DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/skincare"
+logger = logging.getLogger(__name__)
 
 _pool: Optional[asyncpg.Pool] = None
 
 
-async def init_db_pool() -> asyncpg.Pool:
+async def init_db_pool(dsn: Optional[str] = None) -> asyncpg.Pool:
     global _pool
     if _pool is None:
-        _pool = await asyncpg.create_pool(dsn=DATABASE_URL, min_size=2, max_size=10)
+        _pool = await asyncpg.create_pool(dsn=dsn or settings.database_url, min_size=2, max_size=10)
         logger.info("Database pool initialized")
     return _pool
 
