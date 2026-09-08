@@ -7,6 +7,17 @@ on:
     branches: [master, main]
 
 jobs:
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   test:
     runs-on: ubuntu-latest
 
@@ -72,3 +83,34 @@ jobs:
           REDIS_URL: redis://localhost:6379/1
           JWT_SECRET: ci-only-secret-never-used-outside-github-actions-0123456789ab
         run: python -m pytest tests/ -v
+
+  dependency-scan:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: pip-audit (known-CVE scan of pinned dependencies)
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          pip-audit -r requirements.txt
+
+  docker-build-and-scan:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t skincare-app-backend:${{ github.sha }} .
+      - name: Trivy container scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: skincare-app-backend:${{ github.sha }}
+          severity: CRITICAL,HIGH
+          exit-code: "1"
