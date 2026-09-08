@@ -3,6 +3,13 @@ import logging
 from typing import Dict, List, Any, Optional, Set
 from datetime import datetime, timezone
 from app.domain.priorities import PRIORITIES, CompatibilityRule, PRIORITY_SCHEMA_VERSION, PLANNER_VERSION
+from app.domain.safety_engine import (
+    SafetyEngine,
+    SafetyDecision,
+    PREGNANCY_RESTRICTION,
+    NURSING_RESTRICTION,
+    SENSITIVE_SKIN_INTENSITY_LIMIT,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -10,6 +17,7 @@ logger = logging.getLogger(__name__)
 class PlanService:
     def __init__(self, monitoring_service=None):
         self.monitoring = monitoring_service
+        self.safety_engine = SafetyEngine()
 
     def generate_plan(
         self,
@@ -21,16 +29,31 @@ class PlanService:
         priority_ranking = self._rank_priorities_by_severity(insights, scores)
         user_constraints = self._extract_user_constraints(user_profile)
 
-        priority_ids = self._apply_compatibility_constraints(priority_ranking, user_constraints)
+        candidate_priority_ids = self._apply_compatibility_constraints(priority_ranking, user_constraints)
+
+        # SafetyEngine is the actual authority on which priorities may
+        # proceed, not just a post-hoc recorder -- pregnancy/nursing
+        # exclusion happens here, not inline in _apply_compatibility_constraints.
+        priority_decisions = self.safety_engine.evaluate_priorities(
+            candidate_priority_ids,
+            {pid: PRIORITIES[pid] for pid in candidate_priority_ids},
+            user_constraints,
+        )
+        priority_ids = [d.candidate_id for d in priority_decisions if d.allowed]
 
         categories = self._collect_categories(priority_ids)
+        offer_decisions = [self.safety_engine.evaluate_offer(cat, user_constraints) for cat in categories]
+        allowed_categories = {d.candidate_id for d in offer_decisions if d.allowed}
+        restrictions_by_category = {d.candidate_id: d.restrictions for d in offer_decisions if d.restrictions}
 
-        am_routine = self._build_am_routine(priority_ids, user_constraints)
-        pm_routine = self._build_pm_routine(priority_ids, user_constraints)
+        am_routine = self._build_am_routine(priority_ids, user_constraints, allowed_categories)
+        pm_routine = self._build_pm_routine(priority_ids, user_constraints, allowed_categories, restrictions_by_category)
 
-        eye_care = self._build_eye_care(priority_ids, categories)
+        eye_care = self._build_eye_care(priority_ids, categories, allowed_categories)
         facial_toning = self._build_facial_toning(priority_ids)
         lifestyle = self._build_lifestyle(priority_ids)
+
+        safety_decisions = [d.to_dict() for d in priority_decisions] + [d.to_dict() for d in offer_decisions]
 
         plan = {
             "top_priorities": [
@@ -40,7 +63,9 @@ class PlanService:
                     "description": PRIORITIES[pid].description,
                     "pillar": PRIORITIES[pid].pillar,
                     "severity": priority_ranking[pid],
-                    "display_order": PRIORITIES[pid].display_order
+                    "display_order": PRIORITIES[pid].display_order,
+                    "default_intensity": PRIORITIES[pid].default_intensity,
+                    "effective_intensity": self._effective_intensity(pid, user_constraints),
                 }
                 for pid in priority_ids[:3]
             ],
@@ -54,15 +79,17 @@ class PlanService:
                 "assessment": self._assess_capture_quality(capture_quality),
                 "recommendations": self._get_capture_recommendations(capture_quality)
             },
-            "disclaimers": self._generate_disclaimers(priority_ids, user_constraints),
+            "disclaimers": self._generate_disclaimers(priority_ids, user_constraints, priority_decisions, offer_decisions),
             "metadata": {
                 "all_priority_ids": priority_ids,
                 "priority_severities": {pid: priority_ranking[pid] for pid in priority_ids},
+                "priority_intensities": {pid: self._effective_intensity(pid, user_constraints) for pid in priority_ids},
                 "all_categories": categories,
                 "planner_version": PLANNER_VERSION,
                 "priority_schema_version": PRIORITY_SCHEMA_VERSION,
                 "generated_at": datetime.now(timezone.utc).isoformat(),
-                "user_constraints": user_constraints
+                "user_constraints": user_constraints,
+                "safety_decisions": safety_decisions,
             }
         }
 
@@ -71,6 +98,21 @@ class PlanService:
         return plan
 
     def _rank_priorities_by_severity(self, insights: Dict, scores: Dict) -> Dict[str, float]:
+        """
+        Ranking is severity + pillar weight, with display_order reduced
+        to a near-zero tie-break (Phase 16) -- it used to be large enough
+        (up to 0.45) to outrank a real severity/pillar-weight difference,
+        letting arbitrary UI ordering dominate measured concern severity.
+
+        This is still an interim, additive model, not the brief's
+        preferred `severity x confidence x persistence x intervention
+        value` multiplicative one -- that requires calibration data
+        (real confidence scores, validated intervention-value weights)
+        that doesn't exist yet in this codebase. Documenting that
+        honestly here rather than fabricating those inputs; tracked as
+        a follow-up once Phase 9/10 (MetricResult, per-metric confidence)
+        actually produce a real confidence value to multiply by.
+        """
         priority_scores = {}
 
         for pillar_name, pillar_insights in insights.items():
@@ -81,8 +123,11 @@ class PlanService:
                 base_severity = severities.get(pid, 0.5)
                 pillar_score = scores.get(f"{pillar_name}_score", 0.5)
                 pillar_weight = (1.0 - pillar_score) * 0.3
-                display_bonus = (10 - PRIORITIES[pid].display_order) * 0.05
-                combined_score = base_severity + pillar_weight + display_bonus
+                # Tie-break only: at most 0.009, two orders of magnitude
+                # below a typical severity value -- never enough to flip
+                # the ranking of two priorities with a real severity gap.
+                display_tiebreak = (10 - PRIORITIES[pid].display_order) * 0.001
+                combined_score = base_severity + pillar_weight + display_tiebreak
                 priority_scores[pid] = combined_score
 
         sorted_priorities = dict(sorted(priority_scores.items(), key=lambda x: x[1], reverse=True))
@@ -100,15 +145,19 @@ class PlanService:
         }
 
     def _apply_compatibility_constraints(self, priority_ranking: Dict[str, float], constraints: Dict[str, Any]) -> List[str]:
+        """Pregnancy/nursing exclusion lives in SafetyEngine now, not
+        here -- this method still owns the retinoid-vs-exfoliant mutual
+        exclusion.
+
+        Beginner experience level no longer drops advanced-intensity
+        priorities (Phase 15): a beginner can still have an advanced-
+        default concern -- it stays visible, and _effective_intensity()
+        softens the *intervention*, not the concern itself."""
         filtered_priorities = []
         incompatible_categories = set()
 
         for pid, severity in priority_ranking.items():
             priority_def = PRIORITIES[pid]
-
-            if constraints["is_pregnant"] or constraints["is_nursing"]:
-                if CompatibilityRule.PREGNANCY_RESTRICTED in priority_def.compatibility_restrictions:
-                    continue
 
             if CompatibilityRule.RETINOID_VS_EXFOLIANT in priority_def.compatibility_restrictions:
                 if "retinoid" in priority_def.product_categories:
@@ -120,16 +169,22 @@ class PlanService:
                         continue
                     incompatible_categories.add("retinoid")
 
-            if constraints["experience_level"] == "beginner":
-                if priority_def.default_intensity == "advanced":
-                    continue
-
             filtered_priorities.append(pid)
 
             if len(filtered_priorities) >= 5:
                 break
 
         return filtered_priorities
+
+    def _effective_intensity(self, priority_id: str, constraints: Dict[str, Any]) -> str:
+        """The concern (priority) is never dropped for a beginner --
+        only the intervention intensity is capped. This is the single
+        place that decision is made, so it's inspectable in one spot
+        rather than duplicated per routine-builder branch."""
+        default_intensity = PRIORITIES[priority_id].default_intensity
+        if constraints.get("experience_level") == "beginner" and default_intensity == "advanced":
+            return "beginner"
+        return default_intensity
 
     def _collect_categories(self, priority_ids: List[str]) -> List[str]:
         categories = []
@@ -140,10 +195,12 @@ class PlanService:
                         categories.append(cat)
         return categories
 
-    def _build_am_routine(self, priority_ids: List[str], constraints: Dict[str, Any]) -> List[Dict]:
+    def _build_am_routine(
+        self, priority_ids: List[str], constraints: Dict[str, Any], allowed_categories: Set[str]
+    ) -> List[Dict]:
         routine = []
         step = 1
-        cats = set(self._collect_categories(priority_ids))
+        cats = set(self._collect_categories(priority_ids)) & allowed_categories
         max_steps = constraints.get("max_routine_steps", 10)
 
         def add_step(category, action, why, priority="standard"):
@@ -160,6 +217,10 @@ class PlanService:
             })
             step += 1
 
+        # Essentials (cleanser/moisturizer/sunscreen) always appear as
+        # categories -- a routine needs *some* cleanser -- but their
+        # SafetyDecision is still recorded in plan metadata regardless,
+        # for a future product-matching step to honor.
         add_step("cleanser", "Gentle cleansing to remove overnight buildup", "Prepares skin for active ingredients", "essential")
 
         if "vitamin_c_serum" in cats and step <= max_steps:
@@ -178,10 +239,16 @@ class PlanService:
 
         return routine
 
-    def _build_pm_routine(self, priority_ids: List[str], constraints: Dict[str, Any]) -> List[Dict]:
+    def _build_pm_routine(
+        self,
+        priority_ids: List[str],
+        constraints: Dict[str, Any],
+        allowed_categories: Set[str],
+        restrictions_by_category: Dict[str, Dict[str, Any]],
+    ) -> List[Dict]:
         routine = []
         step = 1
-        cats = set(self._collect_categories(priority_ids))
+        cats = set(self._collect_categories(priority_ids)) & allowed_categories
         max_steps = constraints.get("max_routine_steps", 10)
 
         def add_step(category, action, why, priority="standard"):
@@ -203,16 +270,43 @@ class PlanService:
         has_retinoid = "retinoid" in cats
         has_exfoliant = "chemical_exfoliant" in cats
 
+        # A real, computed restriction (currently: sensitive skin,
+        # SENSITIVE_SKIN_INTENSITY_LIMIT) drives the actual frequency
+        # text here -- this is what makes sensitive skin change the
+        # plan rather than just append a disclaimer sentence.
+        retinoid_max_weekly = restrictions_by_category.get("retinoid", {}).get("maximum_weekly_frequency")
+        exfoliant_max_weekly = restrictions_by_category.get("chemical_exfoliant", {}).get("maximum_weekly_frequency")
+
         if has_retinoid and has_exfoliant:
-            if constraints.get("experience_level") == "beginner":
+            if retinoid_max_weekly:
+                add_step(
+                    "retinoid",
+                    f"Apply pea-sized amount (limited to {retinoid_max_weekly}x/week for sensitive skin)",
+                    "Improves texture and tone -- frequency capped for sensitive skin", "standard",
+                )
+            elif constraints.get("experience_level") == "beginner":
                 add_step("retinoid", "Apply pea-sized amount (every other night to start)", "Improves texture and tone - start slow to build tolerance", "standard")
             else:
                 add_step("retinoid", "Apply retinoid (Monday/Wednesday/Friday)", "Improves texture and tone", "standard")
                 add_step("chemical_exfoliant", "Apply exfoliant (Tuesday/Thursday/Saturday)", "Smooths texture - alternate with retinoid to avoid over-exfoliation", "standard")
         elif has_retinoid:
-            add_step("retinoid", "Apply pea-sized amount", "Improves texture and tone", "standard")
+            if retinoid_max_weekly:
+                add_step(
+                    "retinoid",
+                    f"Apply pea-sized amount (limited to {retinoid_max_weekly}x/week for sensitive skin)",
+                    "Improves texture and tone -- frequency capped for sensitive skin", "standard",
+                )
+            else:
+                add_step("retinoid", "Apply pea-sized amount", "Improves texture and tone", "standard")
         elif has_exfoliant:
-            add_step("chemical_exfoliant", "Apply exfoliant (2-3x per week)", "Smooths texture and promotes cell turnover", "standard")
+            if exfoliant_max_weekly:
+                add_step(
+                    "chemical_exfoliant",
+                    f"Apply exfoliant (limited to {exfoliant_max_weekly}x/week for sensitive skin)",
+                    "Smooths texture -- frequency capped for sensitive skin", "standard",
+                )
+            else:
+                add_step("chemical_exfoliant", "Apply exfoliant (2-3x per week)", "Smooths texture and promotes cell turnover", "standard")
 
         add_step("night_cream", "Apply rich night cream", "Provides deep hydration and overnight repair", "essential")
 
@@ -221,16 +315,18 @@ class PlanService:
 
         return routine
 
-    def _build_eye_care(self, priority_ids: List[str], categories: List[str]) -> Optional[Dict]:
+    def _build_eye_care(self, priority_ids: List[str], categories: List[str], allowed_categories: Set[str]) -> Optional[Dict]:
         eye_care_priorities = [pid for pid in priority_ids if pid in ["UNDER_EYE_SHADOWS", "PUFFINESS_REDUCTION"]]
 
         if not eye_care_priorities:
             return None
 
+        allowed = [cat for cat in categories if cat in allowed_categories]
+
         return {
             "priorities_addressed": eye_care_priorities,
-            "morning_products": [cat for cat in categories if "eye" in cat and "caffeine" in cat],
-            "evening_products": [cat for cat in categories if "eye" in cat and "peptide" in cat],
+            "morning_products": [cat for cat in allowed if "eye" in cat and "caffeine" in cat],
+            "evening_products": [cat for cat in allowed if "eye" in cat and "peptide" in cat],
             "techniques": [
                 {"name": "Gentle Pat Application", "description": "Use ring finger to gently pat product around orbital bone", "frequency": "Daily, AM and PM"},
                 {"name": "Cooling Application", "description": "Store eye products in fridge for added de-puffing effect", "frequency": "Optional, especially AM"}
@@ -315,7 +411,13 @@ class PlanService:
             recs.append("Ensure camera lens is clean")
         return recs
 
-    def _generate_disclaimers(self, priority_ids: List[str], constraints: Dict[str, Any]) -> List[str]:
+    def _generate_disclaimers(
+        self,
+        priority_ids: List[str],
+        constraints: Dict[str, Any],
+        priority_decisions: List[SafetyDecision],
+        offer_decisions: List[SafetyDecision],
+    ) -> List[str]:
         disclaimers = [
             "This plan is for cosmetic purposes only and is not medical advice.",
             "Consult a dermatologist if you have specific skin conditions or concerns.",
@@ -327,11 +429,22 @@ class PlanService:
             if any("retinoid" in PRIORITIES[pid].product_categories for pid in priority_ids):
                 disclaimers.append("Retinoids can cause initial dryness and sensitivity. Start with 2-3x per week and gradually increase.")
 
-        if constraints.get("is_pregnant") or constraints.get("is_nursing"):
-            disclaimers.append("Plan has been adjusted to exclude pregnancy/nursing contraindicated ingredients.")
+        # Only claim an adjustment happened if a SafetyDecision actually
+        # recorded one -- not just because the constraint flag is set.
+        pregnancy_restricted = any(
+            PREGNANCY_RESTRICTION in d.reason_codes or NURSING_RESTRICTION in d.reason_codes
+            for d in priority_decisions
+        )
+        if pregnancy_restricted:
+            disclaimers.append("Plan has been adjusted to exclude pregnancy/nursing contraindicated priorities.")
 
-        if constraints.get("has_sensitive_skin"):
-            disclaimers.append("Recommendations have been adjusted for sensitive skin. Start slowly and monitor for reactions.")
+        sensitive_skin_restricted = any(
+            SENSITIVE_SKIN_INTENSITY_LIMIT in d.reason_codes for d in offer_decisions
+        )
+        if sensitive_skin_restricted:
+            disclaimers.append("Recommendations have been adjusted for sensitive skin: active ingredient frequency has been capped. Start slowly and monitor for reactions.")
+        elif constraints.get("has_sensitive_skin"):
+            disclaimers.append("Sensitive skin noted -- no active-ingredient frequency limits were triggered by this specific plan, but continue to monitor for reactions.")
 
         return disclaimers
 
