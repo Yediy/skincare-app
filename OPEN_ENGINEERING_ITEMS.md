@@ -6,7 +6,6 @@ Classified into P0 (release blockers) / P1 (pre-launch) / P2 (post-launch) / P3 
 
 ## P0 — Release blockers
 
-1. **`users` and `refresh_tokens` have no row-level security.** Only `user_profiles` and `consent_events` are RLS-scoped. `users` needs a pre-authentication lookup-by-email design that doesn't yet have an RLS-compatible answer; `refresh_tokens` is looked up by an unguessable per-row secret rather than session identity. Both need a real design pass, not a rushed extension of the current `user_id = current_setting(...)` pattern.
 2. **Allergy/avoid-ingredient enforcement is category-level, not per-product**, because no product/offer catalog exists in this repository at all. `app/domain/product_safety.py` is a deliberate, static, hand-authored adapter — real enforcement against real per-SKU ingredient data requires that catalog to exist first.
 
 ## P1 — Pre-launch
@@ -32,3 +31,5 @@ Classified into P0 (release blockers) / P1 (pre-launch) / P2 (post-launch) / P3 
 ## What was closed out in this pass (for contrast — not to be re-litigated as still-open)
 
 Test foundation + CI, transactional refresh rotation, account-state invalidation, real user profile persistence, append-only consent ledger gating `/analyze`, removal of automatic photo-derived supplement recommendations, `SafetyEngine`/`SafetyDecision` with real allergy/pregnancy/sensitive-skin enforcement, beginner concern-vs-intensity separation, ranking's display-order dominance, and a restricted DB runtime role with RLS on two tables. See `FOUNDATION_IMPLEMENTATION_REPORT.md` for the full phase-by-phase detail, including what remains partial within each.
+
+**P0-1 (RLS on `users`/`refresh_tokens`)**, closed separately: migration `feb038fd05bd` gives each table its own mechanism — a `SECURITY DEFINER` function for the pre-auth email lookup on `users`, and a second `app.current_token_hash` session GUC for the pre-identity token-hash lookups on `refresh_tokens` — rather than forcing the `user_profiles`/`consent_events` pattern onto access paths that don't fit it. Verified with 14 real cross-user Postgres integration tests through the restricted role (`tests/database/test_rls_isolation.py`). Full detail in `SECURITY_AND_SAFETY_NOTES.md` and `ARCHITECTURE_CURRENT.md`. The unauthenticated, untested `/db-check` debug route was removed in the same pass rather than left to silently misreport once `users` gained RLS.
