@@ -61,7 +61,9 @@ async def clean_database(db_pool):
     """Truncates all app tables before each test so tests don't leak
     state into each other, regardless of test order."""
     async with db_pool.acquire() as conn:
-        await conn.execute("TRUNCATE TABLE refresh_tokens, users RESTART IDENTITY CASCADE")
+        await conn.execute(
+            "TRUNCATE TABLE refresh_tokens, user_profiles, consent_events, users RESTART IDENTITY CASCADE"
+        )
     yield
 
 

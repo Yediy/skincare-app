@@ -2,6 +2,7 @@ import base64
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
+from typing import List, Literal
 
 from asyncpg.exceptions import UniqueViolationError
 from fastapi import Depends, FastAPI, HTTPException
@@ -53,6 +54,15 @@ class AnalyzeRequest(BaseModel):
 
 @app.post("/analyze")
 async def analyze(request: AnalyzeRequest, user_id: str = Depends(get_current_user)):
+    from app.db.connection import get_db_pool
+    from app.db.consent_repository import has_valid_consent, REQUIRED_CONSENT_TYPE, REQUIRED_POLICY_VERSION
+    if not await has_valid_consent(get_db_pool(), uuid.UUID(user_id), REQUIRED_CONSENT_TYPE, REQUIRED_POLICY_VERSION):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Consent required for facial analysis (policy version {REQUIRED_POLICY_VERSION}). "
+                   f"Grant it via POST /consent before calling /analyze.",
+        )
+
     try:
         image_bytes = base64.b64decode(request.image_base64)
     except Exception:
@@ -72,17 +82,14 @@ async def analyze(request: AnalyzeRequest, user_id: str = Depends(get_current_us
     metrics = extraction_result["metrics"]
     capture_quality = extraction_result["capture_quality"]
 
-    # user_id is now real, from a verified access token. The other four
-    # fields are STILL placeholders -- no DB column backs any of them yet.
-    # Real profile storage is tracked separately (OPEN_ENGINEERING_ITEMS.md,
-    # Tier 2), not silently built here.
-    user_profile = {
-        "user_id": user_id,
-        "is_pregnant": False,           # PLACEHOLDER -- no DB column
-        "is_nursing": False,            # PLACEHOLDER -- no DB column
-        "has_sensitive_skin": False,    # PLACEHOLDER -- no DB column
-        "experience_level": "beginner", # PLACEHOLDER -- no DB column
-    }
+    # user_id is real, from a verified access token. The rest is now a
+    # real persisted profile (app/db/profile_repository.py) -- falling
+    # back to the documented DEFAULT_PROFILE only if the user has never
+    # set one, not as a silent placeholder for missing plumbing.
+    from app.db.profile_repository import get_profile
+    profile = await get_profile(get_db_pool(), uuid.UUID(user_id))
+    user_profile = {"user_id": user_id, **profile}
+
     analysis = scorer.compute_scores(metrics, capture_quality=capture_quality)
     plan = plan_service.generate_plan(analysis["scores"], analysis["insights"], user_profile, capture_quality)
     return {"plan": plan, "scores": analysis["scores"]}
@@ -314,3 +321,62 @@ async def delete_account(user_id: str = Depends(get_current_user)):
     )
 
     return {"detail": "Account deleted"}
+
+
+class ProfileUpdateRequest(BaseModel):
+    has_sensitive_skin: bool = False
+    experience_level: Literal["beginner", "intermediate", "advanced"] = "beginner"
+    max_routine_steps: int = Field(default=10, ge=1, le=20)
+    is_pregnant: bool = False
+    is_nursing: bool = False
+    allergies: List[str] = []
+    avoid_ingredients: List[str] = []
+
+
+@app.get("/profile")
+async def get_profile_route(user_id: str = Depends(get_current_user)):
+    from app.db.connection import get_db_pool
+    from app.db.profile_repository import get_profile
+    return await get_profile(get_db_pool(), uuid.UUID(user_id))
+
+
+@app.put("/profile")
+async def update_profile_route(request: ProfileUpdateRequest, user_id: str = Depends(get_current_user)):
+    from app.db.connection import get_db_pool
+    from app.db.profile_repository import upsert_profile
+    await upsert_profile(get_db_pool(), uuid.UUID(user_id), request.model_dump())
+    return {"detail": "Profile updated"}
+
+
+class ConsentGrantRequest(BaseModel):
+    consent_type: str = "facial_analysis"
+    policy_version: str
+    purpose: str
+    jurisdiction: str | None = None
+    app_version: str | None = None
+    platform: str | None = None
+
+
+@app.post("/consent")
+async def grant_consent(request: ConsentGrantRequest, user_id: str = Depends(get_current_user)):
+    from app.db.connection import get_db_pool
+    from app.db.consent_repository import record_consent
+    result = await record_consent(
+        get_db_pool(), uuid.UUID(user_id), request.consent_type, request.policy_version,
+        request.purpose, request.jurisdiction, request.app_version, request.platform,
+    )
+    return result
+
+
+class ConsentWithdrawRequest(BaseModel):
+    consent_type: str = "facial_analysis"
+
+
+@app.post("/consent/withdraw")
+async def withdraw_consent_route(request: ConsentWithdrawRequest, user_id: str = Depends(get_current_user)):
+    from app.db.connection import get_db_pool
+    from app.db.consent_repository import withdraw_consent
+    withdrew = await withdraw_consent(get_db_pool(), uuid.UUID(user_id), request.consent_type)
+    if not withdrew:
+        raise HTTPException(status_code=404, detail="No active consent of this type to withdraw")
+    return {"detail": "Consent withdrawn"}
