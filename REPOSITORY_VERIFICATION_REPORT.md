@@ -56,13 +56,13 @@ Regenerated against the current HEAD, superseding the much earlier version of th
 
 | Item | Status | Evidence |
 |---|---|---|
-| `CaptureAssessment`, PASS/BORDERLINE/FAIL | `NOT_IMPLEMENTED` | `CaptureQualityAssessor` still returns a single bare float; zero matches for `CaptureAssessment` anywhere. |
-| Head pose (`cv2.solvePnP` or equivalent) | `NOT_IMPLEMENTED` | Zero matches for `solvePnP`/`head_pose` anywhere. |
-| `MetricResult` for all 8 metrics | `NOT_IMPLEMENTED` | All 8 metrics still return bare floats; zero matches for `MetricResult` anywhere. |
-| Per-metric confidence | `NOT_IMPLEMENTED` | No confidence value of any kind is computed per-metric. |
-| Abstention wired into scorer | `NOT_IMPLEMENTED` | No abstention concept exists. |
+| `CaptureAssessment`, PASS/BORDERLINE/FAIL | `VERIFIED_IMPLEMENTED` | `app/cv/capture_assessment.py` — `quality_status`, `overall_quality`, yaw/pitch/roll, blur/exposure/lighting_balance/face_size/resolution/occlusion sub-scores, `failure_reasons`. Real tests prove FAIL blocks analysis entirely (`CaptureQualityFailedError` raised before any metric is computed) and BORDERLINE proceeds but sets `eligible_for_longitudinal_comparison: false`. |
+| Head pose (`cv2.solvePnP` or equivalent) | `VERIFIED_IMPLEMENTED` | `app/cv/head_pose.py` — real `cv2.solvePnP` against a generic 3D face model and 6 MediaPipe landmarks. Tested with synthetic/controlled landmark configurations (per the brief's own guidance): frontal ≈ 0°, a constructed yaw configuration yields a measurably larger yaw, and a degenerate-input case is caught and reported as failure rather than a raw exception. |
+| `MetricResult` for all 8 metrics | `VERIFIED_IMPLEMENTED` | `app/cv/metric_result.py` + `SkinMetricExtractor.compute_all_metric_results()` — every metric returns `value`/`confidence`/`status`/`uncertainty_reasons`/`metric_version`/`calibration_version`. The old bare-float `compute_all_metrics()` was deleted, not left reachable alongside. |
+| Per-metric confidence | `VERIFIED_IMPLEMENTED` | `app/cv/metric_confidence.py` — 8 distinct formulas, each derived from the specific corrupting factors documented in `CV_VALIDATION_LIMITATIONS.md` (e.g. `texture_confidence` is blur-dominated, `symmetry_confidence` is pose-dominated), not one blanket score applied identically. 13 real tests including a boundary case at the exact abstain threshold and a check that an undetermined head-pose solve is treated as maximum severity, never a suspicious zero. |
+| Abstention wired into scorer | `VERIFIED_IMPLEMENTED` | `FacialScorer._analyze_pillar()` skips triggering outright for any `ABSTAINED` metric. Real test proves a priority cannot trigger from an abstained metric regardless of what its withheld value implied — both at the scorer-unit level and through the real end-to-end HTTP path with a controlled capture assessment. |
 
-See `CV_VALIDATION_LIMITATIONS.md` for the full detail on what each of the 8 metrics actually measures and what corrupts it — documented now even though not yet enforced in code.
+**None of this is clinically validated** — `calibration_version` is literally `"uncalibrated-1.0"` on every result; thresholds and formula weights are documented, internally-consistent starting points, not values from a validation study. See `CV_VALIDATION_LIMITATIONS.md` for the full detail on what each of the 8 metrics actually measures, what corrupts it, and what remains unsolved (the texture/blur circular dependency, most notably).
 
 ## Safety Decisions (Phase 12 of this pass's brief)
 

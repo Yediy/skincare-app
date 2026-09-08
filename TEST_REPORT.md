@@ -12,9 +12,22 @@ Against a real, isolated `skincare_test` Postgres database and Redis index 1 —
 
 ## Final result
 
+Full suite, one complete run (this sandbox's system load average was ~11 during this run):
+
 ```
-52 passed, 3 skipped, 0 failed, 5 warnings in 355.21s (0:05:55)
+1 failed, 79 passed, 8 warnings, 2 errors in 5050.70s (1:24:10)
 ```
+
+All three non-passing results are `redis.exceptions.TimeoutError` (a Redis *connection* timeout, not an assertion failure or logic error) — one at test setup (`tests/cv/test_head_pose.py::test_yawed_face_yields_larger_yaw_magnitude_than_frontal`, which touches Redis only via an autouse fixture, not its own logic), one at teardown, and one manifesting as the app's own documented fail-closed behavior (`assert 503 == 200` in `test_poor_lighting_causes_a_color_metric_to_abstain` — Redis was genuinely unreachable for a moment, and the app correctly returned `503` rather than silently treating "unreachable" as "not revoked"). This matches a pattern of transient, load-related Redis timeouts observed and confirmed multiple times earlier in this same session on this small shared VM.
+
+Both affected test files were re-run in isolation afterward to check for a real bug rather than assuming transience:
+
+```
+tests/integration/test_end_to_end_analysis.py -v   → 7 passed in 796.76s (0:13:16)
+tests/cv/test_head_pose.py -v                        → 3 passed in 239.99s (0:03:59)
+```
+
+Every test that failed or errored in the full run passed cleanly on retest, with no code changes in between — confirming environmental (Redis-connection) flakiness under sandbox load, not a code defect. No test failed on logic/assertion grounds in this pass.
 
 ## Breakdown by directory
 
@@ -23,20 +36,15 @@ Against a real, isolated `skincare_test` Postgres database and Redis index 1 —
 | `tests/unit/` | 2 | App import + health endpoint |
 | `tests/database/` | 8 | Infra smoke tests (4) + RLS cross-user isolation (4) |
 | `tests/auth/` | 14 | Account invalidation (3), consent (5), refresh rotation (6, incl. concurrent + forced-rollback) |
-| `tests/integration/` | 6 | 3 real (full chain through real CV pipeline, consent gating, no-face-detected), 3 explicitly skipped with a documented reason (blocked on Phases 7-11, not silently omitted) |
+| `tests/integration/` | 7 | Full chain through real CV pipeline, consent gating, no-face-detected, excessive yaw → FAIL, moderate yaw → BORDERLINE, poor lighting → metric abstains, scorer-abstention cross-reference — all real, none skipped |
 | `tests/planning/` | 25 | SafetyEngine (10), safety-in-plan integration (5), intensity separation (3), ranking correction (2), profile persistence (3), supplement removal (2) |
+| `tests/cv/` | 25 | Head pose (3), capture assessment (4), metric confidence (13), scorer abstention (5) |
 
-2 + 8 + 14 + 6 + 25 = 55, exactly matching pytest's `collected` count (52 passed + 3 skipped).
+2 + 8 + 14 + 7 + 25 + 25 = 81, exactly matching pytest's `collected 81 items`. The full run's `1 failed + 79 passed + 2 errors = 82` double-counts one test (`test_poor_lighting_causes_a_color_metric_to_abstain`, which failed at call and then errored again at teardown — one test item, two reported outcomes), consistent with both outcomes tracing to the same single Redis-timeout episode.
 
-## Skipped tests (3), and why that's honest rather than a gap being hidden
+## No tests are skipped
 
-```
-tests/integration/test_end_to_end_analysis.py::test_excessive_yaw_marks_capture_borderline_or_fail
-tests/integration/test_end_to_end_analysis.py::test_poor_lighting_causes_color_metrics_to_abstain
-tests/integration/test_end_to_end_analysis.py::test_abstained_metric_cannot_create_a_personalized_concern
-```
-
-Each carries an explicit `pytest.mark.skip(reason=...)` naming the exact phase it's blocked on (8, 9/10, and 11 respectively). These exist as stubs specifically so the gap shows up in every test run's output — `3 skipped` is visible in the summary line every single time — rather than the scenario being silently absent from the test suite with no trace at all.
+The three scenarios that were previously stubbed with `pytest.mark.skip` (blocked on Phases 7-11) are now real, executing tests — see `test_end_to_end_analysis.py` above. There are zero `skip` markers left anywhere in `tests/`.
 
 ## Notable things proven by real execution, not just code review
 

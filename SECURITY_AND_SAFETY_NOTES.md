@@ -30,9 +30,14 @@ Plain statement of the actual security and safety posture after this foundation 
 - **`users` and `refresh_tokens` are explicitly, deliberately out of RLS scope in this pass.** `users` needs a pre-authentication lookup by email during `/login`, before any session identity exists to scope RLS by. `refresh_tokens` is looked up by an unguessable per-row secret (the token hash), not by session identity — neither fits the `user_id = current_setting(...)` isolation model without a materially different design. This is a real, tracked gap, not a silent omission — see `OPEN_ENGINEERING_ITEMS.md`.
 - Cross-user isolation was verified with real PostgreSQL integration tests run through the restricted role (not the superuser, not mocked): User A cannot read/update/delete User B's `user_profiles`/`consent_events` rows even when explicitly querying by User B's ID. [Pooled-connection-reuse-does-not-leak-context test result: see FOUNDATION_IMPLEMENTATION_REPORT.md for the final pass/fail state and root cause if it failed.]
 
+## Capture quality and CV confidence (Phases 7-11)
+
+- Real head pose (`app/cv/head_pose.py`, `cv2.solvePnP`) and a structured `CaptureAssessment` (`app/cv/capture_assessment.py`, PASS/BORDERLINE/FAIL) now gate `/analyze`: a `FAIL` capture blocks metric computation entirely before any CV math runs on it, rather than silently producing a plan from a bad photo.
+- Every one of the 8 skin/face metrics is returned as a `MetricResult` with its own `confidence` and `status` (`app/cv/metric_result.py`, `app/cv/metric_confidence.py`) — an `ABSTAINED` metric (`value=None`) is provably excluded from triggering a personalized concern in `FacialScorer` (`app/ml/scorer.py`), verified with a real test proving this holds regardless of what the withheld underlying value implied.
+- **This is not clinical validation.** `calibration_version` is literally `"uncalibrated-1.0"` on every result; see `CV_VALIDATION_LIMITATIONS.md` for the full, honest breakdown of what's measured, what corrupts it, and what remains unsolved (the texture/blur circular dependency, most notably).
+
 ## What's explicitly NOT done (see CV_VALIDATION_LIMITATIONS.md and OPEN_ENGINEERING_ITEMS.md for full detail)
 
-- No capture-quality gating beyond a single blended float — no head pose, no PASS/BORDERLINE/FAIL, no per-metric confidence or abstention (Phases 7-11).
 - No billing/subscription/webhook code of any kind exists in this repository.
 - No rate limiting or quota system of any kind exists in this repository.
 - No offer/product catalog exists — safety enforcement is necessarily category-level, not per-product, as stated above.

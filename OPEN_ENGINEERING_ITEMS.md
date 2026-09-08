@@ -6,9 +6,8 @@ Classified into P0 (release blockers) / P1 (pre-launch) / P2 (post-launch) / P3 
 
 ## P0 — Release blockers
 
-1. **CaptureAssessment, real head pose, MetricResult, per-metric confidence, and abstention (Phases 7-11) are entirely unimplemented.** Every plan this app generates is built from bare-float metrics with no confidence signal and no pose/lighting sanity check — a badly-lit or badly-angled photo produces a full plan with the same apparent authority as a well-captured one. See `CV_VALIDATION_LIMITATIONS.md` for the complete breakdown. This is the single largest gap remaining, and the clear next engineering phase.
-2. **`users` and `refresh_tokens` have no row-level security.** Only `user_profiles` and `consent_events` are RLS-scoped in this pass. `users` needs a pre-authentication lookup-by-email design that doesn't yet have an RLS-compatible answer; `refresh_tokens` is looked up by an unguessable per-row secret rather than session identity. Both need a real design pass, not a rushed extension of the current `user_id = current_setting(...)` pattern.
-3. **Allergy/avoid-ingredient enforcement is category-level, not per-product**, because no product/offer catalog exists in this repository at all. `app/domain/product_safety.py` is a deliberate, static, hand-authored adapter — real enforcement against real per-SKU ingredient data requires that catalog to exist first.
+1. **`users` and `refresh_tokens` have no row-level security.** Only `user_profiles` and `consent_events` are RLS-scoped. `users` needs a pre-authentication lookup-by-email design that doesn't yet have an RLS-compatible answer; `refresh_tokens` is looked up by an unguessable per-row secret rather than session identity. Both need a real design pass, not a rushed extension of the current `user_id = current_setting(...)` pattern.
+2. **Allergy/avoid-ingredient enforcement is category-level, not per-product**, because no product/offer catalog exists in this repository at all. `app/domain/product_safety.py` is a deliberate, static, hand-authored adapter — real enforcement against real per-SKU ingredient data requires that catalog to exist first.
 
 ## P1 — Pre-launch
 
