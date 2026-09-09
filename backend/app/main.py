@@ -116,21 +116,37 @@ class AnalyzeRequest(BaseModel):
 
 @app.post("/analyze")
 async def analyze(request: AnalyzeRequest, user_id: str = Depends(get_current_user)):
+    """
+    A thin HTTP adapter over app.domain.analysis_service.perform_analysis
+    (Phase 14) -- this route no longer contains the analysis logic
+    itself, only the translation from that domain function's plain
+    exceptions/result to HTTP status codes/bodies. The domain function
+    is what a future background worker would call too, unchanged.
+    """
     from app.db.connection import get_db_pool
-    from app.db.consent_repository import has_valid_consent, REQUIRED_CONSENT_TYPE, REQUIRED_POLICY_VERSION
-    if not await has_valid_consent(get_db_pool(), uuid.UUID(user_id), REQUIRED_CONSENT_TYPE, REQUIRED_POLICY_VERSION):
-        raise HTTPException(
-            status_code=403,
-            detail=f"Consent required for facial analysis (policy version {REQUIRED_POLICY_VERSION}). "
-                   f"Grant it via POST /consent before calling /analyze.",
-        )
+    from app.domain.analysis_service import (
+        AnalysisRequest,
+        ConsentRequiredError,
+        InvalidImageError,
+        perform_analysis,
+    )
 
     try:
-        image_bytes = base64.b64decode(request.image_base64)
-    except Exception:
+        result = await perform_analysis(
+            get_db_pool(),
+            AnalysisRequest(user_id=user_id, image_base64=request.image_base64),
+            pipeline=pipeline,
+            scorer=scorer,
+            plan_service=plan_service,
+        )
+    except ConsentRequiredError as e:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Consent required for facial analysis (policy version {e.required_policy_version}). "
+                   f"Grant it via POST /consent before calling /analyze.",
+        )
+    except InvalidImageError:
         raise HTTPException(status_code=422, detail="image_base64 is not valid base64")
-    try:
-        extraction_result = pipeline.analyze(image_bytes)
     except NoFaceDetectedError:
         raise HTTPException(status_code=422, detail="No face detected. Please retake the photo.")
     except CaptureQualityFailedError as e:
@@ -144,28 +160,12 @@ async def analyze(request: AnalyzeRequest, user_id: str = Depends(get_current_us
     except ValueError as e:
         raise HTTPException(status_code=422, detail=f"Invalid image: {e}")
 
-    metric_results = extraction_result["metric_results"]
-    capture_assessment = extraction_result["capture_assessment"]
-    eligible_for_longitudinal_comparison = extraction_result["eligible_for_longitudinal_comparison"]
-
-    # user_id is real, from a verified access token. The rest is now a
-    # real persisted profile (app/db/profile_repository.py) -- falling
-    # back to the documented DEFAULT_PROFILE only if the user has never
-    # set one, not as a silent placeholder for missing plumbing.
-    from app.db.profile_repository import get_profile
-    profile = await get_profile(get_db_pool(), uuid.UUID(user_id))
-    user_profile = {"user_id": user_id, **profile}
-
-    analysis = scorer.compute_scores(metric_results, capture_quality=capture_assessment.overall_quality)
-    plan = plan_service.generate_plan(
-        analysis["scores"], analysis["insights"], user_profile, capture_assessment.overall_quality
-    )
     return {
-        "plan": plan,
-        "scores": analysis["scores"],
-        "metric_results": analysis["metric_results"],
-        "capture_assessment": capture_assessment.to_dict(),
-        "eligible_for_longitudinal_comparison": eligible_for_longitudinal_comparison,
+        "plan": result.plan,
+        "scores": result.scores,
+        "metric_results": result.metric_results,
+        "capture_assessment": result.capture_assessment,
+        "eligible_for_longitudinal_comparison": result.eligible_for_longitudinal_comparison,
     }
 
 
