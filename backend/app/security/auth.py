@@ -3,7 +3,7 @@ from typing import Optional
 
 import asyncpg
 from fastapi import Header, HTTPException
-from jose import JWTError
+from jwt import InvalidTokenError as JWTError
 from redis.exceptions import RedisError
 
 from app.db.connection import get_db_pool

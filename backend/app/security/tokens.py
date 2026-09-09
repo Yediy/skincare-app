@@ -2,7 +2,8 @@ import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
 
-from jose import JWTError, jwt
+import jwt
+from jwt import InvalidTokenError as JWTError
 
 from app.config import settings
 
@@ -20,6 +21,11 @@ def create_access_token(user_id: str, family_id: str) -> str:
 
 
 def decode_access_token(token: str) -> dict:
+    # algorithms= is an allowlist, not a hint -- PyJWT refuses to decode a
+    # token signed with anything outside it, which is what actually blocks
+    # algorithm-confusion attacks (e.g. a token claiming "alg: none", or an
+    # RS256-signed token replayed against an HS256 verifier using the
+    # public key as the HMAC secret).
     payload = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
     if payload.get("type") != "access":
         raise JWTError("Not an access token")

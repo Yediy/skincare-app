@@ -1,22 +1,25 @@
-fastapi==0.111.0
+# Runtime/production dependencies only. This is what ships in the
+# Docker image -- see requirements-dev.txt for test-only additions
+# (pytest, pytest-asyncio, httpx). alembic/psycopg2-binary stay here
+# (not dev-only) because migrations run inside this same deployed
+# image (`python -m alembic upgrade head`, see DOKPLOY_DEPLOYMENT.md)
+# rather than a separate migration image.
+fastapi==0.141.1
+starlette==1.6.0
 uvicorn[standard]==0.30.1
-pydantic==2.7.4
+pydantic==2.13.5
 pydantic-settings==2.15.0
 asyncpg==0.29.0
 psycopg2-binary==2.9.9
 alembic==1.13.2
 redis==8.1.0
-python-multipart==0.0.9
-pytest==9.1.1
-pytest-asyncio==1.4.0
-httpx==0.27.0
+python-multipart==0.0.32
 bcrypt==5.0.0
-python-jose[cryptography]==3.5.0
+PyJWT==2.13.0
 email-validator==2.3.0
 boto3==1.34.131
-Pillow==10.4.0
+Pillow==12.3.0
 mediapipe==0.10.14
 opencv-python-headless==4.10.0.84
 numpy==1.26.4
 sentry-sdk[fastapi]==2.13.0
-cryptography==42.0.8
