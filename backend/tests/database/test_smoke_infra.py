@@ -23,7 +23,7 @@ async def test_redis_connection_can_initialize(redis_client):
 async def test_migrations_reach_head(db_pool):
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT version_num FROM alembic_version")
-    assert row["version_num"] == "feb038fd05bd"
+    assert row["version_num"] == "2e77bc462867"
 
 
 async def test_all_expected_tables_exist(db_pool):
@@ -32,4 +32,4 @@ async def test_all_expected_tables_exist(db_pool):
             "SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname = 'public'"
         )
     tables = {r["tablename"] for r in rows}
-    assert {"users", "refresh_tokens", "alembic_version"}.issubset(tables)
+    assert {"users", "refresh_tokens", "jobs", "alembic_version"}.issubset(tables)
