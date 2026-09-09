@@ -1,0 +1,24 @@
+# Per-entry justified ignores for the GATING Trivy scan only (see
+# .github/workflows/ci.yml -- the non-gating "full report" scan does
+# NOT read this file, so every entry here stays visible there and in
+# SECURITY_VULNERABILITY_STATUS.md instead of silently disappearing).
+# No blanket ignores. Each entry must have a CVE, a reason, and a
+# review date; remove the entry the day a real fix lands.
+
+# CVE-2026-0994 -- protobuf (google.protobuf.json_format.ParseDict
+# recursion-depth bypass, DoS via deeply nested Any messages).
+# Installed: protobuf==4.25.9 (transitive, pinned by mediapipe==0.10.14
+# which requires protobuf<5). Fixed in 5.29.6 / 6.33.5, but mediapipe
+# only supports those from 0.10.30+, which removed the legacy
+# mediapipe.solutions API this app's FaceLandmarkExtractor (app/cv/
+# face_landmarks.py) depends on -- upgrading requires migrating to
+# mediapipe's Tasks API and vendoring a separately-distributed .task
+# model asset, a real rewrite of the core facial-analysis pipeline.
+# Not reachable here regardless: this app never calls
+# google.protobuf.json_format.ParseDict on attacker-supplied input --
+# mediapipe uses protobuf only for its own internal binary configs.
+# See SECURITY_VULNERABILITY_STATUS.md and CI_SECURITY_RECONCILIATION.md
+# for the full writeup. Review by: 2026-12-09 (re-check whether a
+# mediapipe release has since restored solutions-API compatibility
+# with a patched protobuf, or reassess the Tasks API migration).
+CVE-2026-0994
