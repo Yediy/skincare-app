@@ -27,10 +27,7 @@ from pathlib import Path
 
 import pytest
 
-GRACE_HOPPER_JPG = (
-    Path(__file__).resolve().parent.parent.parent
-    / ".venv/lib/python3.11/site-packages/matplotlib/mpl-data/sample_data/grace_hopper.jpg"
-)
+GRACE_HOPPER_JPG = Path(__file__).resolve().parent.parent / "fixtures" / "grace_hopper.jpg"
 
 
 async def _signup_login_consent(client, email):

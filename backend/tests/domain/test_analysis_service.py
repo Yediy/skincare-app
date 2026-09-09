@@ -25,10 +25,7 @@ from app.domain.analysis_service import (
     perform_analysis,
 )
 
-GRACE_HOPPER_JPG = (
-    Path(__file__).resolve().parent.parent.parent
-    / ".venv/lib/python3.11/site-packages/matplotlib/mpl-data/sample_data/grace_hopper.jpg"
-)
+GRACE_HOPPER_JPG = Path(__file__).resolve().parent.parent / "fixtures" / "grace_hopper.jpg"
 
 
 async def _create_user_with_consent(db_pool, email: str) -> str:

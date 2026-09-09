@@ -1,5 +1,5 @@
 """Phase 7: structured CaptureAssessment, replacing the single blended
-float. Uses a real photo (bundled matplotlib sample data, already used
+float. Uses a real photo (vendored test fixture, already used
 elsewhere this session) for real landmark detection, then constructs
 deliberately degraded variants of the *same* image (blur, darkness) to
 exercise the FAIL/BORDERLINE paths deterministically -- the face
@@ -17,10 +17,7 @@ import pytest
 from app.cv.capture_assessment import CaptureAssessor, QualityStatus
 from app.cv.face_landmarks import FaceLandmarkExtractor
 
-GRACE_HOPPER_JPG = (
-    Path(__file__).resolve().parent.parent.parent
-    / ".venv/lib/python3.11/site-packages/matplotlib/mpl-data/sample_data/grace_hopper.jpg"
-)
+GRACE_HOPPER_JPG = Path(__file__).resolve().parent.parent / "fixtures" / "grace_hopper.jpg"
 
 
 @pytest.fixture(scope="module")
