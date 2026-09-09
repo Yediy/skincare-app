@@ -230,7 +230,24 @@ via the non-gating Trivy report rather than being hidden.
 
 ## Final GitHub Actions result
 
-_Filled in after this pass's commits are pushed and the real workflow run
-completes -- see the PR/commit this document ships with for the actual run
-ID, commit SHA, and per-job conclusions. This document does not claim
-success ahead of that run._
+```
+Workflow run ID: 34394585364
+Commit SHA:      8d17808084d060a729259fef6843e1135e65cf5b
+
+secret-scan             PASS
+test                     PASS
+dependency-scan         PASS
+docker-build-and-scan   PASS
+```
+
+One real workflow run, one commit, all four jobs green:
+https://github.com/Yediy/skincare-app/actions/runs/34394585364
+
+This took two pushes to land, not one -- the first
+(commit `71ea085`, run `34357736117`) got `secret-scan`/`test`/
+`docker-build-and-scan` green but missed that `pip-audit` has no
+severity/unfixed-status filter the way Trivy's `ignore-unfixed` does, so
+the same accepted protobuf exception that Trivy correctly excluded still
+failed `dependency-scan` there. Fixed with the matching `--ignore-vuln`
+exception (commit `8d17808`) rather than declaring success on the first,
+partially-green run.
