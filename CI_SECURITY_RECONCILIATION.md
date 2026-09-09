@@ -88,12 +88,25 @@ cryptography, protobuf, starlette, ecdsa).
 | cryptography | 42.0.8 | **removed** | Was a direct pin only because `python-jose[cryptography]` needed it; no code in `app/` imports it directly (verified: no `hazmat`/`Fernet`/`from cryptography` anywhere in `app/`). Removed entirely along with python-jose (see JWT decision below) rather than merely bumped. | N/A -- dependency eliminated | Confirmed via a from-scratch venv install: `cryptography` is not installed at all from the final `requirements.txt` |
 | protobuf | 4.25.9 | **unchanged** (documented exception) | See "MediaPipe / protobuf decision" below | N/A | N/A |
 
-`pip-audit` after this pass: **1 known vulnerability** (protobuf,
-CVE-2026-0994, documented in `SECURITY_VULNERABILITY_STATUS.md`) in the
-production dependency set. `pip check` and a genuinely fresh
-`python -m venv` + `pip install -r backend/requirements.txt` install both
-confirm no broken/conflicting requirements, and confirm `cryptography` and
-`ecdsa` are not installed at all (not merely unused -- absent).
+`pip-audit -r backend/requirements.txt` after the dependency-upgrade
+commit: **1 known vulnerability** (protobuf, `PYSEC-2026-1805` /
+CVE-2026-0994). `pip check` and a genuinely fresh `python -m venv` +
+`pip install -r backend/requirements.txt` install both confirm no
+broken/conflicting requirements, and confirm `cryptography` and `ecdsa`
+are not installed at all (not merely unused -- absent).
+
+Unlike Trivy, `pip-audit` has no severity threshold to filter on here --
+it fails on *any* known vulnerability, so the accepted protobuf exception
+(same CVE as the Trivy one, see the MediaPipe/protobuf decision below)
+still failed the real `dependency-scan` job on this pass's first push
+(run `34357736117`). Fixed by adding the same kind of per-CVE-justified
+exception pip-audit itself provides for exactly this case --
+`--ignore-vuln PYSEC-2026-1805` on both pip-audit invocations in
+`.github/workflows/ci.yml` -- rather than weakening the gate generally;
+`pip-audit` now reports "No known vulnerabilities found, 1 ignored" for
+the production dependency set, with the ignore itself dated and
+justified in both `ci.yml`'s comments and
+`SECURITY_VULNERABILITY_STATUS.md`.
 
 ## JWT library decision
 

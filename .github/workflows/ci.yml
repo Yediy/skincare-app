@@ -97,11 +97,20 @@ jobs:
       - name: pip-audit (known-CVE scan of production dependencies -- release gate)
         run: |
           python -m pip install --upgrade pip pip-audit
-          pip-audit -r requirements.txt
+          # --ignore-vuln entries are per-CVE-justified exceptions only,
+          # never blanket -- see SECURITY_VULNERABILITY_STATUS.md and
+          # CI_SECURITY_RECONCILIATION.md for the full writeup, and
+          # backend/.trivyignore for the equivalent Trivy-side exception.
+          # PYSEC-2026-1805 / CVE-2026-0994 (protobuf): a JSON-parsing
+          # recursion-depth DoS not reachable through anything this app
+          # does with protobuf; fixing it requires a mediapipe version
+          # that dropped the legacy `mediapipe.solutions` API this app's
+          # CV pipeline depends on. Review by 2026-12-09.
+          pip-audit -r requirements.txt --ignore-vuln PYSEC-2026-1805
 
       - name: pip-audit (dev/test dependencies -- informational, not a release gate)
         continue-on-error: true
-        run: pip-audit -r requirements-dev.txt
+        run: pip-audit -r requirements-dev.txt --ignore-vuln PYSEC-2026-1805
 
   docker-build-and-scan:
     runs-on: ubuntu-latest
