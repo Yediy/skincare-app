@@ -57,6 +57,14 @@ MediaPipe FaceMesh landmarks → real head pose (`app/cv/head_pose.py`, `cv2.sol
 
 Full detail, including the target architecture this is a first slice of, in `PRODUCTION_ARCHITECTURE.md`, `POSTGRES_OPERATIONS.md`, `DOKPLOY_DEPLOYMENT.md`, `FAILURE_DOMAINS.md`, `SCALING_TRIGGERS.md`.
 
+## Async analysis foundation — `VERIFIED_IMPLEMENTED` (this pass)
+
+- **Domain boundary (Phase 14)**: `app/domain/analysis_service.py`'s `perform_analysis()` is the entire consent-check → decode → CV pipeline → profile fetch → score → plan sequence that used to be inlined directly in `/analyze`'s route handler, extracted into a plain async function with no FastAPI/HTTP dependency — it raises framework-agnostic exceptions (`ConsentRequiredError`, `InvalidImageError`, plus the pre-existing `NoFaceDetectedError`/`CaptureQualityFailedError` left unchanged) and returns a plain `AnalysisResult` dataclass. `pipeline`/`scorer`/`plan_service` are passed in rather than constructed inside, so a future background worker can call this exact function with its own singleton instances. `/analyze` itself is now a thin adapter translating this function's outcomes to HTTP. **Does not change `/analyze`'s behavior or move it onto a queue** — verified by the pre-existing `tests/integration/test_end_to_end_analysis.py` suite passing unchanged, plus 4 new tests in `tests/domain/test_analysis_service.py` that call `perform_analysis()` directly with zero HTTP involved (no `client`/ASGI transport at all) — the actual proof this function doesn't secretly still depend on the web framework.
+- **Job queue abstraction (Phase 15)**: `app/queue/base.py`'s provider-neutral `JobQueue` ABC (`enqueue`/`claim`/`acknowledge`/`fail`) and `app/queue/postgres_queue.py`'s `PostgresJobQueue`, backed by a new generic `jobs` table (migration `2e77bc462867`) rather than a new infrastructure dependency — consistent with this pass's own instruction not to deploy Kafka/Pulsar before it's measured as necessary. Claim exclusivity uses `SELECT ... FOR UPDATE SKIP LOCKED`, proven with a real concurrent-claim test (`asyncio.gather` of 5 claimers against 5 jobs — no two ever receive the same job). **Nothing in the application enqueues onto this yet**, deliberately, same posture as the object storage abstraction before it — `/analyze` still runs synchronously inline.
+- **Idempotent enqueue (Phase 16)**: `PostgresJobQueue.enqueue()`'s `request_id` parameter is deduplicated via a partial unique index (`jobs(job_type, request_id) WHERE request_id IS NOT NULL`) — the same logical request submitted twice returns the same job, not a duplicate, regardless of that job's current status (including after a failure — a genuinely new attempt requires a new `request_id`, a documented, deliberate scope decision). Full end-to-end "`/analyze` request submitted twice → one persisted result" is not yet meaningful, honestly stated: no `measurements`/`analysis_results`/`plans` table exists in this repository at all (unchanged from before this pass; `/analyze`'s response is never persisted, only returned), so job-level idempotency is the real, testable guarantee this pass can honestly claim — see `OPEN_ENGINEERING_ITEMS.md`.
+
+16 new job-queue tests (`tests/queue/test_postgres_job_queue.py`) run through the real restricted `skincare_app` role, not mocked.
+
 ## What does not exist, at all (confirmed by direct inspection this pass, same as before except where noted)
 
 - No billing/subscription/webhook code of any kind.
@@ -64,7 +72,8 @@ Full detail, including the target architecture this is a first slice of, in `PRO
 - No offer/product catalog (`offers` table or equivalent).
 - No mobile app source (`mobile/` is empty directory scaffolding).
 - No notification system.
-- No job queue, async analysis job model, analysis idempotency, or CV worker separation — `/analyze` still runs the CV pipeline synchronously inline (Phase 14/15, deferred).
+- No `measurements`/`analysis_results`/`plans` persistence table — `/analyze`'s output is still returned only, never stored, so "one persisted result per idempotent request" isn't yet a claim this repository can make (job-level idempotency is; see above).
+- No CV worker separation or queue consumer — `/analyze` still runs the CV pipeline synchronously inline on the API's own event loop; `JobQueue`/`PostgresJobQueue` exist but nothing calls `enqueue`/`claim` from a real code path yet.
 - No `home_region`/`cell_id` fields or cell-routing abstraction (Phase 23, deferred).
 - No transactional outbox / domain events (Phase 26, deferred).
 - No metrics/observability pipeline or structured logging beyond Python's stdlib `logging` (Phase 28/29, deferred).

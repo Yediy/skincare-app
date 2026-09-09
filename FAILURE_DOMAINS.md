@@ -50,9 +50,11 @@ Currently, CV work (`FacialAnalysisPipeline`) runs synchronously inside the API 
 
 **What happens if this disappears (i.e., today, if CV compute itself hangs or crashes)?** It takes down the one API replica handling that request; other replicas are unaffected. A pathological image that hangs `pipeline.analyze()` indefinitely would hold that replica's event loop hostage for the duration (mediapipe/opencv calls are synchronous, not `await`ed) — a real, currently-unmitigated risk worth flagging honestly rather than glossing over, since it's the reason Phase 14/15's queue-based extraction is on the roadmap at all, not just a scale optimization.
 
-## Queue (not built yet)
+## Queue (`PostgresJobQueue`, unused by any real code path)
 
-N/A — doesn't exist. See `OPEN_ENGINEERING_ITEMS.md` Phase 15.
+The `JobQueue` abstraction and its Postgres-backed implementation exist (`app/queue/`, migration `2e77bc462867`), but nothing enqueues onto it yet — `/analyze` still runs synchronously inline. So today, this table's failure domain is empty by construction: nothing depends on it.
+
+**What happens once something does depend on it (target)?** The queue is just rows in the same Postgres primary everything else already depends on — it has no *separate* failure domain from "Postgres primary" above; a Postgres outage takes down enqueue/claim exactly as it takes down login. A stuck/crashed worker (once one exists) does not lose work: an unacknowledged claimed job becomes reclaimable again once its `claimed_until` visibility timeout passes (proven by a real test, `test_expired_claim_becomes_reclaimable`), so a worker crash mid-job results in a retried job, not a lost one — assuming the work itself is safe to retry, which is a per-job-type property this abstraction doesn't enforce on its own.
 
 ## Dokploy control plane
 

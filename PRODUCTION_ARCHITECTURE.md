@@ -35,6 +35,9 @@ This describes the target production architecture and, separately and explicitly
 ### Postgres connection layer
 `app/db/connection.py`'s `init_db_pool` now takes pool min/max size, a per-connection connect timeout, a command timeout, and sets `application_name` — all from `Settings`, not hardcoded. `close_db_pool` already used `pool.close()` (graceful — waits for checked-out connections) rather than `.terminate()`; unchanged, just documented.
 
+### Async analysis foundation (Phases 14-16, a later pass)
+`app/domain/analysis_service.py`'s `perform_analysis()` is `/analyze`'s full consent → decode → CV → profile → score → plan sequence, extracted from the HTTP route handler into a plain async function with no FastAPI dependency, raising framework-agnostic exceptions and taking `pipeline`/`scorer`/`plan_service` as parameters rather than constructing them — so a future background worker can call this exact function. `/analyze` itself is now a thin adapter and its behavior is unchanged (verified by the pre-existing E2E suite passing unchanged, plus new tests calling `perform_analysis()` directly with zero HTTP involved). `app/queue/base.py`'s `JobQueue` ABC and `app/queue/postgres_queue.py`'s `PostgresJobQueue` (migration `2e77bc462867`) provide a generic, provider-neutral job queue backed by Postgres rather than a new infrastructure dependency, with real `SELECT ... FOR UPDATE SKIP LOCKED`-based claim exclusivity and idempotent enqueue-by-`request_id` (a partial unique index, not application-level check-then-insert). Nothing calls `enqueue`/`claim` from any real code path yet — same deliberate-but-unused posture as the object storage abstraction above.
+
 ## Target architecture (not built this pass unless stated above)
 
 ```text

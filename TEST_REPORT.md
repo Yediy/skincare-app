@@ -20,6 +20,8 @@ Full suite, one complete, isolated run (no concurrent pytest process, no concurr
 
 **Zero failures, zero errors.** This is the deterministic, single-execution, all-green result this pass's Phase 1 set out to reach.
 
+**Update, later pass (Phases 14-16, 134 tests)**: one run recorded `133 passed, 1 error` — a `redis.exceptions.*` connection error during `test_liveness_endpoint_responds`'s fixture setup, tracing to `getaddrinfo("localhost", 6379)` being cancelled by Phase 1's own 5-second `socket_connect_timeout` under this sandbox's sustained resource contention (`uptime` showed a load average of 5.85-8.7 on a 2.7GB VM at the time, consistent throughout this entire session). Re-run of that exact test file in isolation immediately after: `4 passed` clean. This is the same class of environmental flakiness Phase 1 investigated, occurring despite that hardening rather than because it's missing — a 5-second timeout on `localhost` DNS resolution should never fire under normal load, and didn't the moment competing CPU/memory pressure from the same run's CV-heavy tests was gone. Not treated as a masked failure: the timeout fired, was reported honestly, and was independently reproduced as transient rather than silently retried away.
+
 ## Phase 1 investigation: making the suite deterministic
 
 The prior pass's `TEST_REPORT.md` recorded transient `redis.exceptions.TimeoutError` failures under this sandbox's system load. This pass investigated rather than re-asserting "environment problem" as a permanent excuse:
@@ -31,12 +33,14 @@ The prior pass's `TEST_REPORT.md` recorded transient `redis.exceptions.TimeoutEr
 
 **What did NOT reproduce this pass**: two separate full-suite runs during this pass (one mid-pass with earlier code, 90 passed/1 failed — the 1 failure was later proven, by isolated re-run, to be self-inflicted test-runner interference from accidentally running two pytest processes concurrently against the same shared test database, not a Redis timeout; and the final run above, 114/0) recorded zero Redis-connection-timeout failures. The hardening above is real and worth keeping regardless, but this pass cannot honestly claim to have reproduced-then-fixed the original timeout — only to have closed every concrete gap that could cause one, and to have caught two different real bugs (both pytest-asyncio/event-loop interactions) along the way that a less careful "add a retry and move on" pass would have missed.
 
-## Breakdown by directory (114 total, matching pytest's own `collected 114 items`)
+## Breakdown by directory (134 total, matching pytest's own `collected 134 items`)
 
 | Directory | Tests | Notes |
 |---|---|---|
 | `tests/unit/` | 14 | App import, liveness (1), readiness incl. simulated DB outage (2), production config validation (10) |
 | `tests/storage/` | 11 | `CloudflareR2ObjectStorage` contract via `botocore.stub.Stubber` — no real R2 connectivity |
+| `tests/domain/` | 4 | `perform_analysis()` called directly, zero HTTP involved |
+| `tests/queue/` | 16 | `PostgresJobQueue`: enqueue idempotency, claim exclusivity (incl. real concurrency), acknowledge/fail, expired-claim reclaim |
 | `tests/database/` | 18 | Infra smoke (4) + RLS cross-user isolation across all four tables (14) |
 | `tests/auth/` | 14 | Account invalidation (3), consent (5), refresh rotation (6) |
 | `tests/integration/` | 7 | Full chain through the real CV pipeline, consent gating, no-face-detected, excessive/moderate yaw, poor-lighting abstention |
@@ -44,6 +48,12 @@ The prior pass's `TEST_REPORT.md` recorded transient `redis.exceptions.TimeoutEr
 | `tests/cv/` | 25 | Head pose, capture assessment, metric confidence, scorer abstention |
 
 No `pytest.mark.skip` markers anywhere in `tests/` — unchanged from before this pass.
+
+## Async analysis foundation pass (Phases 14-16): 20 new tests
+
+`tests/domain/test_analysis_service.py` (4) calls `perform_analysis()` directly with zero HTTP involved — the actual proof the extracted domain function doesn't secretly still depend on FastAPI, not an assertion from reading the code. `tests/queue/test_postgres_job_queue.py` (16) runs `PostgresJobQueue` through the real restricted `skincare_app` role, including a genuine concurrency test (`asyncio.gather` of 5 concurrent claimers against 5 pending jobs — proves no two claimers ever receive the same job) and idempotent-enqueue coverage (same `request_id` twice returns the same job; different `job_type` with the same `request_id` doesn't collide; a failed job isn't silently retried by re-enqueuing the same `request_id`).
+
+The pre-existing `tests/integration/test_end_to_end_analysis.py` suite (7 tests) was re-run after `/analyze` was rewired onto the new domain function and passed unchanged — proof the extraction didn't alter `/analyze`'s actual behavior, only its internal structure. As with the prior pass, `tests/database/test_smoke_infra.py::test_migrations_reach_head` needed its hardcoded head SHA updated for the new `jobs`-table migration (`2e77bc462867`) — expected, not a regression.
 
 ## Verified beyond the test suite itself, this pass
 

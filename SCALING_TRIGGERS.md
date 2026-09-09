@@ -19,7 +19,7 @@ This is the cheapest scaling lever in the whole architecture (`PRODUCTION_ARCHIT
 - `/analyze` load materially affects the latency of *unrelated* endpoints on the same replica (e.g. `/login` p95 degrading because the event loop is busy with synchronous CV work) — this is the specific, concrete symptom of the coupling `FAILURE_DOMAINS.md`'s CV-worker section already flags as a live risk today, not a hypothetical.
 - Or: CV compute needs different hardware (more CPU cores, or eventually GPU) than the HTTP-serving replicas need — provisioning API replicas identically to CV-heavy replicas becomes wasteful once this is true.
 
-Building this before either symptom is real would mean paying queue/worker operational complexity (Phase 14/15) for zero measured benefit — exactly the overbuilding this pass's own brief warns against.
+The domain boundary and queue abstraction this now needs already exist (`app/domain/analysis_service.py`, `app/queue/`) — extracting a CV worker at that point means writing the worker process and wiring `/analyze` to enqueue instead of calling the pipeline inline, not building the queue itself from scratch. Doing that wiring before either symptom above is real would still mean paying a real API-contract change (submit → poll, instead of a synchronous response) for zero measured benefit — exactly the overbuilding this pass's own brief warns against.
 
 ## Add a Postgres read replica or PgBouncer when
 
