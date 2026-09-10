@@ -23,7 +23,7 @@ async def test_redis_connection_can_initialize(redis_client):
 async def test_migrations_reach_head(db_pool):
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT version_num FROM alembic_version")
-    assert row["version_num"] == "b034483cb876"
+    assert row["version_num"] == "071fab81f0ac"
 
 
 async def test_all_expected_tables_exist(db_pool):

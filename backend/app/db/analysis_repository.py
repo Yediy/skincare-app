@@ -165,6 +165,26 @@ async def get_product_recommendations(pool: asyncpg.Pool, user_id: UUID, analysi
     return results
 
 
+async def find_overdue_ephemeral_images(pool: asyncpg.Pool, *, batch_limit: int = 100) -> List[Dict[str, Any]]:
+    """Cross-user by design -- the safety-net cleanup sweeper (Part IV,
+    Phase 22) needs to find overdue images regardless of which user
+    they belong to. Goes through find_overdue_ephemeral_images(), a
+    narrow SECURITY DEFINER SQL function (migration 071fab81f0ac), not
+    a direct SELECT -- RLS would otherwise scope any ordinary query to
+    one app.current_user_id, and this role has no broader bypass."""
+    rows = await pool.fetch("SELECT * FROM find_overdue_ephemeral_images($1)", batch_limit)
+    return [dict(r) for r in rows]
+
+
+async def clear_image_reference(pool: asyncpg.Pool, analysis_request_id: UUID) -> None:
+    """Call only after the object has been *confirmed* deleted from
+    storage (EphemeralAnalysisImageStore.delete_if_confirmed()
+    returning True) -- never before, or a crash between clearing this
+    reference and actually deleting the object would orphan it with no
+    remaining pointer for a later sweep to find."""
+    await pool.execute("SELECT clear_image_reference($1)", analysis_request_id)
+
+
 async def commit_analysis_result(
     pool: asyncpg.Pool,
     user_id: UUID,

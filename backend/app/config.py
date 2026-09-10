@@ -80,17 +80,26 @@ class Settings(BaseSettings):
     # undeclared proxy.
     trusted_proxies: List[str] = []
 
-    # Object storage (Phase 6/7). All optional: nothing in the
-    # application calls into R2 yet (see PRODUCTION_ARCHITECTURE.md --
-    # face images are deliberately not persisted there), so an
-    # unconfigured deployment must keep working unmodified. Once a
-    # real feature depends on R2, these become required the same way
-    # jwt_secret/database_url already are.
+    # Object storage (Phase 6/7). All optional: an unconfigured
+    # deployment must keep working unmodified for as long as
+    # async_image_storage_enabled stays False below (the default).
     r2_account_id: Optional[str] = None
     r2_access_key_id: Optional[str] = None
     r2_secret_access_key: Optional[str] = None
     r2_bucket: Optional[str] = None
     r2_endpoint: Optional[str] = None
+
+    # Async analysis submission (production recommendation pass, Part
+    # IV/V). Defaults False -- see CONSENT_ASYNC_PROCESSING_REVIEW.md:
+    # this pass builds the full async image-transport pipeline
+    # (EphemeralAnalysisImageStore on top of R2, a real CV worker), but
+    # it must not run against real user traffic until a real legal/
+    # product review confirms the consent language covers transient
+    # third-party cloud storage during processing, which this
+    # engineering pass has no authority to assert on its own.
+    # AnalysisSubmissionService checks this and refuses to enqueue
+    # (503) when False, rather than silently proceeding.
+    async_image_storage_enabled: bool = False
 
     @property
     def is_production(self) -> bool:
