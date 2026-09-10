@@ -11,7 +11,13 @@ from pydantic import BaseModel, EmailStr, Field
 
 from app.config import settings
 from app.cv.pipeline import FacialAnalysisPipeline, NoFaceDetectedError, CaptureQualityFailedError
-from app.domain.entitlement import FreeTierEntitlementService, QuotaExceededError, UsagePolicyService
+from app.domain.entitlement import (
+    AnalysisAlreadyCompletedError,
+    AnalysisInProgressError,
+    FreeTierEntitlementService,
+    QuotaExceededError,
+    UsagePolicyService,
+)
 from app.domain.product_matching_service import ProductMatchingService
 from app.domain.safety_engine import SafetyEngine
 from app.ml.scorer import FacialScorer
@@ -191,6 +197,16 @@ async def analyze(request: AnalyzeRequest, user_id: str = Depends(rate_limit_by_
         )
     except QuotaExceededError as e:
         raise HTTPException(status_code=429, detail=str(e))
+    except AnalysisAlreadyCompletedError as e:
+        raise HTTPException(
+            status_code=409,
+            detail="This request_id already completed. Retry with a new request_id for a new analysis.",
+        )
+    except AnalysisInProgressError as e:
+        raise HTTPException(
+            status_code=409,
+            detail="This request_id is already being processed. Wait for it to finish, or retry with a new request_id.",
+        )
     except InvalidImageError:
         raise HTTPException(status_code=422, detail="image_base64 is not valid base64")
     except NoFaceDetectedError:

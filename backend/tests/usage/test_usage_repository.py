@@ -93,21 +93,116 @@ async def test_release_marks_reservation_released_and_frees_a_slot(db_pool, app_
     assert fresh.status == usage_repository.RESERVED
 
 
-async def test_released_reservations_request_id_is_not_reusable_for_a_fresh_reservation(db_pool, app_db_pool):
-    """Matches the same idempotency philosophy as the jobs table
-    (app/queue/postgres_queue.py): a request_id maps to one row
-    forever, including after release -- a retry with that same
-    request_id returns the RELEASED row itself, not a new reservation.
-    A genuinely new attempt requires a new request_id."""
-    user_id = await _create_user(db_pool, "usage-release-replay@test.com")
+# --- Part II, Phase 14: corrected RELEASED-retry semantics -----------
+
+async def test_released_request_can_be_re_reserved_atomically(db_pool, app_db_pool):
+    """Corrected this pass: a RELEASED reservation may be re-reserved
+    under the SAME request_id (RELEASED -> RESERVED), subject to
+    current quota availability -- not permanently terminal the way an
+    earlier pass assumed. attempt_count increments."""
+    user_id = await _create_user(db_pool, "usage-release-retry@test.com")
     request_id = str(uuid.uuid4())
-    reservation = await usage_repository.reserve(app_db_pool, user_id, request_id, "2026-09", allowance=3)
-    await usage_repository.release(app_db_pool, user_id, reservation.id)
+    first = await usage_repository.reserve(app_db_pool, user_id, request_id, "2026-09", allowance=3)
+    assert first.attempt_count == 1
+    await usage_repository.release(app_db_pool, user_id, first.id)
+
+    retry = await usage_repository.reserve(app_db_pool, user_id, request_id, "2026-09", allowance=3)
+    assert retry.id == first.id
+    assert retry.status == usage_repository.RESERVED
+    assert retry.replay is True
+    assert retry.just_reactivated is True
+    assert retry.attempt_count == 2
+
+
+async def test_released_retry_that_succeeds_ends_consumed_never_stranded_released(db_pool, app_db_pool):
+    user_id = await _create_user(db_pool, "usage-release-retry-success@test.com")
+    request_id = str(uuid.uuid4())
+    first = await usage_repository.reserve(app_db_pool, user_id, request_id, "2026-09", allowance=3)
+    await usage_repository.release(app_db_pool, user_id, first.id)
+
+    retry = await usage_repository.reserve(app_db_pool, user_id, request_id, "2026-09", allowance=3)
+    await usage_repository.consume(app_db_pool, user_id, retry.id)
+
+    row = await db_pool.fetchrow("SELECT status FROM analysis_usage WHERE id = $1", retry.id)
+    assert row["status"] == "CONSUMED"
+
+
+async def test_released_retry_respects_current_quota_not_a_free_pass(db_pool, app_db_pool):
+    """A released slot does not bypass the allowance check -- if the
+    user's *other* reservations now fill the allowance, the released
+    request_id's retry is DENIED, not silently granted."""
+    user_id = await _create_user(db_pool, "usage-release-retry-denied@test.com")
+    request_id = str(uuid.uuid4())
+    first = await usage_repository.reserve(app_db_pool, user_id, request_id, "2026-09", allowance=1)
+    await usage_repository.release(app_db_pool, user_id, first.id)
+
+    # Fill the (now-freed) single slot with a different request.
+    other = await usage_repository.reserve(app_db_pool, user_id, str(uuid.uuid4()), "2026-09", allowance=1)
+    assert other.status == usage_repository.RESERVED
+
+    retry = await usage_repository.reserve(app_db_pool, user_id, request_id, "2026-09", allowance=1)
+    assert retry.status == usage_repository.DENIED
+
+
+async def test_consumed_replay_returns_consumed_status_creates_nothing_new(db_pool, app_db_pool):
+    user_id = await _create_user(db_pool, "usage-consumed-replay@test.com")
+    request_id = str(uuid.uuid4())
+    first = await usage_repository.reserve(app_db_pool, user_id, request_id, "2026-09", allowance=3)
+    await usage_repository.consume(app_db_pool, user_id, first.id)
 
     replay = await usage_repository.reserve(app_db_pool, user_id, request_id, "2026-09", allowance=3)
-    assert replay.id == reservation.id
-    assert replay.status == usage_repository.RELEASED
+    assert replay.id == first.id
+    assert replay.status == usage_repository.CONSUMED
     assert replay.replay is True
+    assert replay.just_reactivated is False
+
+    row_count = await db_pool.fetchval(
+        "SELECT COUNT(*) FROM analysis_usage WHERE user_id = $1 AND request_id = $2", user_id, request_id
+    )
+    assert row_count == 1  # no second row created
+
+
+async def test_reserved_replay_by_a_second_concurrent_caller_does_not_reactivate(db_pool, app_db_pool):
+    """A request_id still RESERVED (not yet consumed or released) --
+    e.g. another attempt already in flight -- must come back as a
+    plain replay with just_reactivated=False, distinguishing it from a
+    legitimate RELEASED->RESERVED retry."""
+    user_id = await _create_user(db_pool, "usage-reserved-replay@test.com")
+    request_id = str(uuid.uuid4())
+    first = await usage_repository.reserve(app_db_pool, user_id, request_id, "2026-09", allowance=3)
+
+    replay = await usage_repository.reserve(app_db_pool, user_id, request_id, "2026-09", allowance=3)
+    assert replay.id == first.id
+    assert replay.status == usage_repository.RESERVED
+    assert replay.replay is True
+    assert replay.just_reactivated is False
+    assert replay.attempt_count == 1  # unchanged -- no reactivation happened
+
+
+async def test_same_released_request_raced_concurrently_ten_times_yields_one_active_reservation(db_pool, app_db_pool):
+    """The required Part II concurrency proof: the same RELEASED
+    request_id retried by 10 simultaneous callers must produce exactly
+    one active (RESERVED) reservation and no quota leak -- the
+    advisory-lock serialization from Phase 9 applies identically to the
+    RELEASED->RESERVED path, not just fresh inserts."""
+    user_id = await _create_user(db_pool, "usage-released-race@test.com")
+    request_id = str(uuid.uuid4())
+    first = await usage_repository.reserve(app_db_pool, user_id, request_id, "2026-09", allowance=5)
+    await usage_repository.release(app_db_pool, user_id, first.id)
+
+    results = await asyncio.gather(*(
+        usage_repository.reserve(app_db_pool, user_id, request_id, "2026-09", allowance=5) for _ in range(10)
+    ))
+
+    ids = {r.id for r in results}
+    assert ids == {first.id}
+    assert all(r.status == usage_repository.RESERVED for r in results)
+    reactivated_count = sum(1 for r in results if r.just_reactivated)
+    assert reactivated_count == 1  # exactly one caller performed the transition
+
+    row = await db_pool.fetchrow("SELECT status, attempt_count FROM analysis_usage WHERE id = $1", first.id)
+    assert row["status"] == "RESERVED"
+    assert row["attempt_count"] == 2  # incremented exactly once, not 10 times
 
 
 async def test_concurrent_reservations_never_exceed_allowance(db_pool, app_db_pool):
