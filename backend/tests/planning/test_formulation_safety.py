@@ -13,7 +13,9 @@ import pytest
 from app.domain.safety_engine import (
     ACTIVE_INTERACTION_CONFLICT,
     ALLERGY_CONFLICT,
+    INCOMPLETE_FORMULATION_DATA,
     INSUFFICIENT_DATA,
+    MAX_FREQUENCY_EXCEEDED,
     NURSING_RESTRICTION,
     PREGNANCY_RESTRICTION,
     RESTRICTED,
@@ -21,6 +23,8 @@ from app.domain.safety_engine import (
     SafetyEngine,
     SENSITIVE_SKIN_INTENSITY_LIMIT,
     UNKNOWN_FORMULATION,
+    UNRESOLVED_ALLERGY_CONSTRAINT,
+    UNRESOLVED_AVOID_CONSTRAINT,
     UNSAFE,
     USER_AVOID_INGREDIENT,
 )
@@ -206,3 +210,127 @@ async def test_commercial_factors_cannot_change_safety_result(app_db_pool, synth
     assert decision_original.status == decision_rebranded.status == UNSAFE
     assert decision_original.reason_codes == decision_rebranded.reason_codes
     assert decision_original.restrictions == decision_rebranded.restrictions
+
+
+# --- Part I, Phase 1/2: formulation data completeness -----------------
+
+async def test_partial_formulation_never_appears_safe(app_db_pool, synthetic_catalog):
+    """Real ingredients are recorded (unlike the zero-ingredient
+    'incomplete' case) but ingredient_data_status is PARTIAL -- must
+    still be INSUFFICIENT_DATA, never SAFE, purely because of that
+    status field."""
+    engine = SafetyEngine()
+    decision = await engine.evaluate_product_formulation(
+        app_db_pool, synthetic_catalog["formulations"]["partial"], NO_CONSTRAINTS,
+    )
+    assert decision.status == INSUFFICIENT_DATA
+    assert decision.allowed is False
+    assert INCOMPLETE_FORMULATION_DATA in decision.reason_codes
+    assert decision.status != SAFE
+
+
+async def test_unknown_status_formulation_never_appears_safe(app_db_pool, synthetic_catalog):
+    engine = SafetyEngine()
+    decision = await engine.evaluate_product_formulation(
+        app_db_pool, synthetic_catalog["formulations"]["unknown"], NO_CONSTRAINTS,
+    )
+    assert decision.status == INSUFFICIENT_DATA
+    assert decision.allowed is False
+    assert INCOMPLETE_FORMULATION_DATA in decision.reason_codes
+
+
+async def test_one_or_more_ingredients_is_not_sufficient_for_complete(app_db_pool, synthetic_catalog):
+    """A formulation is never inferred COMPLETE merely because it has
+    ingredients recorded -- both the partial and unknown fixtures have
+    two real ingredients each (same as several SAFE fixtures) and are
+    still correctly rejected, proving the gate is the explicit status
+    field, not ingredient-list non-emptiness."""
+    partial = await SafetyEngine().evaluate_product_formulation(
+        app_db_pool, synthetic_catalog["formulations"]["partial"], NO_CONSTRAINTS,
+    )
+    unknown = await SafetyEngine().evaluate_product_formulation(
+        app_db_pool, synthetic_catalog["formulations"]["unknown"], NO_CONSTRAINTS,
+    )
+    assert partial.status == unknown.status == INSUFFICIENT_DATA
+
+
+# --- Part I, Phase 4: unresolved user constraints ----------------------
+
+async def test_unresolved_allergy_constraint_blocks_specific_product_recommendation(app_db_pool, synthetic_catalog):
+    """Even a formulation that would otherwise be SAFE must fail
+    closed to INSUFFICIENT_DATA when the calling user has an
+    unresolved allergy constraint -- the system must not silently
+    recommend a specific product as though the unresolved constraint
+    didn't exist."""
+    engine = SafetyEngine()
+    constraints = {
+        "allergies": [], "avoid_ingredients": [],
+        "has_unresolved_allergy_constraint": True,
+    }
+    decision = await engine.evaluate_product_formulation(
+        app_db_pool, synthetic_catalog["formulations"]["moisturizer"], constraints,
+    )
+    assert decision.status == INSUFFICIENT_DATA
+    assert decision.allowed is False
+    assert UNRESOLVED_ALLERGY_CONSTRAINT in decision.reason_codes
+
+
+async def test_unresolved_avoid_constraint_blocks_specific_product_recommendation(app_db_pool, synthetic_catalog):
+    engine = SafetyEngine()
+    constraints = {
+        "allergies": [], "avoid_ingredients": [],
+        "has_unresolved_avoid_constraint": True,
+    }
+    decision = await engine.evaluate_product_formulation(
+        app_db_pool, synthetic_catalog["formulations"]["moisturizer"], constraints,
+    )
+    assert decision.status == INSUFFICIENT_DATA
+    assert decision.allowed is False
+    assert UNRESOLVED_AVOID_CONSTRAINT in decision.reason_codes
+
+
+async def test_no_unresolved_constraint_flags_does_not_block_recommendation(app_db_pool, synthetic_catalog):
+    """The absence of the new optional constraint keys (the pre-
+    existing calling convention, before this pass) must not itself
+    trigger the new gate -- confirms backward compatibility of the
+    constraints dict shape."""
+    engine = SafetyEngine()
+    decision = await engine.evaluate_product_formulation(
+        app_db_pool, synthetic_catalog["formulations"]["moisturizer"], NO_CONSTRAINTS,
+    )
+    assert decision.status == SAFE
+
+
+# --- Part I, Phase 5: MAX_FREQUENCY is a restriction, not a verdict ----
+
+async def test_max_frequency_rule_is_surfaced_as_restriction_not_exceeded(app_db_pool, synthetic_catalog):
+    """A MAX_FREQUENCY rule existing on an ingredient must never, by
+    itself, produce MAX_FREQUENCY_EXCEEDED at the formulation level --
+    only evaluate_routine_safety(), once an actual proposed schedule
+    is compared against it, can honestly say that."""
+    engine = SafetyEngine()
+    decision = await engine.evaluate_product_formulation(
+        app_db_pool, synthetic_catalog["formulations"]["retinol"], NO_CONSTRAINTS,
+    )
+    assert MAX_FREQUENCY_EXCEEDED not in decision.reason_codes
+    caps = decision.restrictions.get("ingredient_frequency_caps", [])
+    assert any(c["maximum_weekly_frequency"] == 3 for c in caps)
+
+
+# --- Part I, Phase 6: BARRIER_RECOVERY is inert without active context -
+
+async def test_barrier_recovery_rule_is_never_a_conflict_at_formulation_level(app_db_pool, synthetic_catalog):
+    """evaluate_product_formulation() has no usage-context input at
+    all -- a BARRIER_RECOVERY rule existing on an ingredient must never
+    produce BARRIER_RECOVERY_CONFLICT here, regardless of any
+    constraint flag, since formulation-level evaluation must never
+    invent whether barrier recovery is currently active."""
+    from app.domain.safety_engine import BARRIER_RECOVERY_CONFLICT
+
+    engine = SafetyEngine()
+    decision = await engine.evaluate_product_formulation(
+        app_db_pool, synthetic_catalog["formulations"]["acid"], NO_CONSTRAINTS,
+    )
+    assert BARRIER_RECOVERY_CONFLICT not in decision.reason_codes
+    rules = decision.restrictions.get("barrier_recovery_rules", [])
+    assert len(rules) == 1

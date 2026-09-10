@@ -69,6 +69,19 @@ SAFETY_DATA_UNAVAILABLE = "SAFETY_DATA_UNAVAILABLE"
 # distinct SafetyStatus, INSUFFICIENT_DATA -- see that status's own
 # docstring for why "unknown" must never collapse into "safe".
 UNKNOWN_FORMULATION = "UNKNOWN_FORMULATION"
+# A formulation exists and has recorded ingredients, but the catalog
+# ingestion/admin process has not marked that list COMPLETE (it is
+# PARTIAL or UNKNOWN -- see migration ac641537d224). One or more
+# recorded ingredients is not sufficient grounds to treat the
+# disclosure as exhaustive.
+INCOMPLETE_FORMULATION_DATA = "INCOMPLETE_FORMULATION_DATA"
+# The user has an allergy/avoid entry (user_ingredient_constraints)
+# that could not be resolved to a canonical ingredient. Specific-
+# product recommendation must fail closed rather than silently
+# evaluate as though the unresolved entry didn't exist -- Part I,
+# Phase 4.
+UNRESOLVED_ALLERGY_CONSTRAINT = "UNRESOLVED_ALLERGY_CONSTRAINT"
+UNRESOLVED_AVOID_CONSTRAINT = "UNRESOLVED_AVOID_CONSTRAINT"
 
 # Formulation-level decision status. Four states, not a boolean --
 # per this pass's own explicit "Unknown Formulation Policy":
@@ -105,6 +118,28 @@ class SafetyDecision:
             "reason_codes": self.reason_codes,
             "rules_version": self.rules_version,
         }
+
+
+@dataclass(frozen=True)
+class ProposedRoutineEntry:
+    """One formulation's place in a proposed routine, as far as
+    evaluate_routine_safety() needs to know about it -- not the full
+    routine-step shape PlanService/ProductMatchingService build."""
+    formulation_id: UUID
+    proposed_weekly_frequency: int
+    daypart: str = "BOTH"  # "AM" | "PM" | "BOTH"
+
+
+@dataclass(frozen=True)
+class SafetyUsageContext:
+    """Real, currently-known usage state that formulation-level
+    evaluation must never invent (Part I, Phase 6). barrier_recovery_
+    active defaults False -- there is no signal producing True yet in
+    this pass (that requires a future irritation/outcome-tracking
+    capability); wiring a real one in later requires no change to
+    evaluate_routine_safety() itself, only to whatever constructs this
+    context."""
+    barrier_recovery_active: bool = False
 
 
 class SafetyEngine:
@@ -196,14 +231,40 @@ class SafetyEngine:
     ) -> SafetyDecision:
         """Real, per-formulation evaluation against the normalized
         catalog: User constraints + product formulation + ingredient
-        rules + ingredient interactions -> SafetyDecision. Formulation-
-        level, not per-category -- see this module's own docstring for
-        how this composes with (not replaces) evaluate_offer().
+        rules + within-formulation ingredient interactions ->
+        SafetyDecision. Formulation-level, not per-category -- see this
+        module's own docstring for how this composes with (not
+        replaces) evaluate_offer(). Cross-*product* interactions and
+        actual-schedule-dependent restrictions (MAX_FREQUENCY_EXCEEDED,
+        BARRIER_RECOVERY_CONFLICT) are ROUTINE safety, not formulation
+        safety -- see evaluate_routine_safety() below and Part I,
+        Phase 7's FORMULATION vs ROUTINE distinction.
 
-        Unknown Formulation Policy: a formulation that doesn't exist,
-        or exists with zero recorded ingredients, returns
-        status=INSUFFICIENT_DATA (allowed=False) -- never SAFE. Missing
-        data is a distinct, honest outcome, not a silent pass."""
+        Unknown Formulation Policy, tightened this pass (Phase 1/2): a
+        formulation cannot return SAFE or RESTRICTED unless its safety
+        data is sufficiently complete. Three independent things all
+        collapse to status=INSUFFICIENT_DATA, never SAFE:
+          - the formulation doesn't exist, or has zero recorded
+            ingredients (UNKNOWN_FORMULATION -- unchanged from before);
+          - it has ingredients but ingredient_data_status is PARTIAL or
+            UNKNOWN, not COMPLETE (INCOMPLETE_FORMULATION_DATA -- new);
+          - the calling user has an unresolved allergy/avoid constraint
+            (UNRESOLVED_ALLERGY_CONSTRAINT/UNRESOLVED_AVOID_CONSTRAINT --
+            new, Phase 4). This is a *user*-level precondition, not a
+            formulation-level one, but it gates the exact same output:
+            a specific product can't honestly be called safe for a
+            user whose own constraints aren't fully known. Category-
+            level guidance (evaluate_offer()) is unaffected -- this
+            gate is specific-formulation-recommendation only, per this
+            pass's own explicit instruction.
+
+        constraints carries two new optional boolean keys this pass,
+        alongside the pre-existing ones (allergies/avoid_ingredients/
+        is_pregnant/is_nursing/has_sensitive_skin):
+        has_unresolved_allergy_constraint / has_unresolved_avoid_constraint
+        -- computed by the caller via
+        app/db/user_constraint_repository.py's has_unresolved_constraints()
+        (typically once per request, not per candidate formulation)."""
         formulation = await get_formulation_by_id(pool, formulation_id)
         if formulation is None:
             return SafetyDecision(
@@ -215,13 +276,24 @@ class SafetyEngine:
             )
 
         formulation_ingredients = await get_formulation_ingredients(pool, formulation_id)
+
+        insufficient_reasons: List[str] = []
         if not formulation_ingredients:
+            insufficient_reasons.append(UNKNOWN_FORMULATION)
+        elif formulation.get("ingredient_data_status") != "COMPLETE":
+            insufficient_reasons.append(INCOMPLETE_FORMULATION_DATA)
+        if constraints.get("has_unresolved_allergy_constraint"):
+            insufficient_reasons.append(UNRESOLVED_ALLERGY_CONSTRAINT)
+        if constraints.get("has_unresolved_avoid_constraint"):
+            insufficient_reasons.append(UNRESOLVED_AVOID_CONSTRAINT)
+
+        if insufficient_reasons:
             return SafetyDecision(
                 candidate_type="product_formulation",
                 candidate_id=str(formulation_id),
                 allowed=False,
                 status=INSUFFICIENT_DATA,
-                reason_codes=[UNKNOWN_FORMULATION],
+                reason_codes=insufficient_reasons,
             )
 
         ingredient_ids = [fi["ingredient_id"] for fi in formulation_ingredients]
@@ -238,8 +310,9 @@ class SafetyEngine:
         # a user who typed "Vitamin C" correctly conflicts with a
         # formulation whose ingredient's canonical name is "Ascorbic
         # Acid", as long as "vitamin c" is a registered alias for it.
-        # An unresolvable free-text entry matches nothing -- it is
-        # never silently treated as a match or a non-match by guessing.
+        # An unresolvable free-text entry matches nothing at this
+        # per-candidate step -- it was already handled, globally, by
+        # the has_unresolved_*_constraint gate above.
         ingredient_id_set = set(ingredient_ids)
 
         async def _resolve_ids(raw_names: Sequence[str]) -> set:
@@ -262,10 +335,10 @@ class SafetyEngine:
             reason_codes.append(USER_AVOID_INGREDIENT)
             unsafe = True
 
-        # Ingredient-intrinsic rules (pregnancy/nursing/sensitive-skin/
-        # etc. restrictions on a *specific ingredient*), as opposed to
-        # the allergy/avoid checks above, which are about the *user's*
-        # own declared list, not an ingredient-table fact.
+        # Ingredient-intrinsic rules (pregnancy/nursing/sensitive-skin
+        # restrictions on a *specific ingredient*), as opposed to the
+        # allergy/avoid checks above, which are about the *user's* own
+        # declared list, not an ingredient-table fact.
         for rule in rules:
             rule_type = rule["rule_type"]
             action = rule["action"]
@@ -279,15 +352,35 @@ class SafetyEngine:
                     unsafe = True
             elif rule_type == "SENSITIVE_SKIN" and constraints.get("has_sensitive_skin"):
                 reason_codes.append(SENSITIVE_SKIN_INTENSITY_LIMIT)
-                restrictions["maximum_weekly_frequency"] = 2
+                cap = rule.get("parameters", {}).get("maximum_weekly_frequency", 2)
+                restrictions["maximum_weekly_frequency"] = cap
             elif rule_type == "MAX_FREQUENCY":
-                reason_codes.append(MAX_FREQUENCY_EXCEEDED)
-                if action == "EXCLUDE":
-                    unsafe = True
+                # Fixed this pass (Phase 5): a rule saying "maximum N
+                # uses per week" is a *restriction* to surface, not a
+                # violation -- MAX_FREQUENCY_EXCEEDED is never emitted
+                # here, only by evaluate_routine_safety() once an
+                # actual proposed schedule has been compared against
+                # this cap. No cap parameter at all means the rule
+                # carries no enforceable threshold; nothing is surfaced.
+                cap = rule.get("parameters", {}).get("maximum_weekly_frequency")
+                if cap is not None:
+                    restrictions.setdefault("ingredient_frequency_caps", []).append({
+                        "ingredient_id": str(rule["ingredient_id"]),
+                        "maximum_weekly_frequency": cap,
+                        "action": action,
+                    })
             elif rule_type == "BARRIER_RECOVERY":
-                reason_codes.append(BARRIER_RECOVERY_CONFLICT)
-                if action == "EXCLUDE":
-                    unsafe = True
+                # Fixed this pass (Phase 6): never emitted here at all
+                # -- whether barrier recovery is *currently active* for
+                # this user is routine/usage-context state formulation-
+                # level evaluation has no access to and must not
+                # invent. Only surfaced as a restriction the routine
+                # builder can act on if/when that context says it's
+                # active (evaluate_routine_safety()).
+                restrictions.setdefault("barrier_recovery_rules", []).append({
+                    "ingredient_id": str(rule["ingredient_id"]),
+                    "action": action,
+                })
             elif rule_type in ("PHOTOSENSITIVITY", "IRRITATION"):
                 # Advisory-only in this pass -- no dedicated top-level
                 # reason code exists for these in the brief's list, so
@@ -307,6 +400,7 @@ class SafetyEngine:
                     "severity": i["severity"],
                     "reason_code": i["reason_code"],
                     "recommendation": i["recommendation"],
+                    "recommended_action": i["recommended_action"],
                 }
                 for i in interactions
             ]
@@ -323,6 +417,126 @@ class SafetyEngine:
         return SafetyDecision(
             candidate_type="product_formulation",
             candidate_id=str(formulation_id),
+            allowed=status in (SAFE, RESTRICTED),
+            status=status,
+            restrictions=restrictions,
+            reason_codes=reason_codes,
+        )
+
+    async def evaluate_routine_safety(
+        self,
+        pool: asyncpg.Pool,
+        entries: List[ProposedRoutineEntry],
+        usage_context: SafetyUsageContext,
+    ) -> SafetyDecision:
+        """ROUTINE safety (Part I, Phase 7/8): can these formulations be
+        used together, in this proposed schedule? Distinct from
+        FORMULATION safety (evaluate_product_formulation, above), which
+        only answers "can this one formulation be considered for this
+        user at all", with no notion of a schedule or of what else is
+        in the routine.
+
+        Three things only routine-level evaluation can honestly decide,
+        each requiring information formulation-level evaluation
+        deliberately doesn't have:
+          - MAX_FREQUENCY_EXCEEDED: only once `entry.proposed_weekly_
+            frequency` is actually compared against a real
+            maximum_weekly_frequency rule parameter on one of that
+            entry's own ingredients -- never merely because such a rule
+            exists (that was last pass's bug, fixed here).
+          - BARRIER_RECOVERY_CONFLICT: only when
+            usage_context.barrier_recovery_active is True. This pass
+            does not invent that state -- it is False by default, and
+            wired from a real signal only once one exists (a future
+            irritation/outcome-tracking pass); until then this branch
+            is inert by construction, not merely by convention.
+          - ACTIVE_INTERACTION_CONFLICT across *different* formulations
+            in the routine (cross-product), via the union of every
+            entry's own ingredient set -- app/db/catalog_repository.py's
+            get_interactions_within() is reused unmodified: it was
+            already written to accept any ingredient-ID set, not just
+            one formulation's own.
+
+        Interaction severity is read from `recommended_action`
+        (migration 32231ea81bb5), not blindly treated as exclusion:
+        EXCLUDE_COMBINATION marks the routine UNSAFE; SEPARATE_DAYPART/
+        ALTERNATE_DAYS/REDUCE_FREQUENCY are RESTRICTED (the routine
+        builder must adjust the schedule to satisfy them -- Phase 12);
+        ADVISORY never restricts anything, only informs."""
+        reason_codes: List[str] = []
+        restrictions: Dict[str, Any] = {}
+        unsafe = False
+
+        formulation_ingredient_ids: Dict[str, List[UUID]] = {}
+        all_ingredient_ids: List[UUID] = []
+        for entry in entries:
+            fi = await get_formulation_ingredients(pool, entry.formulation_id)
+            ids = [x["ingredient_id"] for x in fi]
+            formulation_ingredient_ids[str(entry.formulation_id)] = ids
+            all_ingredient_ids.extend(ids)
+
+        unique_ids = list({i for i in all_ingredient_ids})
+        rules = await get_active_rules_for_ingredients(pool, unique_ids)
+
+        for entry in entries:
+            entry_ids = set(formulation_ingredient_ids[str(entry.formulation_id)])
+
+            for rule in rules:
+                if rule["ingredient_id"] not in entry_ids:
+                    continue
+
+                if rule["rule_type"] == "MAX_FREQUENCY":
+                    cap = rule.get("parameters", {}).get("maximum_weekly_frequency")
+                    if cap is not None and entry.proposed_weekly_frequency > cap:
+                        if MAX_FREQUENCY_EXCEEDED not in reason_codes:
+                            reason_codes.append(MAX_FREQUENCY_EXCEEDED)
+                        restrictions.setdefault("frequency_caps_exceeded", []).append({
+                            "formulation_id": str(entry.formulation_id),
+                            "maximum_weekly_frequency": cap,
+                            "proposed_weekly_frequency": entry.proposed_weekly_frequency,
+                        })
+                        if rule["action"] == "EXCLUDE":
+                            unsafe = True
+
+                elif rule["rule_type"] == "BARRIER_RECOVERY" and usage_context.barrier_recovery_active:
+                    if BARRIER_RECOVERY_CONFLICT not in reason_codes:
+                        reason_codes.append(BARRIER_RECOVERY_CONFLICT)
+                    restrictions.setdefault("barrier_recovery_conflicts", []).append(str(entry.formulation_id))
+                    if rule["action"] == "EXCLUDE":
+                        unsafe = True
+
+        interactions = await get_interactions_within(pool, unique_ids)
+        if interactions:
+            interaction_details = []
+            for interaction in interactions:
+                action = interaction["recommended_action"]
+                if action == "EXCLUDE_COMBINATION":
+                    unsafe = True
+                elif action in ("SEPARATE_DAYPART", "ALTERNATE_DAYS", "REDUCE_FREQUENCY"):
+                    pass  # restriction, not necessarily unsafe -- routine builder must satisfy it
+                # ADVISORY: no schedule effect at all, informational only.
+                interaction_details.append({
+                    "ingredient_a_id": str(interaction["ingredient_a_id"]),
+                    "ingredient_b_id": str(interaction["ingredient_b_id"]),
+                    "interaction_type": interaction["interaction_type"],
+                    "severity": interaction["severity"],
+                    "recommended_action": action,
+                    "recommendation": interaction["recommendation"],
+                })
+            if ACTIVE_INTERACTION_CONFLICT not in reason_codes:
+                reason_codes.append(ACTIVE_INTERACTION_CONFLICT)
+            restrictions["interactions"] = interaction_details
+
+        if unsafe:
+            status = UNSAFE
+        elif reason_codes:
+            status = RESTRICTED
+        else:
+            status = SAFE
+
+        return SafetyDecision(
+            candidate_type="routine",
+            candidate_id="routine",
             allowed=status in (SAFE, RESTRICTED),
             status=status,
             restrictions=restrictions,

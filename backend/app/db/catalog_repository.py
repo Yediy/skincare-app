@@ -12,6 +12,7 @@ normalization happens, reused for every lookup (brands, products,
 ingredients, aliases) so two different callers can never disagree on
 whether "Vitamin C" and "vitamin   c" are the same string.
 """
+import json
 import re
 from typing import Any, Dict, List, Optional, Sequence
 from uuid import UUID
@@ -47,7 +48,8 @@ async def get_formulation_by_id(pool: asyncpg.Pool, formulation_id: UUID) -> Opt
         """
         SELECT f.id, f.product_id, f.version, f.market_or_region, f.is_current,
                f.effective_from, f.effective_to, f.source_type, f.source_reference, f.verified_at,
-               p.name AS product_name, p.category AS product_category, p.brand_id
+               f.ingredient_data_status,
+               p.name AS product_name, p.category AS product_category, p.brand_id, p.status AS product_status
         FROM product_formulations f JOIN products p ON p.id = f.product_id
         WHERE f.id = $1
         """,
@@ -63,7 +65,8 @@ async def get_current_formulation_for_product(
         """
         SELECT f.id, f.product_id, f.version, f.market_or_region, f.is_current,
                f.effective_from, f.effective_to, f.source_type, f.source_reference, f.verified_at,
-               p.name AS product_name, p.category AS product_category, p.brand_id
+               f.ingredient_data_status,
+               p.name AS product_name, p.category AS product_category, p.brand_id, p.status AS product_status
         FROM product_formulations f JOIN products p ON p.id = f.product_id
         WHERE f.product_id = $1 AND f.market_or_region = $2 AND f.is_current = true
         """,
@@ -88,6 +91,51 @@ async def get_formulation_by_sku(pool: asyncpg.Pool, sku: str, product_id: Optio
     if row is None:
         return None
     return await get_formulation_by_id(pool, row["formulation_id"])
+
+
+async def list_current_active_formulations_by_category(
+    pool: asyncpg.Pool, category: str, market_or_region: str
+) -> List[Dict[str, Any]]:
+    """Candidate lookup for ProductMatchingService (Part I, Phase 9).
+    Only ever returns: active products, current formulations, exactly
+    the requested market_or_region (never a different specific region
+    -- global fallback is the caller's own explicit second call with
+    market_or_region='global', never silently substituted here), and
+    COMPLETE ingredient data (filtered here as an efficiency measure --
+    evaluate_product_formulation() independently re-enforces this same
+    rule regardless, so this is defense in depth, not the only
+    mechanism). Ordered by verification freshness, most recent first,
+    with product_id as a final deterministic tie-break for anything
+    with the same (or no) verified_at."""
+    rows = await pool.fetch(
+        """
+        SELECT f.id, f.product_id, f.market_or_region, f.verified_at, f.ingredient_data_status,
+               p.name AS product_name, p.category AS product_category, b.id AS brand_id, b.name AS brand_name
+        FROM product_formulations f
+        JOIN products p ON p.id = f.product_id
+        JOIN brands b ON b.id = p.brand_id
+        WHERE p.category = $1
+          AND p.status = 'active'
+          AND f.is_current = true
+          AND f.market_or_region = $2
+          AND f.ingredient_data_status = 'COMPLETE'
+        ORDER BY f.verified_at DESC NULLS LAST, f.product_id
+        """,
+        category, market_or_region,
+    )
+    return [dict(r) for r in rows]
+
+
+async def get_representative_sku_for_formulation(pool: asyncpg.Pool, formulation_id: UUID) -> Optional[Dict[str, Any]]:
+    """A formulation may back several SKUs (different sizes/packaging).
+    Returns one deterministically (lowest sku string) for display
+    purposes -- ProductMatch doesn't need to enumerate every SKU, just
+    a representative one to reference."""
+    row = await pool.fetchrow(
+        "SELECT id, sku FROM product_skus WHERE formulation_id = $1 AND active = true ORDER BY sku LIMIT 1",
+        formulation_id,
+    )
+    return dict(row) if row is not None else None
 
 
 async def get_product_by_id(pool: asyncpg.Pool, product_id: UUID) -> Optional[Dict[str, Any]]:
@@ -149,27 +197,38 @@ async def get_active_rules_for_ingredients(pool: asyncpg.Pool, ingredient_ids: S
     rows = await pool.fetch(
         """
         SELECT id, ingredient_id, rule_type, severity, action, reason_code,
-               evidence_grade, source_reference, rules_version
+               evidence_grade, source_reference, rules_version, parameters
         FROM ingredient_rules
         WHERE ingredient_id = ANY($1::uuid[]) AND active = true
         """,
         list(ingredient_ids),
     )
-    return [dict(r) for r in rows]
+    results = []
+    for r in rows:
+        rule = dict(r)
+        # asyncpg returns jsonb as raw text unless a type codec is
+        # registered (none is, in this codebase -- see
+        # app/queue/postgres_queue.py's identical pattern for `jobs.payload`).
+        params = rule["parameters"]
+        rule["parameters"] = json.loads(params) if isinstance(params, str) else (params or {})
+        results.append(rule)
+    return results
 
 
 async def get_interactions_within(pool: asyncpg.Pool, ingredient_ids: Sequence[UUID]) -> List[Dict[str, Any]]:
     """Interactions where *both* members of the pair are present in
-    ingredient_ids -- i.e. an interaction that actually exists within
-    one formulation's own ingredient list, not any interaction either
-    ingredient happens to participate in against something else."""
+    ingredient_ids. Deliberately not scoped to one formulation's own
+    ingredient list -- the same query is reused for routine-level,
+    cross-product interaction evaluation (Part I, Phase 8) by passing
+    the union of ingredient IDs across every formulation in a proposed
+    routine, not just one formulation's own set."""
     if len(ingredient_ids) < 2:
         return []
     id_list = list(ingredient_ids)
     rows = await pool.fetch(
         """
         SELECT id, ingredient_a_id, ingredient_b_id, interaction_type, severity,
-               reason_code, recommendation, rules_version
+               reason_code, recommendation, recommended_action, rules_version
         FROM ingredient_interactions
         WHERE ingredient_a_id = ANY($1::uuid[]) AND ingredient_b_id = ANY($1::uuid[])
         """,
