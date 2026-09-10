@@ -62,8 +62,8 @@ directly and never reserves a second slot for the same logical
 request. See ASYNC_ANALYSIS_ARCHITECTURE.md.
 """
 import base64
-from dataclasses import dataclass
-from typing import Any, Dict
+from dataclasses import dataclass, field
+from typing import Any, Dict, List
 from uuid import UUID
 
 import asyncpg
@@ -114,6 +114,15 @@ class AnalysisResult:
     metric_results: Dict[str, Any]
     capture_assessment: Dict[str, Any]
     eligible_for_longitudinal_comparison: bool
+    # Provenance for every concrete product recommendation the routine
+    # actually carries -- the exact shape
+    # app.db.analysis_repository.commit_analysis_result() needs for its
+    # analysis_product_recommendations rows (Part VI). Already fully
+    # embedded, per-step, inside `plan` too (that's what /analyze's
+    # JSON response reads) -- this is the same data, flattened, for a
+    # caller (AnalysisExecutionService) that needs to persist it as
+    # its own rows rather than read it back out of `plan`.
+    product_recommendations: List[Dict[str, Any]] = field(default_factory=list)
 
 
 async def compute_analysis(
@@ -174,7 +183,7 @@ async def compute_analysis(
     # directly rather than rebuilt.
     unresolved_flags = await get_unresolved_constraint_flags(pool, user_id)
     recommendation_constraints = {**user_profile, **unresolved_flags}
-    await apply_product_matching_and_routine_safety(
+    recommendation_result = await apply_product_matching_and_routine_safety(
         pool, plan, recommendation_constraints,
         product_matching_service=product_matching_service,
         safety_engine=safety_engine,
@@ -186,6 +195,7 @@ async def compute_analysis(
         metric_results=analysis["metric_results"],
         capture_assessment=capture_assessment.to_dict(),
         eligible_for_longitudinal_comparison=eligible_for_longitudinal_comparison,
+        product_recommendations=[rec.to_dict() for rec in recommendation_result.product_recommendations],
     )
 
 

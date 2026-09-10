@@ -101,6 +101,16 @@ class Settings(BaseSettings):
     # (503) when False, rather than silently proceeding.
     async_image_storage_enabled: bool = False
 
+    # Minimal cell-readiness (Part VII): the launch defaults a new/
+    # unplaced user is assigned by UserPlacementService. Configurable
+    # per deployment via env, never hardcoded at any call site --
+    # these two settings are the *only* place a literal region/cell
+    # value should ever appear. This is metadata/contract readiness
+    # only; it does not stand up any actual multi-region
+    # infrastructure.
+    launch_home_region: str = "us-east"
+    launch_cell_id: str = "use1-001"
+
     @property
     def is_production(self) -> bool:
         return self.environment.lower() == "production"

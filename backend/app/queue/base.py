@@ -81,7 +81,7 @@ class JobQueue(ABC):
         the job doesn't exist or isn't currently claimed."""
 
     @abstractmethod
-    async def fail(self, job_id: UUID, error: str, *, retryable: bool = False) -> None:
+    async def fail(self, job_id: UUID, error: str, *, retryable: bool = False) -> bool:
         """Marks a claimed job failed. Raises JobNotFoundError if the
         job doesn't exist or isn't currently claimed.
 
@@ -96,7 +96,15 @@ class JobQueue(ABC):
         next_attempt_at and an incremented attempt_count, so a future
         claim() can pick it up again -- once attempts are exhausted, it
         still lands in 'failed', same terminal state either way (Phase
-        29's "job -> dead/failed terminal state")."""
+        29's "job -> dead/failed terminal state").
+
+        Returns True if this call left the job in its terminal
+        'failed' state (either retryable=False, or retryable=True with
+        attempts now exhausted), False if it was requeued for a future
+        retry instead. The async worker (Part VI) uses this to decide
+        whether to also release the request's quota reservation and
+        mark the durable analysis_request FAILED -- only ever on a
+        genuinely terminal outcome, never on a requeue."""
 
     @abstractmethod
     async def extend_visibility(self, job_id: UUID, additional_seconds: int) -> None:

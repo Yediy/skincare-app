@@ -53,6 +53,7 @@ import base64
 import binascii
 import logging
 from dataclasses import dataclass
+from typing import Optional
 from uuid import UUID
 
 import asyncpg
@@ -130,6 +131,7 @@ class AnalysisSubmissionService:
         image_base64: str,
         *,
         region: str = "global",
+        cell_id: Optional[str] = None,
     ) -> SubmissionResult:
         if not self._async_image_storage_enabled:
             raise AsyncImageStorageDisabledError()
@@ -174,7 +176,8 @@ class AnalysisSubmissionService:
 
         try:
             req = await analysis_repository.create_request(
-                self._pool, user_id, request_id, usage_reservation_id=reservation.id, home_region=region,
+                self._pool, user_id, request_id,
+                usage_reservation_id=reservation.id, home_region=region, cell_id=cell_id,
             )
         except Exception:
             # Failure window A: create_request() never returned a row,

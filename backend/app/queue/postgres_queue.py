@@ -116,7 +116,7 @@ class PostgresJobQueue(JobQueue):
         if result.endswith(" 0"):
             raise JobNotFoundError(str(job_id))
 
-    async def fail(self, job_id: UUID, error: str, *, retryable: bool = False) -> None:
+    async def fail(self, job_id: UUID, error: str, *, retryable: bool = False) -> bool:
         async with self._pool.acquire() as conn:
             if retryable:
                 row = await conn.fetchrow(
@@ -140,7 +140,7 @@ class PostgresJobQueue(JobQueue):
                     )
                     if result.endswith(" 0"):
                         raise JobNotFoundError(str(job_id))
-                    return
+                    return False
                 # Attempts exhausted (or job already vanished) -- falls
                 # through to the same terminal path as retryable=False.
 
@@ -153,6 +153,7 @@ class PostgresJobQueue(JobQueue):
             )
         if result.endswith(" 0"):
             raise JobNotFoundError(str(job_id))
+        return True
 
     async def extend_visibility(self, job_id: UUID, additional_seconds: int) -> None:
         async with self._pool.acquire() as conn:
