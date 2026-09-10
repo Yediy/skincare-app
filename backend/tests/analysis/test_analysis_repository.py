@@ -97,11 +97,19 @@ async def test_commit_analysis_result_persists_everything_atomically(db_pool, ap
     ]
 
     # product_id/formulation_id must be real FKs -- seed minimal
-    # catalog rows so the FK constraint is satisfiable.
-    brand_id = await db_pool.fetchval("INSERT INTO brands (name, normalized_name) VALUES ('X', 'x') RETURNING id")
+    # catalog rows so the FK constraint is satisfiable. Catalog tables
+    # are deliberately outside clean_database's TRUNCATE list (see
+    # synthetic_catalog's docstring -- catalog data is self-truncated
+    # by the fixtures that own it), so a unique suffix is required
+    # here to avoid colliding with a row this same test left behind on
+    # a prior run.
+    unique = uuid.uuid4().hex[:8]
+    brand_id = await db_pool.fetchval(
+        "INSERT INTO brands (name, normalized_name) VALUES ($1, $2) RETURNING id", f"X-{unique}", f"x-{unique}"
+    )
     product_id = await db_pool.fetchval(
-        "INSERT INTO products (brand_id, name, normalized_name, category) VALUES ($1, 'P', 'p', 'moisturizer') RETURNING id",
-        brand_id,
+        "INSERT INTO products (brand_id, name, normalized_name, category) VALUES ($1, $2, $3, 'moisturizer') RETURNING id",
+        brand_id, f"P-{unique}", f"p-{unique}",
     )
     formulation_id = await db_pool.fetchval(
         "INSERT INTO product_formulations (product_id, version, source_type, ingredient_data_status) "
