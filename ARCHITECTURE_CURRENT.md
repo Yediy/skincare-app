@@ -6,7 +6,7 @@ This describes the application as it **actually exists right now**, verified by 
 
 ## What this repository is
 
-A FastAPI backend (`backend/app/main.py`) with real authentication, a real Postgres database (behind a restricted, non-superuser runtime role with row-level security on all four application tables), a real CV pipeline (MediaPipe landmarks → real head pose → 8 skin/face metrics, each with real per-metric confidence and abstention), a real domain-driven planning/safety layer, a real pytest suite with CI, and — as of this pass — a real production container image, health/readiness endpoints, fail-closed production config validation, and a provider-neutral object storage abstraction. No mobile app exists (the `mobile/` directory is empty scaffolding). No offer/product catalog exists.
+A FastAPI backend (`backend/app/main.py`) with real authentication, a real Postgres database (behind a restricted, non-superuser runtime role with row-level security on every user-owned application table), a real CV pipeline (MediaPipe landmarks → real head pose → 8 skin/face metrics, each with real per-metric confidence and abstention), a real domain-driven planning/safety layer, a normalized product/ingredient catalog with formulation-level safety evaluation, atomic Redis rate limiting and an atomic usage-quota reservation ledger, a real pytest suite with CI, and a real production container image, health/readiness endpoints, fail-closed production config validation, and a provider-neutral object storage abstraction. No mobile app exists (the `mobile/` directory is empty scaffolding). No billing/RevenueCat integration, ranking, or async CV worker exist yet.
 
 ## HTTP / API layer — `VERIFIED_IMPLEMENTED`
 
@@ -44,7 +44,7 @@ MediaPipe FaceMesh landmarks → real head pose (`app/cv/head_pose.py`, `cv2.sol
 
 ## Planning and safety — `VERIFIED_IMPLEMENTED`
 
-`SafetyEngine`/`SafetyDecision` (`app/domain/safety_engine.py`) is real and wired into `PlanService.generate_plan()` — replacing the old undocumented inline pregnancy/nursing exclusion. Every priority and product-category candidate gets a `SafetyDecision` recorded in `plan.metadata.safety_decisions`. Allergy/avoid-ingredient enforcement is real, operating against a category-level `ProductSafetyProfile` adapter (`app/domain/product_safety.py`) — **not per-product**, since no product catalog exists in this repository; a missing safety profile fails closed (`SAFETY_DATA_UNAVAILABLE`), never silently "safe". Sensitive skin genuinely caps active-ingredient frequency (routine text reflects the real cap) rather than only appending a disclaimer. A beginner's advanced-default concern stays visible with a capped `effective_intensity` instead of being dropped outright. Ranking's `display_order` bonus was reduced from a dominant factor (up to 0.45) to a true tie-break (0.001/step). Real per-metric confidence (Phase 10) now flows into severity via `PriorityTrigger.should_trigger()`'s `severity × confidence` multiplication, but `_rank_priorities_by_severity()` itself is still the original additive model (`severity + pillar_weight + tiebreak`), not the brief's preferred `severity × confidence × persistence × intervention-value` multiplicative one — that would need a validated intervention-value weighting this codebase doesn't have, so it wasn't fabricated.
+`SafetyEngine`/`SafetyDecision` (`app/domain/safety_engine.py`) is real and wired into `PlanService.generate_plan()` — replacing the old undocumented inline pregnancy/nursing exclusion. Every priority and product-category candidate gets a `SafetyDecision` recorded in `plan.metadata.safety_decisions`. Allergy/avoid-ingredient enforcement here is real, operating against a category-level `ProductSafetyProfile` adapter (`app/domain/product_safety.py`) — **not per-product** — because `PlanService` has no product-matching/ranking step connecting its recommended categories to the normalized catalog that now exists (see `PRODUCT_CATALOG_ARCHITECTURE.md`); a missing safety profile fails closed (`SAFETY_DATA_UNAVAILABLE`), never silently "safe". `SafetyEngine.evaluate_product_formulation()`, new this pass, is the real, formulation-level, per-ingredient evaluation path — additive, not yet wired into `PlanService` (see `PRODUCT_CATALOG_ARCHITECTURE.md`). Sensitive skin genuinely caps active-ingredient frequency (routine text reflects the real cap) rather than only appending a disclaimer. A beginner's advanced-default concern stays visible with a capped `effective_intensity` instead of being dropped outright. Ranking's `display_order` bonus was reduced from a dominant factor (up to 0.45) to a true tie-break (0.001/step). Real per-metric confidence (Phase 10) now flows into severity via `PriorityTrigger.should_trigger()`'s `severity × confidence` multiplication, but `_rank_priorities_by_severity()` itself is still the original additive model (`severity + pillar_weight + tiebreak`), not the brief's preferred `severity × confidence × persistence × intervention-value` multiplicative one — that would need a validated intervention-value weighting this codebase doesn't have, so it wasn't fabricated.
 
 ## Platform foundation — `VERIFIED_IMPLEMENTED` (this pass)
 
@@ -65,11 +65,57 @@ Full detail, including the target architecture this is a first slice of, in `PRO
 
 16 new job-queue tests (`tests/queue/test_postgres_job_queue.py`) run through the real restricted `skincare_app` role, not mocked.
 
+## Product catalog — `VERIFIED_IMPLEMENTED` (this pass)
+
+A normalized `brands → products → product_formulations → product_skus`
+catalog, with ingredients resolved through `ingredient_aliases`, and the
+safety boundary at the formulation level (not product/brand) — full detail
+in `PRODUCT_CATALOG_ARCHITECTURE.md`. `SafetyEngine.
+evaluate_product_formulation()` is the new, additive, real-ingredient-data
+evaluation path (`ALLERGY_CONFLICT`, `USER_AVOID_INGREDIENT`,
+`PREGNANCY_RESTRICTION`, `NURSING_RESTRICTION`,
+`SENSITIVE_SKIN_INTENSITY_LIMIT`, `ACTIVE_INTERACTION_CONFLICT`,
+`UNKNOWN_FORMULATION`, all actually triggered against real seeded data, not
+just defined) alongside — not replacing — the pre-existing category-level
+`evaluate_offer()` `PlanService` still uses (nothing yet matches
+`PlanService`'s recommended categories to real catalog products; that is
+ranking/matching work, out of scope this pass). Catalog tables are global
+reference data with `SELECT`-only grants to `skincare_app` (no write access
+at all — verified with a real `InsufficientPrivilegeError`), not RLS
+(nothing in them has a `user_id`).
+
+## Usage/rate-limit foundation — `VERIFIED_IMPLEMENTED` (this pass)
+
+Full detail in `USAGE_AND_RATE_LIMIT_ARCHITECTURE.md`. Summary:
+
+- **Rate limiting** (`app/middleware/rate_limiter.py`): atomic (single Lua
+  script), fixed-window, three policies (`auth`/`analysis`/`general`),
+  wired into every real route via FastAPI dependencies — not left unused.
+  Per-policy fail-open/fail-closed Redis-failure behavior. Trusted-proxy-
+  gated `X-Forwarded-For` handling.
+- **Usage/quota reservation** (`app/db/usage_repository.py`,
+  `app/domain/entitlement.py`, `analysis_usage` table, migration
+  `ee276e90a60f`): atomic reserve/consume/release via a
+  `pg_advisory_xact_lock`-serialized critical section, proven under real
+  concurrent load to never oversubscribe a fixed allowance and to never
+  double-reserve an idempotent retry. `EntitlementService`/
+  `UsagePolicyService` is the RevenueCat-independent boundary (Phase 8);
+  `FreeTierEntitlementService` is a real, working default policy, not a
+  stub. Wired into `perform_analysis()`: reservation happens after the
+  consent check and before CV compute; any failure past that point
+  releases the slot, only full success consumes it.
+- `analysis_usage` has row-level security (user-owned data, unlike the
+  catalog tables above).
+
 ## What does not exist, at all (confirmed by direct inspection this pass, same as before except where noted)
 
-- No billing/subscription/webhook code of any kind.
-- No rate limiting or quota system of any kind.
-- No offer/product catalog (`offers` table or equivalent).
+- No billing/subscription/webhook code of any kind (RevenueCat is
+  deliberately not integrated this pass — see "Usage/rate-limit foundation"
+  above for the abstraction seam that will absorb it).
+- No offer/product catalog with pricing, availability, or commercial
+  ranking — the normalized catalog above has real ingredient/safety data,
+  but no price, no affiliate/commission data, and no ranking system
+  connecting it to `PlanService`'s recommendations.
 - No mobile app source (`mobile/` is empty directory scaffolding).
 - No notification system.
 - No `measurements`/`analysis_results`/`plans` persistence table — `/analyze`'s output is still returned only, never stored, so "one persisted result per idempotent request" isn't yet a claim this repository can make (job-level idempotency is; see above).
@@ -80,4 +126,4 @@ Full detail, including the target architecture this is a first slice of, in `PRO
 
 ## Test foundation and CI — `VERIFIED_IMPLEMENTED`
 
-`backend/tests/{unit,integration,auth,cv,planning,database}/`, isolated from dev infra (separate `skincare_test` database, Redis index 1). GitHub Actions (`.github/workflows/ci.yml`) runs the full suite against real Postgres/Redis services on every push/PR. See `TEST_REPORT.md` for the exact test count and pass/fail breakdown from the final run of this pass.
+`backend/tests/{unit,integration,auth,cv,planning,database,queue,storage,domain,catalog,usage,middleware}/`, isolated from dev infra (separate `skincare_test` database, Redis index 1). GitHub Actions (`.github/workflows/ci.yml`) runs the full suite against real Postgres/Redis services on every push/PR. See `PRODUCT_USAGE_IMPLEMENTATION_REPORT.md` for this pass's exact test count and pass/fail breakdown.
