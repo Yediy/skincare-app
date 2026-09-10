@@ -53,6 +53,33 @@ class Settings(BaseSettings):
     db_pool_connect_timeout_seconds: float = 10.0
     db_pool_command_timeout_seconds: float = 30.0
 
+    # Atomic Redis rate limiting (see app/middleware/rate_limiter.py).
+    # Three policies, each independently configurable: auth endpoints
+    # (signup/login/refresh, keyed by client IP -- no session exists
+    # yet), analysis submission (keyed by user_id, the expensive CV
+    # path), general authenticated API (keyed by user_id). Fail-open
+    # vs fail-closed on a Redis outage is a deliberate per-policy
+    # choice, not a single blanket one -- see
+    # USAGE_AND_RATE_LIMIT_ARCHITECTURE.md's "Rate limit failure
+    # policy" section for why auth/analysis fail closed and general
+    # reads fail open.
+    rate_limit_auth_max: int = 10
+    rate_limit_auth_window_seconds: int = 60
+    rate_limit_analysis_max: int = 20
+    rate_limit_analysis_window_seconds: int = 3600
+    rate_limit_general_max: int = 120
+    rate_limit_general_window_seconds: int = 60
+
+    # Only X-Forwarded-For values relayed by a listed, trusted
+    # reverse-proxy peer IP are honored for IP-based rate-limit keying
+    # -- otherwise any client could simply forge the header to any
+    # value (including another real user's IP) and evade IP-based
+    # limiting entirely. Empty by default: an unconfigured deployment
+    # (no reverse proxy declared as trusted) uses the direct TCP peer
+    # IP only, which is always correct even if less useful behind an
+    # undeclared proxy.
+    trusted_proxies: List[str] = []
+
     # Object storage (Phase 6/7). All optional: nothing in the
     # application calls into R2 yet (see PRODUCTION_ARCHITECTURE.md --
     # face images are deliberately not persisted there), so an

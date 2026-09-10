@@ -25,6 +25,18 @@ calling this exact function: `pipeline`/`scorer`/`plan_service` are
 passed in (dependency injection), not constructed here, so a worker
 process can construct its own singletons and call the same function
 with no changes to this module.
+
+Product/usage foundation pass: quota reservation
+(app/domain/entitlement.py's UsagePolicyService) is now part of this
+same request lifecycle, for the same reason the pieces above are --
+whichever code path eventually calls this function (HTTP today, a
+queue worker later) must get the same idempotent-reservation
+guarantee, not a version that only exists in the HTTP route handler.
+Reservation happens after the consent check (a request rejected for
+missing consent never touches quota at all) and before any CV compute
+runs; a failure anywhere in the CV/scoring/plan sequence releases the
+reservation rather than consuming it -- only a fully successful
+analysis consumes the slot.
 """
 import base64
 from dataclasses import dataclass
@@ -34,6 +46,7 @@ from uuid import UUID
 import asyncpg
 
 from app.cv.pipeline import FacialAnalysisPipeline
+from app.domain.entitlement import UsagePolicyService
 from app.ml.scorer import FacialScorer
 from app.services.plan_service import PlanService
 
@@ -56,6 +69,15 @@ class InvalidImageError(Exception):
 class AnalysisRequest:
     user_id: str
     image_base64: str
+    # Caller-supplied idempotency key -- see app/db/usage_repository.py
+    # for the full contract (one request_id maps to one reservation
+    # forever). Required, not optional: a caller with no real
+    # idempotency key of its own must still supply *something*
+    # unique per attempt (the HTTP layer generates a fresh UUID when
+    # the client doesn't provide one) -- there is no "skip
+    # idempotency" mode, since every request must still go through
+    # exactly one reservation.
+    request_id: str
 
 
 @dataclass(frozen=True)
@@ -74,6 +96,7 @@ async def perform_analysis(
     pipeline: FacialAnalysisPipeline,
     scorer: FacialScorer,
     plan_service: PlanService,
+    usage_policy_service: UsagePolicyService,
 ) -> AnalysisResult:
     from app.db.consent_repository import REQUIRED_CONSENT_TYPE, REQUIRED_POLICY_VERSION, has_valid_consent
     from app.db.profile_repository import get_profile
@@ -83,31 +106,55 @@ async def perform_analysis(
     if not await has_valid_consent(pool, user_uuid, REQUIRED_CONSENT_TYPE, REQUIRED_POLICY_VERSION):
         raise ConsentRequiredError(REQUIRED_POLICY_VERSION)
 
+    # QuotaExceededError (app.domain.entitlement) propagates uncaught
+    # from here -- a request that never reserved a slot has nothing to
+    # release. A replayed reservation (idempotent retry of a
+    # request_id already RESERVED/CONSUMED/RELEASED earlier) returns
+    # that same reservation rather than a fresh one; letting the
+    # analysis proceed again for a replay of an already-CONSUMED
+    # request_id is deliberate -- the caller asked for the same
+    # logical request's *result*, not a second billable unit of it.
+    reservation = await usage_policy_service.reserve_analysis(user_uuid, request.request_id)
+
     try:
-        image_bytes = base64.b64decode(request.image_base64)
-    except Exception as e:
-        raise InvalidImageError("image_base64 is not valid base64") from e
+        try:
+            image_bytes = base64.b64decode(request.image_base64)
+        except Exception as e:
+            raise InvalidImageError("image_base64 is not valid base64") from e
 
-    # NoFaceDetectedError / CaptureQualityFailedError / ValueError from
-    # here propagate unchanged -- all three were already
-    # framework-agnostic exceptions before this module existed.
-    extraction_result = pipeline.analyze(image_bytes)
+        # NoFaceDetectedError / CaptureQualityFailedError / ValueError
+        # from here propagate unchanged -- all three were already
+        # framework-agnostic exceptions before this module existed.
+        extraction_result = pipeline.analyze(image_bytes)
 
-    metric_results = extraction_result["metric_results"]
-    capture_assessment = extraction_result["capture_assessment"]
-    eligible_for_longitudinal_comparison = extraction_result["eligible_for_longitudinal_comparison"]
+        metric_results = extraction_result["metric_results"]
+        capture_assessment = extraction_result["capture_assessment"]
+        eligible_for_longitudinal_comparison = extraction_result["eligible_for_longitudinal_comparison"]
 
-    # user_id is real, from a verified access token by the time this
-    # is called. The rest is a real persisted profile
-    # (app/db/profile_repository.py) -- falling back to the documented
-    # DEFAULT_PROFILE only if the user has never set one.
-    profile = await get_profile(pool, user_uuid)
-    user_profile = {"user_id": request.user_id, **profile}
+        # user_id is real, from a verified access token by the time
+        # this is called. The rest is a real persisted profile
+        # (app/db/profile_repository.py) -- falling back to the
+        # documented DEFAULT_PROFILE only if the user has never set one.
+        profile = await get_profile(pool, user_uuid)
+        user_profile = {"user_id": request.user_id, **profile}
 
-    analysis = scorer.compute_scores(metric_results, capture_quality=capture_assessment.overall_quality)
-    plan = plan_service.generate_plan(
-        analysis["scores"], analysis["insights"], user_profile, capture_assessment.overall_quality
-    )
+        analysis = scorer.compute_scores(metric_results, capture_quality=capture_assessment.overall_quality)
+        plan = plan_service.generate_plan(
+            analysis["scores"], analysis["insights"], user_profile, capture_assessment.overall_quality
+        )
+    except Exception:
+        # A legitimate failure anywhere past the reservation (bad
+        # image, no face detected, capture quality too low, or any
+        # unexpected error) releases the quota slot instead of
+        # consuming it -- a failed attempt produced no usable result,
+        # so it should not count against the user's allowance.
+        # release() only touches rows still in RESERVED status, so
+        # this is a safe no-op if the reservation was itself a replay
+        # of a request_id some other call already resolved.
+        await usage_policy_service.release_reservation(user_uuid, reservation.id)
+        raise
+
+    await usage_policy_service.consume_reservation(user_uuid, reservation.id)
 
     return AnalysisResult(
         plan=plan,

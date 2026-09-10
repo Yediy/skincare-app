@@ -11,10 +11,18 @@ from pydantic import BaseModel, EmailStr, Field
 
 from app.config import settings
 from app.cv.pipeline import FacialAnalysisPipeline, NoFaceDetectedError, CaptureQualityFailedError
+from app.domain.entitlement import FreeTierEntitlementService, QuotaExceededError, UsagePolicyService
 from app.ml.scorer import FacialScorer
 from app.services.plan_service import PlanService
 from app.db.connection import init_db_pool, close_db_pool
 from app.redis_client import init_redis, close_redis, get_redis
+from app.middleware.rate_limiter import (
+    ANALYSIS_POLICY,
+    AUTH_POLICY,
+    GENERAL_POLICY,
+    rate_limit_by_ip,
+    rate_limit_by_user,
+)
 from app.security.passwords import hash_password, verify_password
 from app.security.auth import get_current_user
 from app.security.tokens import create_access_token, generate_refresh_token, hash_refresh_token
@@ -65,6 +73,13 @@ async def shutdown_event():
 pipeline = FacialAnalysisPipeline()
 scorer = FacialScorer()
 plan_service = PlanService()
+# Real, working free-tier policy -- not a test-only stub (see
+# app/domain/entitlement.py) -- used until a billing-aware
+# EntitlementService (RevenueCat-backed, a later pass) replaces it.
+# Needs no pool, so it's a safe module-level singleton like the three
+# above; UsagePolicyService itself is constructed per-request in
+# /analyze since it wraps the request-time db pool.
+entitlement_service = FreeTierEntitlementService()
 
 
 @app.get("/health/live")
@@ -112,10 +127,18 @@ async def readiness():
 
 class AnalyzeRequest(BaseModel):
     image_base64: str
+    # Optional client-supplied idempotency key: a retried call with
+    # the same request_id is guaranteed not to reserve (or consume) a
+    # second quota slot -- see app/db/usage_repository.py. A client
+    # that never supplies one gets a fresh, server-generated UUID per
+    # call (below), which means that particular call has no retry
+    # protection -- an honest consequence of not supplying a key, not
+    # a bug.
+    request_id: str | None = None
 
 
 @app.post("/analyze")
-async def analyze(request: AnalyzeRequest, user_id: str = Depends(get_current_user)):
+async def analyze(request: AnalyzeRequest, user_id: str = Depends(rate_limit_by_user(ANALYSIS_POLICY))):
     """
     A thin HTTP adapter over app.domain.analysis_service.perform_analysis
     (Phase 14) -- this route no longer contains the analysis logic
@@ -123,6 +146,8 @@ async def analyze(request: AnalyzeRequest, user_id: str = Depends(get_current_us
     exceptions/result to HTTP status codes/bodies. The domain function
     is what a future background worker would call too, unchanged.
     """
+    import uuid as uuid_module
+
     from app.db.connection import get_db_pool
     from app.domain.analysis_service import (
         AnalysisRequest,
@@ -131,13 +156,21 @@ async def analyze(request: AnalyzeRequest, user_id: str = Depends(get_current_us
         perform_analysis,
     )
 
+    pool = get_db_pool()
+    usage_policy_service = UsagePolicyService(pool, entitlement_service)
+
     try:
         result = await perform_analysis(
-            get_db_pool(),
-            AnalysisRequest(user_id=user_id, image_base64=request.image_base64),
+            pool,
+            AnalysisRequest(
+                user_id=user_id,
+                image_base64=request.image_base64,
+                request_id=request.request_id or str(uuid_module.uuid4()),
+            ),
             pipeline=pipeline,
             scorer=scorer,
             plan_service=plan_service,
+            usage_policy_service=usage_policy_service,
         )
     except ConsentRequiredError as e:
         raise HTTPException(
@@ -145,6 +178,8 @@ async def analyze(request: AnalyzeRequest, user_id: str = Depends(get_current_us
             detail=f"Consent required for facial analysis (policy version {e.required_policy_version}). "
                    f"Grant it via POST /consent before calling /analyze.",
         )
+    except QuotaExceededError as e:
+        raise HTTPException(status_code=429, detail=str(e))
     except InvalidImageError:
         raise HTTPException(status_code=422, detail="image_base64 is not valid base64")
     except NoFaceDetectedError:
@@ -175,7 +210,7 @@ class SignupRequest(BaseModel):
 
 
 @app.post("/signup")
-async def signup(request: SignupRequest):
+async def signup(request: SignupRequest, _rl: None = Depends(rate_limit_by_ip(AUTH_POLICY))):
     """
     The new user's id is generated here in Python (not left to the
     table's default gen_random_uuid()) so that app.current_user_id can
@@ -217,7 +252,7 @@ class LoginRequest(BaseModel):
 
 
 @app.post("/login")
-async def login(request: LoginRequest):
+async def login(request: LoginRequest, _rl: None = Depends(rate_limit_by_ip(AUTH_POLICY))):
     """
     The email lookup below goes through `login_lookup_by_email`, a
     SECURITY DEFINER function (migration feb038fd05bd), not a direct
@@ -265,7 +300,7 @@ class RefreshRequest(BaseModel):
 
 
 @app.post("/refresh")
-async def refresh(request: RefreshRequest):
+async def refresh(request: RefreshRequest, _rl: None = Depends(rate_limit_by_ip(AUTH_POLICY))):
     """
     The old-token consumption and successor creation happen inside one
     explicit transaction. If successor insertion fails for any reason,
@@ -346,7 +381,7 @@ class LogoutRequest(BaseModel):
 
 
 @app.post("/logout")
-async def logout(request: LogoutRequest):
+async def logout(request: LogoutRequest, _rl: None = Depends(rate_limit_by_ip(AUTH_POLICY))):
     """
     Both statements now run inside one explicit transaction (not two
     separate implicit ones) so that app.current_token_hash, set before
@@ -379,12 +414,12 @@ async def logout(request: LogoutRequest):
 
 
 @app.get("/me")
-async def get_me(user_id: str = Depends(get_current_user)):
+async def get_me(user_id: str = Depends(rate_limit_by_user(GENERAL_POLICY))):
     return {"user_id": user_id}
 
 
 @app.post("/logout-all")
-async def logout_all(user_id: str = Depends(get_current_user)):
+async def logout_all(user_id: str = Depends(rate_limit_by_user(GENERAL_POLICY))):
     from app.db.connection import get_db_pool
     r = get_redis()
     now_ts = datetime.now(timezone.utc).timestamp()
@@ -407,7 +442,7 @@ async def logout_all(user_id: str = Depends(get_current_user)):
 
 
 @app.delete("/me")
-async def delete_account(user_id: str = Depends(get_current_user)):
+async def delete_account(user_id: str = Depends(rate_limit_by_user(GENERAL_POLICY))):
     """
     Soft-deletes the authenticated user's own account. The primary
     invalidation guarantee is the `is_active`/`deleted_at` check in
@@ -459,14 +494,14 @@ class ProfileUpdateRequest(BaseModel):
 
 
 @app.get("/profile")
-async def get_profile_route(user_id: str = Depends(get_current_user)):
+async def get_profile_route(user_id: str = Depends(rate_limit_by_user(GENERAL_POLICY))):
     from app.db.connection import get_db_pool
     from app.db.profile_repository import get_profile
     return await get_profile(get_db_pool(), uuid.UUID(user_id))
 
 
 @app.put("/profile")
-async def update_profile_route(request: ProfileUpdateRequest, user_id: str = Depends(get_current_user)):
+async def update_profile_route(request: ProfileUpdateRequest, user_id: str = Depends(rate_limit_by_user(GENERAL_POLICY))):
     from app.db.connection import get_db_pool
     from app.db.profile_repository import upsert_profile
     await upsert_profile(get_db_pool(), uuid.UUID(user_id), request.model_dump())
@@ -483,7 +518,7 @@ class ConsentGrantRequest(BaseModel):
 
 
 @app.post("/consent")
-async def grant_consent(request: ConsentGrantRequest, user_id: str = Depends(get_current_user)):
+async def grant_consent(request: ConsentGrantRequest, user_id: str = Depends(rate_limit_by_user(GENERAL_POLICY))):
     from app.db.connection import get_db_pool
     from app.db.consent_repository import record_consent
     result = await record_consent(
@@ -498,7 +533,7 @@ class ConsentWithdrawRequest(BaseModel):
 
 
 @app.post("/consent/withdraw")
-async def withdraw_consent_route(request: ConsentWithdrawRequest, user_id: str = Depends(get_current_user)):
+async def withdraw_consent_route(request: ConsentWithdrawRequest, user_id: str = Depends(rate_limit_by_user(GENERAL_POLICY))):
     from app.db.connection import get_db_pool
     from app.db.consent_repository import withdraw_consent
     withdrew = await withdraw_consent(get_db_pool(), uuid.UUID(user_id), request.consent_type)
