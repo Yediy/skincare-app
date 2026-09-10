@@ -6,6 +6,19 @@ on:
   pull_request:
     branches: [master, main]
 
+# Least-privilege default for every job in this workflow. gitleaks-action
+# needs to read the PR's commits/diff to scan them -- contents: read
+# alone was previously sufficient (GITHUB_TOKEN's own implicit default),
+# but that implicit default disappeared once this repository went
+# private, and gitleaks then failed with "403 Resource not accessible by
+# integration" trying to read PR commits. pull-requests: read grants
+# exactly the read access gitleaks-action needs for that, nothing more --
+# no job here writes to the repo, comments on PRs, or needs any other
+# scope.
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
   secret-scan:
     runs-on: ubuntu-latest

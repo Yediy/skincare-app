@@ -36,25 +36,30 @@ For each component this application depends on: what happens if it disappears, r
 
 ## Cloudflare R2
 
-**What happens if this disappears?** Nothing in the current request path depends on it — no route calls `ObjectStorage`/`CloudflareR2ObjectStorage` yet (Phase 6/7 built the abstraction; nothing consumes it yet, deliberately — see `PRODUCTION_ARCHITECTURE.md`'s Raw Face Image Policy). Once a real feature (product/media assets, exports, reports) depends on it, an R2 outage would degrade that feature specifically; `ObjectStorageUnavailableError` is the typed exception a caller would catch to degrade gracefully rather than 500.
+**What happens if this disappears?** Now a real dependency of the async path only (`POST /api/v2/analyses`), not of `/analyze`, which never touches it. `EphemeralAnalysisImageStore.store()` failing at submission time releases the quota reservation and marks the request `FAILED` (`IMAGE_STORAGE_UNAVAILABLE`) rather than leaving it stuck; `retrieve()` failing at execution time is caught and classified by the worker as `ImageRetrievalError` (retryable if it's `ObjectStorageUnavailableError`, terminal if the object is genuinely gone — `ObjectNotFoundError`, most likely because its retention window already expired).
 
 **Can users still log in?** Yes.
-**Can analysis continue?** Yes.
-**Can data be lost?** N/A currently — no transactional data is ever stored here (`PRODUCTION_ARCHITECTURE.md` principle 2).
-**How is it restored?** Provider-side; nothing this application controls.
-**Blast radius:** Currently zero. Grows only as real features start depending on it.
+**Can analysis continue?** Synchronous `/analyze`: yes, unaffected. Async submission/execution: no new submissions can complete, and in-flight async jobs retry (bounded by `max_attempts`) until R2 is back or they dead-letter.
+**Can data be lost?** No transactional data is ever stored here (`PRODUCTION_ARCHITECTURE.md` principle 2) — only the transient raw image, which was always meant to be short-lived (`RAW_IMAGE_LIFECYCLE.md`). A dead-lettered job releases quota and marks the request `FAILED`; nothing is silently lost, the user simply needs to resubmit.
+**How is it restored?** Provider-side; nothing this application controls. The cleanup sweeper (`app/workers/image_cleanup.py`) recovers any object whose deletion failed mid-outage once R2 is back.
+**Blast radius:** Async submission/execution only. Grows as more features start depending on it for non-ephemeral use (product/media assets, exports, reports).
 
-## CV worker (not built yet — target architecture)
+## CV worker (`app/workers/analysis_worker.py`)
 
-Currently, CV work (`FacialAnalysisPipeline`) runs synchronously inside the API process handling `/analyze`. There is no separate CV worker yet (Phase 14/15, deferred).
+Now real, not target-architecture-only. `python -m app.workers.analysis_worker` is a separate process/deployment consuming `PostgresJobQueue`; `/analyze` still also runs CV work synchronously inline on the API process (unchanged, and remains available for callers that want an immediate result).
 
-**What happens if this disappears (i.e., today, if CV compute itself hangs or crashes)?** It takes down the one API replica handling that request; other replicas are unaffected. A pathological image that hangs `pipeline.analyze()` indefinitely would hold that replica's event loop hostage for the duration (mediapipe/opencv calls are synchronous, not `await`ed) — a real, currently-unmitigated risk worth flagging honestly rather than glossing over, since it's the reason Phase 14/15's queue-based extraction is on the roadmap at all, not just a scale optimization.
+**What happens if a worker process disappears (crashes, is killed, hangs on a pathological image)?** The job it was processing stops receiving heartbeats (`extend_visibility`); once `claimed_until` passes, `claim()` makes it reclaimable by another worker replica — proven by a real test (`tests/workers/test_analysis_worker.py::test_heartbeat_prevents_a_concurrent_worker_from_reclaiming`, and the queue's own `test_expired_claim_becomes_reclaimable`). The synchronous `/analyze` path's own known risk is unchanged: a pathological image hanging `pipeline.analyze()` on that path still holds one API replica's event loop hostage, since mediapipe/opencv calls there aren't `await`ed — the async path is exactly the mitigation for that risk when a caller uses it, not a retrofit onto `/analyze` itself.
+**Can users still log in?** Yes.
+**Can analysis continue?** Yes, via `/analyze`, and via async submission once at least one worker replica is up.
+**Can data be lost?** No — a job reclaimed after a crash re-runs `AnalysisExecutionService.execute()` from scratch; `commit_analysis_result()`'s idempotency means a retry after a result already committed does nothing further (no duplicate compute, no double quota consumption).
+**How is it restored?** Orchestrator restarts/replaces the worker container/process; no state was held only there.
+**Blast radius:** Async analysis throughput only, scaled down to zero once more than one worker replica is running (same shape as the API node's own failure domain above).
 
-## Queue (`PostgresJobQueue`, unused by any real code path)
+## Queue (`PostgresJobQueue`)
 
-The `JobQueue` abstraction and its Postgres-backed implementation exist (`app/queue/`, migration `2e77bc462867`), but nothing enqueues onto it yet — `/analyze` still runs synchronously inline. So today, this table's failure domain is empty by construction: nothing depends on it.
+Now real, not unused. `app/queue/` (migration `2e77bc462867`, plus `9db3e5856a79`'s retry/heartbeat columns) backs `POST /api/v2/analyses`'s enqueue and the worker's `claim`/`acknowledge`/`fail`/`extend_visibility`.
 
-**What happens once something does depend on it (target)?** The queue is just rows in the same Postgres primary everything else already depends on — it has no *separate* failure domain from "Postgres primary" above; a Postgres outage takes down enqueue/claim exactly as it takes down login. A stuck/crashed worker (once one exists) does not lose work: an unacknowledged claimed job becomes reclaimable again once its `claimed_until` visibility timeout passes (proven by a real test, `test_expired_claim_becomes_reclaimable`), so a worker crash mid-job results in a retried job, not a lost one — assuming the work itself is safe to retry, which is a per-job-type property this abstraction doesn't enforce on its own.
+**What happens if Postgres (and therefore this queue) disappears?** No separate failure domain from "Postgres primary" above — a Postgres outage takes down enqueue/claim exactly as it takes down login. A stuck/crashed worker does not lose work: an unacknowledged claimed job becomes reclaimable again once its `claimed_until` visibility timeout passes. A job that fails retryably backs off exponentially (`BACKOFF_BASE_SECONDS * 2**attempt`) before becoming claimable again; once `max_attempts` is exhausted it dead-letters (`fail()` returns `is_terminal=True`), and the worker releases quota + marks the durable request `FAILED` at that point, not before.
 
 ## Dokploy control plane
 

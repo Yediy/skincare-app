@@ -20,7 +20,9 @@ This describes how to deploy `backend/Dockerfile`'s image under Dokploy. Nothing
 | `REDIS_CONNECT_TIMEOUT_SECONDS` / `REDIS_SOCKET_TIMEOUT_SECONDS` | Optional | Default 5.0 / 5.0. |
 | `DB_POOL_MIN_SIZE` / `DB_POOL_MAX_SIZE` | Optional | Default 2 / 10. Multiply by replica count when sizing Postgres `max_connections` — see `SCALING_TRIGGERS.md`'s PgBouncer trigger. |
 | `DB_POOL_CONNECT_TIMEOUT_SECONDS` / `DB_POOL_COMMAND_TIMEOUT_SECONDS` | Optional | Default 10.0 / 30.0. |
-| `R2_ACCOUNT_ID` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` / `R2_BUCKET` / `R2_ENDPOINT` | Optional | Only if a feature using `ObjectStorage` is deployed. Unset is fine — nothing in the request path depends on these yet. |
+| `R2_ACCOUNT_ID` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` / `R2_BUCKET` / `R2_ENDPOINT` | Required if `ASYNC_IMAGE_STORAGE_ENABLED=true` | Unset is fine while that flag stays `false` (the default) — constructing the client is safe either way (no network call at construction, see `app/storage/r2.py`), but the async submission path will fail at the first real upload attempt without real credentials. |
+| `ASYNC_IMAGE_STORAGE_ENABLED` | Optional | Default `false`. Gates `POST /api/v2/analyses` entirely (`503` while off) — see `CONSENT_ASYNC_PROCESSING_REVIEW.md` for why this stays off until a real legal/product review signs off. Turning it on without deploying at least one `app.workers.analysis_worker` replica means requests queue but never process. |
+| `LAUNCH_HOME_REGION` / `LAUNCH_CELL_ID` | Optional | Defaults `us-east` / `use1-001`. The placement metadata `UserPlacementService` assigns to a user/request the first time either is needed — see `ASYNC_ANALYSIS_ARCHITECTURE.md`. Not a routing config; changing this does not move any infrastructure. |
 
 Set every one of these as Dokploy environment variables / secrets, never baked into the image — `backend/.dockerignore` already excludes `.env*` from the build context so this isn't a configuration option that can silently go wrong.
 
@@ -56,9 +58,11 @@ Run this **before** rolling the new API image out, and ensure the migration is b
 2. If the failed deploy included a migration that isn't backward-compatible with the previous image, run that migration's `downgrade()` first — every migration in `backend/migrations/versions/` implements a real `downgrade()`, not a stub (verified by inspection of each file in this repository).
 3. Confirm `/health/ready` returns `200` on the rolled-back version before considering the rollback complete.
 
-## Worker deployment (later)
+## Worker deployment
 
-Not applicable yet — no separate CV worker or queue exists (Phase 14/15, `OPEN_ENGINEERING_ITEMS.md`). When it does, it deploys as its own Dokploy service/image, consuming the same `JobQueue` abstraction the API's `enqueue` call writes to, scaled independently of the API replica count per `SCALING_TRIGGERS.md`.
+Now real. `python -m app.workers.analysis_worker` deploys as its own Dokploy service, from the same image as the API (same `Dockerfile`, different `CMD`/entrypoint override), consuming `PostgresJobQueue` — no separate queue infrastructure to stand up. Requires the same `DATABASE_URL` and, if `ASYNC_IMAGE_STORAGE_ENABLED=true`, the same `R2_*` credentials as the API. Scale worker replica count independently of API replica count per `SCALING_TRIGGERS.md` — CV compute cost is per-analysis, not per-HTTP-request. No `HEALTHCHECK`/`/health/*` endpoint exists for the worker process itself yet; monitor it via the structured `analysis_processing`/`queue_claim` events (`app/observability/events.py`) and the job queue's own `pending`/`claimed`/`failed` row counts.
+
+Also deploy `python -m app.workers.image_cleanup` on a recurring schedule (a cron-like trigger, not a long-running process) — the safety-net sweeper for raw images the primary worker path didn't clean up (a crash, a kill, an R2 timeout). See `RAW_IMAGE_LIFECYCLE.md` for the retention window this is racing against (default one hour) and how to size the schedule's cadence against it.
 
 ## Image size, stated honestly
 
