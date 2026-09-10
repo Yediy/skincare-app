@@ -87,18 +87,42 @@ async def get_request_by_request_id(pool: asyncpg.Pool, user_id: UUID, request_i
     return dict(row) if row is not None else None
 
 
-async def mark_queued(pool: asyncpg.Pool, user_id: UUID, analysis_request_id: UUID, *, image_object_key: str, image_expires_at) -> None:
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            await conn.execute("SELECT set_config('app.current_user_id', $1, true)", str(user_id))
-            await conn.execute(
-                """
-                UPDATE analysis_requests
-                SET status = 'QUEUED', queued_at = now(), image_object_key = $2, image_expires_at = $3
-                WHERE id = $1
-                """,
-                analysis_request_id, image_object_key, image_expires_at,
-            )
+async def mark_queued(
+    pool: asyncpg.Pool,
+    user_id: UUID,
+    analysis_request_id: UUID,
+    *,
+    image_object_key: str,
+    image_expires_at,
+    conn: Optional[asyncpg.Connection] = None,
+) -> None:
+    """`conn`, when given, is used directly instead of acquiring+
+    transacting a new connection -- lets AnalysisSubmissionService
+    (Part V, Phase 24) run this UPDATE in the same transaction as
+    PostgresJobQueue.enqueue()'s job INSERT, so a request is never left
+    QUEUED with no corresponding job (or vice versa). The caller is
+    responsible for having already opened that transaction and set
+    app.current_user_id is set fresh here regardless, since it's
+    transaction-local (`true`) and this statement needs it in scope
+    either way."""
+    if conn is not None:
+        await _mark_queued_with_conn(conn, user_id, analysis_request_id, image_object_key, image_expires_at)
+        return
+    async with pool.acquire() as acquired:
+        async with acquired.transaction():
+            await _mark_queued_with_conn(acquired, user_id, analysis_request_id, image_object_key, image_expires_at)
+
+
+async def _mark_queued_with_conn(conn, user_id: UUID, analysis_request_id: UUID, image_object_key: str, image_expires_at) -> None:
+    await conn.execute("SELECT set_config('app.current_user_id', $1, true)", str(user_id))
+    await conn.execute(
+        """
+        UPDATE analysis_requests
+        SET status = 'QUEUED', queued_at = now(), image_object_key = $2, image_expires_at = $3
+        WHERE id = $1
+        """,
+        analysis_request_id, image_object_key, image_expires_at,
+    )
 
 
 async def mark_processing(pool: asyncpg.Pool, user_id: UUID, analysis_request_id: UUID) -> None:
