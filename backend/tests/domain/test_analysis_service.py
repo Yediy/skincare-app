@@ -26,6 +26,7 @@ from app.domain.analysis_service import (
     perform_analysis,
 )
 from app.domain.entitlement import FreeTierEntitlementService, UsagePolicyService
+from app.domain.product_matching_service import ProductMatchingService
 
 GRACE_HOPPER_JPG = Path(__file__).resolve().parent.parent / "fixtures" / "grace_hopper.jpg"
 
@@ -43,14 +44,17 @@ async def _create_user_with_consent(db_pool, email: str) -> str:
 
 @pytest.fixture
 def real_singletons(app_db_pool):
-    from app.main import pipeline, plan_service, scorer
+    from app.main import pipeline, plan_service, safety_engine, scorer
 
     usage_policy_service = UsagePolicyService(app_db_pool, FreeTierEntitlementService())
+    product_matching_service = ProductMatchingService(app_db_pool, safety_engine)
     return {
         "pipeline": pipeline,
         "scorer": scorer,
         "plan_service": plan_service,
         "usage_policy_service": usage_policy_service,
+        "product_matching_service": product_matching_service,
+        "safety_engine": safety_engine,
     }
 
 
@@ -180,12 +184,16 @@ async def test_perform_analysis_consumes_reservation_on_success(db_pool, app_db_
 
 async def test_perform_analysis_raises_quota_exceeded_once_allowance_is_used(db_pool, app_db_pool):
     from app.domain.entitlement import FreeTierEntitlementService, QuotaExceededError, UsagePolicyService
-    from app.main import pipeline, plan_service, scorer
+    from app.main import pipeline, plan_service, safety_engine, scorer
 
     user_id = await _create_user_with_consent(db_pool, "domain-quota@test.com")
     image_base64 = base64.b64encode(GRACE_HOPPER_JPG.read_bytes()).decode()
     tight_usage_policy = UsagePolicyService(app_db_pool, FreeTierEntitlementService(monthly_allowance=1))
-    singletons = {"pipeline": pipeline, "scorer": scorer, "plan_service": plan_service}
+    singletons = {
+        "pipeline": pipeline, "scorer": scorer, "plan_service": plan_service,
+        "product_matching_service": ProductMatchingService(app_db_pool, safety_engine),
+        "safety_engine": safety_engine,
+    }
 
     # First call consumes the only slot the tight allowance provides.
     await perform_analysis(

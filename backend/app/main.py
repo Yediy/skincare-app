@@ -12,6 +12,8 @@ from pydantic import BaseModel, EmailStr, Field
 from app.config import settings
 from app.cv.pipeline import FacialAnalysisPipeline, NoFaceDetectedError, CaptureQualityFailedError
 from app.domain.entitlement import FreeTierEntitlementService, QuotaExceededError, UsagePolicyService
+from app.domain.product_matching_service import ProductMatchingService
+from app.domain.safety_engine import SafetyEngine
 from app.ml.scorer import FacialScorer
 from app.services.plan_service import PlanService
 from app.db.connection import init_db_pool, close_db_pool
@@ -80,6 +82,12 @@ plan_service = PlanService()
 # above; UsagePolicyService itself is constructed per-request in
 # /analyze since it wraps the request-time db pool.
 entitlement_service = FreeTierEntitlementService()
+# Stateless -- safe as a shared singleton, same as pipeline/scorer/
+# plan_service above. ProductMatchingService itself is constructed
+# per-request (it wraps the request-time db pool), sharing this same
+# engine instance so formulation-level and routine-level evaluation
+# never disagree about rules_version/behavior mid-request.
+safety_engine = SafetyEngine()
 
 
 @app.get("/health/live")
@@ -158,6 +166,7 @@ async def analyze(request: AnalyzeRequest, user_id: str = Depends(rate_limit_by_
 
     pool = get_db_pool()
     usage_policy_service = UsagePolicyService(pool, entitlement_service)
+    product_matching_service = ProductMatchingService(pool, safety_engine)
 
     try:
         result = await perform_analysis(
@@ -171,6 +180,8 @@ async def analyze(request: AnalyzeRequest, user_id: str = Depends(rate_limit_by_
             scorer=scorer,
             plan_service=plan_service,
             usage_policy_service=usage_policy_service,
+            product_matching_service=product_matching_service,
+            safety_engine=safety_engine,
         )
     except ConsentRequiredError as e:
         raise HTTPException(

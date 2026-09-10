@@ -95,9 +95,10 @@ async def get_constraints(pool: asyncpg.Pool, user_id: UUID, constraint_type: st
 
 
 async def has_unresolved_constraints(pool: asyncpg.Pool, user_id: UUID) -> bool:
-    """Part I Phase 4's gate: an unresolved allergy/avoid entry must
-    block specific-product recommendation, not be silently treated as
-    though it didn't exist."""
+    """Any unresolved constraint, of either type. Kept for callers that
+    only need a single yes/no signal; SafetyEngine.
+    evaluate_product_formulation() needs the two types distinguished
+    (different reason codes) -- see get_unresolved_constraint_flags()."""
     async with pool.acquire() as conn:
         async with conn.transaction():
             await conn.execute("SELECT set_config('app.current_user_id', $1, true)", str(user_id))
@@ -106,3 +107,26 @@ async def has_unresolved_constraints(pool: asyncpg.Pool, user_id: UUID) -> bool:
                 user_id, UNRESOLVED,
             )
     return row is not None
+
+
+async def get_unresolved_constraint_flags(pool: asyncpg.Pool, user_id: UUID) -> Dict[str, bool]:
+    """Part I Phase 4's actual gate, type-distinguished: one query
+    returning both has_unresolved_allergy_constraint and
+    has_unresolved_avoid_constraint -- the exact two keys
+    SafetyEngine.evaluate_product_formulation()'s constraints dict
+    reads, so a caller can just do
+    `constraints = {**user_profile, **flags}` and pass it straight
+    through."""
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.current_user_id', $1, true)", str(user_id))
+            rows = await conn.fetch(
+                "SELECT DISTINCT constraint_type FROM user_ingredient_constraints "
+                "WHERE user_id = $1 AND resolution_status = $2",
+                user_id, UNRESOLVED,
+            )
+    unresolved_types = {r["constraint_type"] for r in rows}
+    return {
+        "has_unresolved_allergy_constraint": ALLERGY in unresolved_types,
+        "has_unresolved_avoid_constraint": AVOID in unresolved_types,
+    }

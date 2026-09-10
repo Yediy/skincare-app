@@ -37,6 +37,16 @@ missing consent never touches quota at all) and before any CV compute
 runs; a failure anywhere in the CV/scoring/plan sequence releases the
 reservation rather than consuming it -- only a fully successful
 analysis consumes the slot.
+
+Production recommendation pass (Part I, Phase 11 -- the P0 closure):
+after PlanService.generate_plan() produces its abstract, category-level
+plan, this function now calls
+app.domain.recommendation_service.apply_product_matching_and_routine_safety()
+to resolve concrete catalog products for it, each evaluated through
+SafetyEngine.evaluate_product_formulation() and cross-checked by
+evaluate_routine_safety() -- the actual production path a concrete
+product recommendation goes through, not merely an interface waiting
+for a caller. See PRODUCT_RECOMMENDATION_PIPELINE.md.
 """
 import base64
 from dataclasses import dataclass
@@ -46,7 +56,11 @@ from uuid import UUID
 import asyncpg
 
 from app.cv.pipeline import FacialAnalysisPipeline
+from app.db.user_constraint_repository import get_unresolved_constraint_flags
 from app.domain.entitlement import UsagePolicyService
+from app.domain.product_matching_service import ProductMatchingService
+from app.domain.recommendation_service import apply_product_matching_and_routine_safety
+from app.domain.safety_engine import SafetyEngine
 from app.ml.scorer import FacialScorer
 from app.services.plan_service import PlanService
 
@@ -97,6 +111,8 @@ async def perform_analysis(
     scorer: FacialScorer,
     plan_service: PlanService,
     usage_policy_service: UsagePolicyService,
+    product_matching_service: ProductMatchingService,
+    safety_engine: SafetyEngine,
 ) -> AnalysisResult:
     from app.db.consent_repository import REQUIRED_CONSENT_TYPE, REQUIRED_POLICY_VERSION, has_valid_consent
     from app.db.profile_repository import get_profile
@@ -141,6 +157,25 @@ async def perform_analysis(
         analysis = scorer.compute_scores(metric_results, capture_quality=capture_assessment.overall_quality)
         plan = plan_service.generate_plan(
             analysis["scores"], analysis["insights"], user_profile, capture_assessment.overall_quality
+        )
+
+        # Part I, Phase 11 (the P0 closure): resolve the abstract plan's
+        # categories to real catalog products, each independently
+        # evaluated through SafetyEngine.evaluate_product_formulation()
+        # and routine-level safety -- never produced from category-level
+        # evaluate_offer() alone. has_unresolved_*_constraint flags come
+        # from the normalized table (app/db/user_constraint_repository.py),
+        # the actual source of truth for per-ingredient resolution;
+        # user_profile's own allergies/avoid_ingredients/is_pregnant/
+        # is_nursing/has_sensitive_skin already match the exact shape
+        # SafetyEngine's constraints dict expects, so it's reused
+        # directly rather than rebuilt.
+        unresolved_flags = await get_unresolved_constraint_flags(pool, user_uuid)
+        recommendation_constraints = {**user_profile, **unresolved_flags}
+        await apply_product_matching_and_routine_safety(
+            pool, plan, recommendation_constraints,
+            product_matching_service=product_matching_service,
+            safety_engine=safety_engine,
         )
     except Exception:
         # A legitimate failure anywhere past the reservation (bad
