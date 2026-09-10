@@ -25,6 +25,8 @@ around compute.
 """
 import asyncio
 import logging
+import time
+from datetime import datetime, timezone
 from typing import Tuple
 from uuid import UUID
 
@@ -35,6 +37,7 @@ from app.domain.analysis_execution_service import (
     ImageRetrievalError,
 )
 from app.cv.pipeline import CaptureQualityFailedError, NoFaceDetectedError
+from app.observability import events as observability_events
 from app.queue.base import Job, JobNotFoundError, JobQueue
 from app.storage.base import ObjectNotFoundError
 
@@ -116,6 +119,7 @@ async def _heartbeat_loop(job_queue: JobQueue, job_id: UUID) -> None:
 
 async def _process_job(job: Job, job_queue: JobQueue, execution_service: AnalysisExecutionService) -> None:
     heartbeat_task = asyncio.create_task(_heartbeat_loop(job_queue, job.id))
+    started_at = time.monotonic()
     try:
         analysis_request_id = UUID(job.payload["analysis_request_id"])
         user_id = UUID(job.payload["user_id"])
@@ -127,12 +131,21 @@ async def _process_job(job: Job, job_queue: JobQueue, execution_service: Analysi
                 "analysis_worker: job=%s analysis_request_id=%s completed already_completed=%s",
                 job.id, analysis_request_id, outcome.already_completed,
             )
+            observability_events.processing_result(
+                job_id=str(job.id), analysis_id=str(analysis_request_id),
+                outcome="SUCCESS", duration_seconds=time.monotonic() - started_at,
+            )
         except Exception as e:
             retryable, error_code = classify_failure(e)
             is_terminal = await job_queue.fail(job.id, f"{e.__class__.__name__}: {error_code}", retryable=retryable)
             logger.warning(
                 "analysis_worker: job=%s analysis_request_id=%s failed error_code=%s retryable=%s terminal=%s",
                 job.id, analysis_request_id, error_code, retryable, is_terminal,
+            )
+            observability_events.processing_result(
+                job_id=str(job.id), analysis_id=str(analysis_request_id),
+                outcome="DEAD_LETTER" if is_terminal else "RETRY",
+                duration_seconds=time.monotonic() - started_at, error_code=error_code,
             )
             if is_terminal:
                 # Dead letter (Part VI, Phase 29): either this
@@ -153,8 +166,15 @@ async def run_one_cycle(job_queue: JobQueue, execution_service: AnalysisExecutio
     claimed (regardless of whether it ultimately succeeded or failed),
     False if the queue had nothing pending-and-ready."""
     job = await job_queue.claim(ANALYSIS_JOB_TYPE, visibility_timeout_seconds=CLAIM_VISIBILITY_TIMEOUT_SECONDS)
+    observability_events.queue_claim(
+        job_type=ANALYSIS_JOB_TYPE, job_id=str(job.id) if job else None, claimed=job is not None,
+    )
     if job is None:
         return False
+    observability_events.queue_wait_seconds(
+        job_id=str(job.id),
+        wait_seconds=(datetime.now(timezone.utc) - job.created_at).total_seconds(),
+    )
     await _process_job(job, job_queue, execution_service)
     return True
 

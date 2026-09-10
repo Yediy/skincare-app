@@ -150,12 +150,18 @@ async def compute_analysis(
     `pipeline.analyze()` propagate unchanged -- all three were already
     framework-agnostic exceptions before this module existed."""
     from app.db.profile_repository import get_profile
+    from app.observability import events as observability_events
 
     extraction_result = pipeline.analyze(image_bytes)
 
     metric_results = extraction_result["metric_results"]
     capture_assessment = extraction_result["capture_assessment"]
     eligible_for_longitudinal_comparison = extraction_result["eligible_for_longitudinal_comparison"]
+
+    observability_events.capture_quality(analysis_id=None, status=capture_assessment.quality_status.value)
+    for metric_name, mr in metric_results.items():
+        if mr.status == "ABSTAINED":
+            observability_events.metric_abstention(analysis_id=None, metric_name=metric_name)
 
     # user_id is real, from a verified access token (sync path) or an
     # already-durable analysis_requests.user_id (async path) by the

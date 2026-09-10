@@ -24,6 +24,7 @@ from uuid import UUID
 import asyncpg
 
 from app.db import usage_repository
+from app.observability import events as observability_events
 
 
 class EntitlementService(ABC):
@@ -129,6 +130,7 @@ class UsagePolicyService:
         result = await usage_repository.reserve(self._pool, user_id, request_id, period_key, allowance)
 
         if result.status == usage_repository.DENIED:
+            observability_events.quota_denial(user_id=str(user_id))
             raise QuotaExceededError(
                 f"Analysis allowance ({allowance}/period) exhausted for the current period."
             )

@@ -22,6 +22,7 @@ from typing import List
 import asyncpg
 
 from app.db import analysis_repository
+from app.observability import events as observability_events
 from app.storage.ephemeral_image_store import EphemeralAnalysisImageStore
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,7 @@ async def run_cleanup_sweep(
         else:
             result.failed += 1
             result.failed_request_ids.append(str(row["id"]))
+            observability_events.image_cleanup_failure(analysis_request_id=str(row["id"]))
             logger.warning(
                 "image_cleanup: failed to confirm deletion for analysis_request_id=%s (object storage unreachable, will retry next sweep)",
                 row["id"],

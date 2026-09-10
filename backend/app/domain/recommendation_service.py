@@ -27,6 +27,7 @@ import asyncpg
 
 from app.db.catalog_repository import get_formulation_ingredients
 from app.domain.product_matching_service import ProductMatch, ProductMatchingService
+from app.observability import events as observability_events
 from app.domain.safety_engine import (
     ProposedRoutineEntry,
     SafetyDecision,
@@ -249,6 +250,8 @@ async def apply_product_matching_and_routine_safety(
     for step, daypart, key in all_steps:
         matches = step_matches[key]
         step["product_recommendations"] = [m.to_dict() for m in matches]
+        if not matches:
+            observability_events.no_compatible_product(analysis_id=None, category=step["product_category"])
         if matches:
             top = matches[0]
             product_recommendations.append(StepProductRecommendation(

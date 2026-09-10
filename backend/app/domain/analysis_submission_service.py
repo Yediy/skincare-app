@@ -60,6 +60,7 @@ import asyncpg
 
 from app.db import analysis_repository
 from app.domain.entitlement import AnalysisInProgressError, UsagePolicyService
+from app.observability import events as observability_events
 from app.queue.base import JobQueue
 from app.storage.ephemeral_image_store import EphemeralAnalysisImageStore
 
@@ -134,11 +135,17 @@ class AnalysisSubmissionService:
         cell_id: Optional[str] = None,
     ) -> SubmissionResult:
         if not self._async_image_storage_enabled:
+            observability_events.analysis_submission(
+                request_id=request_id, user_id=str(user_id), outcome="STORAGE_DISABLED",
+            )
             raise AsyncImageStorageDisabledError()
 
         from app.db.consent_repository import REQUIRED_CONSENT_TYPE, REQUIRED_POLICY_VERSION, has_valid_consent
 
         if not await has_valid_consent(self._pool, user_id, REQUIRED_CONSENT_TYPE, REQUIRED_POLICY_VERSION):
+            observability_events.analysis_submission(
+                request_id=request_id, user_id=str(user_id), outcome="CONSENT_REQUIRED",
+            )
             raise ConsentRequiredError(REQUIRED_POLICY_VERSION)
 
         # Idempotent submit (Phase 23): a retried POST with a
@@ -147,6 +154,9 @@ class AnalysisSubmissionService:
         # reservation, image upload, or job.
         existing = await analysis_repository.get_request_by_request_id(self._pool, user_id, request_id)
         if existing is not None:
+            observability_events.analysis_submission(
+                request_id=request_id, user_id=str(user_id), outcome="REPLAY",
+            )
             return SubmissionResult(analysis_request_id=existing["id"], status=existing["status"], replay=True)
 
         # QuotaExceededError / AnalysisAlreadyCompletedError propagate
@@ -172,6 +182,9 @@ class AnalysisSubmissionService:
             image_bytes = base64.b64decode(image_base64, validate=True)
         except (binascii.Error, ValueError) as e:
             await self._usage_policy_service.release_reservation(user_id, reservation.id)
+            observability_events.analysis_submission(
+                request_id=request_id, user_id=str(user_id), outcome="INVALID_IMAGE",
+            )
             raise InvalidImageError("image_base64 is not valid base64") from e
 
         try:
@@ -185,6 +198,7 @@ class AnalysisSubmissionService:
             # off of -- release now, or this reservation is stranded
             # RESERVED forever.
             await self._usage_policy_service.release_reservation(user_id, reservation.id)
+            observability_events.analysis_submission(request_id=request_id, user_id=str(user_id), outcome="ERROR")
             raise
 
         try:
@@ -196,6 +210,7 @@ class AnalysisSubmissionService:
             # leaving it stuck in RECEIVED forever.
             await self._usage_policy_service.release_reservation(user_id, reservation.id)
             await analysis_repository.mark_failed(self._pool, user_id, req["id"], "IMAGE_STORAGE_UNAVAILABLE")
+            observability_events.analysis_submission(request_id=request_id, user_id=str(user_id), outcome="ERROR")
             raise
 
         try:
@@ -217,8 +232,10 @@ class AnalysisSubmissionService:
             # mark_queued()+enqueue() transaction did not commit -- see
             # module docstring's second bullet.
             await self._compensate_orphaned_upload(user_id, req["id"], reservation.id, stored)
+            observability_events.analysis_submission(request_id=request_id, user_id=str(user_id), outcome="ERROR")
             raise
 
+        observability_events.analysis_submission(request_id=request_id, user_id=str(user_id), outcome="QUEUED")
         return SubmissionResult(analysis_request_id=req["id"], status="QUEUED", replay=False)
 
     async def _compensate_orphaned_upload(
