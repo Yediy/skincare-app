@@ -94,3 +94,46 @@ async def test_skincare_app_can_read_catalog_tables(app_db_pool, synthetic_catal
             "SELECT canonical_name FROM ingredients WHERE id = $1", synthetic_catalog["ingredients"]["retinol"]
         )
     assert row["canonical_name"] == "Retinol"
+
+
+# --- Part III: analysis lifecycle tables (all user-owned, RLS) -------
+
+async def test_user_a_cannot_read_user_b_analysis_request(db_pool, app_db_pool):
+    from app.db import analysis_repository
+
+    user_a = await _create_user(db_pool, "analysis-rls-a@test.com")
+    user_b = await _create_user(db_pool, "analysis-rls-b@test.com")
+
+    req_b = await analysis_repository.create_request(app_db_pool, user_b, str(uuid.uuid4()))
+
+    async with app_db_pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.current_user_id', $1, true)", str(user_a))
+            row = await conn.fetchrow("SELECT * FROM analysis_requests WHERE id = $1", req_b["id"])
+
+    assert row is None
+
+
+async def test_user_a_cannot_read_user_b_analysis_result(db_pool, app_db_pool):
+    from app.db import analysis_repository, usage_repository
+
+    user_a = await _create_user(db_pool, "analysis-result-rls-a@test.com")
+    user_b = await _create_user(db_pool, "analysis-result-rls-b@test.com")
+
+    req_b = await analysis_repository.create_request(app_db_pool, user_b, str(uuid.uuid4()))
+    reservation = await usage_repository.reserve(app_db_pool, user_b, str(uuid.uuid4()), "2026-09", allowance=5)
+    await analysis_repository.commit_analysis_result(
+        app_db_pool, user_b, req_b["id"],
+        capture_assessment={}, scores={}, plan={}, eligible_for_longitudinal_comparison=True,
+        pipeline_version="1.0", metric_results={}, product_recommendations=[],
+        usage_reservation_id=reservation.id,
+    )
+
+    async with app_db_pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.current_user_id', $1, true)", str(user_a))
+            row = await conn.fetchrow(
+                "SELECT * FROM analysis_results WHERE analysis_request_id = $1", req_b["id"]
+            )
+
+    assert row is None
