@@ -47,6 +47,19 @@ SafetyEngine.evaluate_product_formulation() and cross-checked by
 evaluate_routine_safety() -- the actual production path a concrete
 product recommendation goes through, not merely an interface waiting
 for a caller. See PRODUCT_RECOMMENDATION_PIPELINE.md.
+
+Async-execution pass (Part V/VI): `compute_analysis()` below is the
+quota-independent core this module and
+app.domain.analysis_execution_service.AnalysisExecutionService both
+call -- image bytes in, CV/scoring/plan/product-matching/routine-safety
+out, no reservation, no consumption, no HTTP exceptions. `perform_analysis`
+is now a thin wrapper: it owns the *synchronous* request's reservation
+lifecycle (reserve before compute, consume/release after) around a
+call to the same `compute_analysis()`. The async worker path owns a
+*different* reservation lifecycle -- the one AnalysisSubmissionService
+already created at submission time -- so it calls `compute_analysis()`
+directly and never reserves a second slot for the same logical
+request. See ASYNC_ANALYSIS_ARCHITECTURE.md.
 """
 import base64
 from dataclasses import dataclass
@@ -103,6 +116,79 @@ class AnalysisResult:
     eligible_for_longitudinal_comparison: bool
 
 
+async def compute_analysis(
+    pool: asyncpg.Pool,
+    user_id: UUID,
+    image_bytes: bytes,
+    *,
+    pipeline: FacialAnalysisPipeline,
+    scorer: FacialScorer,
+    plan_service: PlanService,
+    product_matching_service: ProductMatchingService,
+    safety_engine: SafetyEngine,
+) -> AnalysisResult:
+    """The quota-independent core of a facial analysis: raw image bytes
+    in, CV -> scoring -> abstract plan -> product matching -> routine
+    safety out. No reservation, no consumption, no HTTP exceptions, no
+    consent check -- every one of those is a *caller* concern (a
+    synchronous request's reservation lifecycle in `perform_analysis`
+    below, or the async worker's, which reuses a reservation
+    AnalysisSubmissionService already created). Never call this twice
+    for the same logical request without knowing which caller owns
+    that request's quota slot.
+
+    NoFaceDetectedError / CaptureQualityFailedError / ValueError from
+    `pipeline.analyze()` propagate unchanged -- all three were already
+    framework-agnostic exceptions before this module existed."""
+    from app.db.profile_repository import get_profile
+
+    extraction_result = pipeline.analyze(image_bytes)
+
+    metric_results = extraction_result["metric_results"]
+    capture_assessment = extraction_result["capture_assessment"]
+    eligible_for_longitudinal_comparison = extraction_result["eligible_for_longitudinal_comparison"]
+
+    # user_id is real, from a verified access token (sync path) or an
+    # already-durable analysis_requests.user_id (async path) by the
+    # time this is called. The rest is a real persisted profile
+    # (app/db/profile_repository.py) -- falling back to the documented
+    # DEFAULT_PROFILE only if the user has never set one.
+    profile = await get_profile(pool, user_id)
+    user_profile = {"user_id": str(user_id), **profile}
+
+    analysis = scorer.compute_scores(metric_results, capture_quality=capture_assessment.overall_quality)
+    plan = plan_service.generate_plan(
+        analysis["scores"], analysis["insights"], user_profile, capture_assessment.overall_quality
+    )
+
+    # Part I, Phase 11 (the P0 closure): resolve the abstract plan's
+    # categories to real catalog products, each independently
+    # evaluated through SafetyEngine.evaluate_product_formulation()
+    # and routine-level safety -- never produced from category-level
+    # evaluate_offer() alone. has_unresolved_*_constraint flags come
+    # from the normalized table (app/db/user_constraint_repository.py),
+    # the actual source of truth for per-ingredient resolution;
+    # user_profile's own allergies/avoid_ingredients/is_pregnant/
+    # is_nursing/has_sensitive_skin already match the exact shape
+    # SafetyEngine's constraints dict expects, so it's reused
+    # directly rather than rebuilt.
+    unresolved_flags = await get_unresolved_constraint_flags(pool, user_id)
+    recommendation_constraints = {**user_profile, **unresolved_flags}
+    await apply_product_matching_and_routine_safety(
+        pool, plan, recommendation_constraints,
+        product_matching_service=product_matching_service,
+        safety_engine=safety_engine,
+    )
+
+    return AnalysisResult(
+        plan=plan,
+        scores=analysis["scores"],
+        metric_results=analysis["metric_results"],
+        capture_assessment=capture_assessment.to_dict(),
+        eligible_for_longitudinal_comparison=eligible_for_longitudinal_comparison,
+    )
+
+
 async def perform_analysis(
     pool: asyncpg.Pool,
     request: AnalysisRequest,
@@ -115,7 +201,6 @@ async def perform_analysis(
     safety_engine: SafetyEngine,
 ) -> AnalysisResult:
     from app.db.consent_repository import REQUIRED_CONSENT_TYPE, REQUIRED_POLICY_VERSION, has_valid_consent
-    from app.db.profile_repository import get_profile
 
     user_uuid = UUID(request.user_id)
 
@@ -130,52 +215,24 @@ async def perform_analysis(
     # analysis proceed again for a replay of an already-CONSUMED
     # request_id is deliberate -- the caller asked for the same
     # logical request's *result*, not a second billable unit of it.
+    #
+    # This is the SYNCHRONOUS path's own reservation, owned start to
+    # finish by this function -- distinct from the async path, where
+    # AnalysisExecutionService reuses a reservation
+    # AnalysisSubmissionService already created and never calls
+    # reserve_analysis() itself. See compute_analysis()'s docstring.
     reservation = await usage_policy_service.reserve_analysis(user_uuid, request.request_id)
 
     try:
         try:
-            image_bytes = base64.b64decode(request.image_base64)
+            image_bytes = base64.b64decode(request.image_base64, validate=True)
         except Exception as e:
             raise InvalidImageError("image_base64 is not valid base64") from e
 
-        # NoFaceDetectedError / CaptureQualityFailedError / ValueError
-        # from here propagate unchanged -- all three were already
-        # framework-agnostic exceptions before this module existed.
-        extraction_result = pipeline.analyze(image_bytes)
-
-        metric_results = extraction_result["metric_results"]
-        capture_assessment = extraction_result["capture_assessment"]
-        eligible_for_longitudinal_comparison = extraction_result["eligible_for_longitudinal_comparison"]
-
-        # user_id is real, from a verified access token by the time
-        # this is called. The rest is a real persisted profile
-        # (app/db/profile_repository.py) -- falling back to the
-        # documented DEFAULT_PROFILE only if the user has never set one.
-        profile = await get_profile(pool, user_uuid)
-        user_profile = {"user_id": request.user_id, **profile}
-
-        analysis = scorer.compute_scores(metric_results, capture_quality=capture_assessment.overall_quality)
-        plan = plan_service.generate_plan(
-            analysis["scores"], analysis["insights"], user_profile, capture_assessment.overall_quality
-        )
-
-        # Part I, Phase 11 (the P0 closure): resolve the abstract plan's
-        # categories to real catalog products, each independently
-        # evaluated through SafetyEngine.evaluate_product_formulation()
-        # and routine-level safety -- never produced from category-level
-        # evaluate_offer() alone. has_unresolved_*_constraint flags come
-        # from the normalized table (app/db/user_constraint_repository.py),
-        # the actual source of truth for per-ingredient resolution;
-        # user_profile's own allergies/avoid_ingredients/is_pregnant/
-        # is_nursing/has_sensitive_skin already match the exact shape
-        # SafetyEngine's constraints dict expects, so it's reused
-        # directly rather than rebuilt.
-        unresolved_flags = await get_unresolved_constraint_flags(pool, user_uuid)
-        recommendation_constraints = {**user_profile, **unresolved_flags}
-        await apply_product_matching_and_routine_safety(
-            pool, plan, recommendation_constraints,
-            product_matching_service=product_matching_service,
-            safety_engine=safety_engine,
+        result = await compute_analysis(
+            pool, user_uuid, image_bytes,
+            pipeline=pipeline, scorer=scorer, plan_service=plan_service,
+            product_matching_service=product_matching_service, safety_engine=safety_engine,
         )
     except Exception:
         # A legitimate failure anywhere past the reservation (bad
@@ -191,10 +248,4 @@ async def perform_analysis(
 
     await usage_policy_service.consume_reservation(user_uuid, reservation.id)
 
-    return AnalysisResult(
-        plan=plan,
-        scores=analysis["scores"],
-        metric_results=analysis["metric_results"],
-        capture_assessment=capture_assessment.to_dict(),
-        eligible_for_longitudinal_comparison=eligible_for_longitudinal_comparison,
-    )
+    return result

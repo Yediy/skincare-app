@@ -125,6 +125,31 @@ async def _mark_queued_with_conn(conn, user_id: UUID, analysis_request_id: UUID,
     )
 
 
+async def record_ephemeral_image_reference(
+    pool: asyncpg.Pool,
+    user_id: UUID,
+    analysis_request_id: UUID,
+    *,
+    image_object_key: str,
+    image_expires_at,
+) -> None:
+    """Persists the image reference WITHOUT touching status -- used
+    only by AnalysisSubmissionService's failure-window-B compensation
+    (Part V, this pass), when the atomic mark_queued()+enqueue()
+    transaction that would normally set these same columns failed to
+    commit. A direct, independent write so the cleanup sweeper
+    (find_overdue_ephemeral_images(), driven purely by
+    image_expires_at) can still recover the orphaned object later,
+    even though the request itself never reached QUEUED."""
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.current_user_id', $1, true)", str(user_id))
+            await conn.execute(
+                "UPDATE analysis_requests SET image_object_key = $2, image_expires_at = $3 WHERE id = $1",
+                analysis_request_id, image_object_key, image_expires_at,
+            )
+
+
 async def mark_processing(pool: asyncpg.Pool, user_id: UUID, analysis_request_id: UUID) -> None:
     async with pool.acquire() as conn:
         async with conn.transaction():
