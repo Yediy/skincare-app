@@ -371,6 +371,7 @@ async def synthetic_catalog(db_pool, migrated_test_database):
         # SAFE (this pass's Unknown Formulation Policy).
         incomplete_product_id, incomplete_formulation_id = await _product_with_formulation(
             "Undisclosed Mystery Serum", "vitamin_c_serum", [], "TNX-MYSTERY-01",
+            ingredient_data_status="UNKNOWN",
         )
 
         # Part I, Phase 1/2: a formulation CAN have real ingredients
