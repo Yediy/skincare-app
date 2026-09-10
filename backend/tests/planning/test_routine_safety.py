@@ -156,6 +156,94 @@ async def test_cross_product_separate_daypart_is_restricted_not_unsafe(app_db_po
     assert any(i["recommended_action"] == "SEPARATE_DAYPART" for i in interactions)
 
 
+async def _add_formulation_with_rule(db_pool, brand_id, *, category, rule_type, action, parameters=None):
+    """Test-local catalog insert -- a fresh ingredient/product/
+    formulation carrying exactly one EXCLUDE-or-not rule of the given
+    type, isolated from synthetic_catalog's own shared rows (which
+    other tests already assert specific RESTRICT-action behavior on;
+    this pass's new EXCLUDE-action coverage must not perturb those)."""
+    import json as _json
+
+    async with db_pool.acquire() as conn:
+        ingredient_id = await conn.fetchval(
+            "INSERT INTO ingredients (canonical_name, normalized_name, ingredient_type) "
+            "VALUES ($1, $2, 'active') RETURNING id",
+            f"Test Exclude Ingredient {rule_type} {action}", f"test exclude ingredient {rule_type} {action}".lower(),
+        )
+        product_id = await conn.fetchval(
+            "INSERT INTO products (brand_id, name, normalized_name, category) VALUES ($1, $2, $3, $4) RETURNING id",
+            brand_id, f"Test {rule_type} {action} Product", f"test {rule_type} {action} product".lower(), category,
+        )
+        formulation_id = await conn.fetchval(
+            """
+            INSERT INTO product_formulations
+                (product_id, version, source_type, verified_at, ingredient_data_status, market_or_region)
+            VALUES ($1, '1', 'manufacturer_disclosure', now(), 'COMPLETE', 'global')
+            RETURNING id
+            """,
+            product_id,
+        )
+        await conn.execute(
+            "INSERT INTO product_skus (product_id, formulation_id, sku) VALUES ($1, $2, $3)",
+            product_id, formulation_id, f"TEST-{rule_type}-{action}-{formulation_id}",
+        )
+        await conn.execute(
+            "INSERT INTO formulation_ingredients (formulation_id, ingredient_id, position) VALUES ($1, $2, 1)",
+            formulation_id, ingredient_id,
+        )
+        await conn.execute(
+            "INSERT INTO ingredient_rules (ingredient_id, rule_type, severity, action, reason_code, parameters) "
+            "VALUES ($1, $2, 'HIGH', $3, $4, $5::jsonb)",
+            ingredient_id, rule_type, action, f"{rule_type}_TEST", _json.dumps(parameters or {}),
+        )
+    return ingredient_id, product_id, formulation_id
+
+
+async def test_max_frequency_exclude_action_marks_routine_unsafe_and_attributes_formulation(
+    db_pool, synthetic_catalog,
+):
+    """A MAX_FREQUENCY rule whose action is EXCLUDE (not RESTRICT, see
+    test_max_frequency_exceeded_only_after_actual_schedule_comparison
+    for the RESTRICT case) must mark the routine UNSAFE once the
+    proposed schedule exceeds the cap, and must record the offending
+    formulation in exclude_action_formulation_ids so the routine
+    builder (recommendation_service) can attribute and drop it."""
+    _, _, formulation_id = await _add_formulation_with_rule(
+        db_pool, synthetic_catalog["brand_id"], category="strict_retinoid",
+        rule_type="MAX_FREQUENCY", action="EXCLUDE", parameters={"maximum_weekly_frequency": 1},
+    )
+    engine = SafetyEngine()
+    entries = [ProposedRoutineEntry(formulation_id=formulation_id, proposed_weekly_frequency=7)]
+    decision = await engine.evaluate_routine_safety(db_pool, entries, INACTIVE_CONTEXT)
+    assert decision.status == UNSAFE
+    assert decision.allowed is False
+    assert MAX_FREQUENCY_EXCEEDED in decision.reason_codes
+    assert str(formulation_id) in decision.restrictions["exclude_action_formulation_ids"]
+
+
+async def test_barrier_recovery_exclude_action_marks_routine_unsafe_and_attributes_formulation(
+    db_pool, synthetic_catalog,
+):
+    """Same as above, for a BARRIER_RECOVERY rule whose action is
+    EXCLUDE, only while barrier_recovery_active is True (inert
+    otherwise, same as the pre-existing RESTRICT-action test)."""
+    _, _, formulation_id = await _add_formulation_with_rule(
+        db_pool, synthetic_catalog["brand_id"], category="strict_barrier",
+        rule_type="BARRIER_RECOVERY", action="EXCLUDE",
+    )
+    engine = SafetyEngine()
+    entries = [ProposedRoutineEntry(formulation_id=formulation_id, proposed_weekly_frequency=1)]
+
+    inactive_decision = await engine.evaluate_routine_safety(db_pool, entries, INACTIVE_CONTEXT)
+    assert BARRIER_RECOVERY_CONFLICT not in inactive_decision.reason_codes
+    assert inactive_decision.status == SAFE
+
+    active_decision = await engine.evaluate_routine_safety(db_pool, entries, ACTIVE_BARRIER_CONTEXT)
+    assert active_decision.status == UNSAFE
+    assert active_decision.allowed is False
+    assert str(formulation_id) in active_decision.restrictions["exclude_action_formulation_ids"]
+
+
 async def test_single_formulation_routine_has_no_cross_product_interaction(app_db_pool, synthetic_catalog):
     """A routine with only one formulation can never produce a
     cross-product interaction finding -- get_interactions_within()

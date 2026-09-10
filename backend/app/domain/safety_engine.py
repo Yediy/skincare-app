@@ -120,6 +120,24 @@ class SafetyDecision:
         }
 
 
+def _mark_exclude_action_formulation(restrictions: Dict[str, Any], formulation_id: UUID) -> None:
+    """Records, in a form the routine builder (recommendation_service's
+    conflict-resolution pass) can act on directly, that this
+    formulation -- on its own, independent of any pairwise interaction
+    -- is why the routine is UNSAFE (an EXCLUDE-action MAX_FREQUENCY or
+    BARRIER_RECOVERY rule). Kept as its own dedicated restriction key
+    rather than overloading frequency_caps_exceeded/
+    barrier_recovery_conflicts (whose existing shape several tests
+    already assert on): those two stay restriction-only records of
+    what was compared, regardless of action; this key is specifically
+    "the routine builder must drop this formulation's concrete product
+    to have any chance of resolving to non-UNSAFE."""
+    ids = restrictions.setdefault("exclude_action_formulation_ids", [])
+    fid = str(formulation_id)
+    if fid not in ids:
+        ids.append(fid)
+
+
 @dataclass(frozen=True)
 class ProposedRoutineEntry:
     """One formulation's place in a proposed routine, as far as
@@ -497,6 +515,7 @@ class SafetyEngine:
                         })
                         if rule["action"] == "EXCLUDE":
                             unsafe = True
+                            _mark_exclude_action_formulation(restrictions, entry.formulation_id)
 
                 elif rule["rule_type"] == "BARRIER_RECOVERY" and usage_context.barrier_recovery_active:
                     if BARRIER_RECOVERY_CONFLICT not in reason_codes:
@@ -504,6 +523,7 @@ class SafetyEngine:
                     restrictions.setdefault("barrier_recovery_conflicts", []).append(str(entry.formulation_id))
                     if rule["action"] == "EXCLUDE":
                         unsafe = True
+                        _mark_exclude_action_formulation(restrictions, entry.formulation_id)
 
         interactions = await get_interactions_within(pool, unique_ids)
         if interactions:

@@ -145,53 +145,92 @@ async def apply_product_matching_and_routine_safety(
             )
         return entries
 
-    # Phase 12: enforce restrictions in the actual routine. A single
-    # bounded conflict-resolution pass -- each iteration drops exactly
-    # one step's top (specific-product) match on an unresolved
-    # EXCLUDE_COMBINATION pairing (the later-ordered step yields to the
-    # earlier one) and re-evaluates, until routine safety is no longer
-    # UNSAFE or every conflicting step has been reduced to its abstract
-    # category (no specific product at all -- Phase 11's fallback).
-    # This does not chase every pathological N-way conflict graph to a
+    # Phase 12 (P0 safety fix, this pass): enforce restrictions in the
+    # actual routine. A single bounded conflict-resolution pass -- each
+    # iteration drops exactly one step's top (specific-product) match
+    # for each formulation this pass can attribute to the current
+    # UNSAFE status, then re-evaluates, until routine safety is no
+    # longer UNSAFE or nothing further can be attributed/dropped. This
+    # does not chase every pathological N-way conflict graph to a
     # global optimum; it is real, terminates, and is honestly scoped,
-    # not a fabricated claim of completeness.
+    # not a fabricated claim of completeness -- the hard backstop below
+    # is what actually guarantees the invariant regardless.
+    #
+    # Two independent kinds of UNSAFE contributor, both handled here:
+    #   - exclude_action_formulation_ids (safety_engine's own explicit
+    #     marker): a single formulation is unsafe on its own, given the
+    #     proposed schedule -- an EXCLUDE-action MAX_FREQUENCY_EXCEEDED
+    #     or BARRIER_RECOVERY_CONFLICT rule. Drop it unconditionally;
+    #     there is no "other side" to keep.
+    #   - an unresolved EXCLUDE_COMBINATION interaction: pairwise by
+    #     nature -- the later-ordered step yields to the earlier one,
+    #     same as before.
     routine_decision = await safety_engine.evaluate_routine_safety(pool, list(_top_choice_entries().values()), usage_context)
     guard = 0
-    while routine_decision.status == UNSAFE and guard < len(all_steps):
+    while routine_decision.status == UNSAFE and guard < len(all_steps) * 2:
         guard += 1
         entries_by_key = _top_choice_entries()
-        excluded_ids = {
+        if not entries_by_key:
+            break  # every step has already lost its concrete product -- nothing left to drop.
+
+        direct_exclude_formulation_ids = set(routine_decision.restrictions.get("exclude_action_formulation_ids", []))
+        excluded_ingredient_ids = {
             i["ingredient_a_id"] for i in routine_decision.restrictions.get("interactions", [])
             if i["recommended_action"] == "EXCLUDE_COMBINATION"
         } | {
             i["ingredient_b_id"] for i in routine_decision.restrictions.get("interactions", [])
             if i["recommended_action"] == "EXCLUDE_COMBINATION"
         }
-        if not excluded_ids:
-            break  # UNSAFE for a reason this loop can't resolve (e.g. an EXCLUDE-action frequency rule) -- stop, don't loop forever.
 
-        # Formulations in the current entry set whose own ingredients
-        # include one of the excluded pair -- reuse the same catalog
-        # lookup evaluate_routine_safety already did, cheaply, per
-        # candidate formulation still in play.
-        conflicting_keys: List[str] = []
+        direct_drop_keys: List[str] = []
+        pairwise_conflict_keys: List[str] = []
         for key, entry in entries_by_key.items():
-            fi = await get_formulation_ingredients(pool, entry.formulation_id)
-            if any(str(x["ingredient_id"]) in excluded_ids for x in fi):
-                conflicting_keys.append(key)
-        if len(conflicting_keys) < 2:
-            break  # can't identify a droppable pair -- stop rather than guess.
+            if str(entry.formulation_id) in direct_exclude_formulation_ids:
+                direct_drop_keys.append(key)
+                continue
+            if excluded_ingredient_ids:
+                fi = await get_formulation_ingredients(pool, entry.formulation_id)
+                if any(str(x["ingredient_id"]) in excluded_ingredient_ids for x in fi):
+                    pairwise_conflict_keys.append(key)
 
-        # Keep the earliest-ordered step (AM before PM, then step_number);
-        # drop the top match of every other conflicting step.
-        conflicting_keys_ordered = sorted(
-            conflicting_keys, key=lambda k: (0 if k.startswith("AM:") else 1, int(k.split(":")[1]))
-        )
-        for drop_key in conflicting_keys_ordered[1:]:
+        drop_keys = set(direct_drop_keys)
+        if len(pairwise_conflict_keys) >= 2:
+            # Keep the earliest-ordered step (AM before PM, then
+            # step_number); drop the top match of every other
+            # conflicting step.
+            ordered = sorted(
+                pairwise_conflict_keys, key=lambda k: (0 if k.startswith("AM:") else 1, int(k.split(":")[1]))
+            )
+            drop_keys |= set(ordered[1:])
+
+        if not drop_keys:
+            break  # UNSAFE for a reason this pass can't attribute to a specific step -- stop, don't loop forever.
+
+        made_progress = False
+        for drop_key in drop_keys:
             if step_matches[drop_key]:
                 step_matches[drop_key] = step_matches[drop_key][1:]  # drop only the top choice, try the next-ranked one next pass
+                made_progress = True
+        if not made_progress:
+            break  # every implicated step already has no candidates left to fall back to.
 
         routine_decision = await safety_engine.evaluate_routine_safety(pool, list(_top_choice_entries().values()), usage_context)
+
+    # Hard backstop for the central invariant ("no concrete product
+    # recommendation may survive an UNSAFE routine decision"): the
+    # bounded pass above is a heuristic, not a guaranteed solver for
+    # every conflict graph. If routine safety is STILL UNSAFE after it
+    # gives up, no per-step attribution above can be trusted -- clear
+    # every step's concrete candidates (abstract category guidance
+    # untouched) rather than ever emit a recommendation on top of an
+    # UNSAFE routine decision. This is the one case where matching
+    # products for otherwise-uninvolved steps are also cleared, because
+    # the pass above already tried and failed to attribute the UNSAFE
+    # status to a smaller set.
+    unresolved_unsafe_routine = routine_decision.status == UNSAFE
+    if unresolved_unsafe_routine:
+        for key in step_matches:
+            step_matches[key] = []
 
     # Apply the FINAL routine decision's frequency-cap restrictions to
     # the actual routine step data -- not merely metadata prose.
@@ -227,6 +266,17 @@ async def apply_product_matching_and_routine_safety(
             ))
 
     plan["metadata"]["routine_safety_decision"] = routine_decision.to_dict()
+    # Explicit safety metadata (never silently absent) explaining why no
+    # concrete product survives, whenever that's the case -- required
+    # by this pass's own invariant: a caller reading only `plan` (not
+    # `product_recommendations`) must still be able to tell this
+    # happened, not infer it from an all-empty routine.
+    plan["metadata"]["unresolved_unsafe_routine"] = unresolved_unsafe_routine
+    if unresolved_unsafe_routine:
+        plan["metadata"]["safety_notice"] = (
+            "No compatible specific-product routine could be safely produced for this combination; "
+            "abstract category guidance only. See routine_safety_decision for details."
+        )
 
     return RecommendationResult(
         plan=plan,
