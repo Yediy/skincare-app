@@ -25,13 +25,30 @@ The response is a paginated `object: "list"` resource
 (`items`/`next_page`/`url`) -- this client follows `next_page` up to a
 bounded page count so the configured entitlement can never be falsely
 declared absent merely because it appears on a later page.
+
+`next_page` is documented as a *relative* path (e.g.
+`/v2/projects/{project_id}/customers/{customer_id}/active_entitlements
+?starting_after=...`), never an absolute URL -- and this client treats
+it that way deliberately, not just as a matter of following the docs.
+Every request here carries `Authorization: Bearer <RevenueCat API
+key>`; if a malformed or compromised response could redirect
+pagination to an arbitrary absolute URL, that header would go with it.
+`_resolve_and_validate_next_page` resolves `next_page` against the
+*current* page's own URL and then requires the result to still share
+the configured API base's scheme/host/port -- a `next_page` that
+resolves anywhere else is rejected outright (fails closed, tagged
+`UNTRUSTED_PAGINATION_ORIGIN`) before any request is made to it, so
+the Authorization header can never leak cross-origin. A `next_page`
+that resolves back to an already-fetched URL is rejected the same way
+(`PAGINATION_LOOP_DETECTED`), independent of the page-count bound
+below.
 """
 import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
-from urllib.parse import quote
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote, urljoin, urlsplit
 from uuid import UUID
 
 import asyncpg
@@ -88,6 +105,19 @@ def _error_code_for_status(status_code: int) -> str:
     return "HTTP_ERROR"
 
 
+def _origin(url: str) -> Tuple[str, str, int]:
+    """(scheme, hostname, effective port) -- the identity a same-origin
+    check must compare, not the raw string (so an explicit default port
+    doesn't falsely mismatch an implicit one)."""
+    parts = urlsplit(url)
+    scheme = (parts.scheme or "").lower()
+    hostname = (parts.hostname or "").lower()
+    port = parts.port
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    return (scheme, hostname, port)
+
+
 class RevenueCatAPIClient:
     """Thin wrapper around RevenueCat's documented v2 active-entitlements
     resource. See REVENUECAT_INTEGRATION_NOTES.md section 5.
@@ -107,16 +137,33 @@ class RevenueCatAPIClient:
         self._timeout_seconds = timeout_seconds
         self._transport = transport
 
+    def _resolve_and_validate_next_page(self, current_url: str, next_page: str) -> str:
+        """Resolves a (documented-relative, but defensively also
+        accepted if absolute) `next_page` value against the page that
+        returned it, then requires the result to share the configured
+        API base's origin. Raises ReconciliationAPIError rather than
+        ever returning an untrusted URL -- see the module docstring."""
+        resolved = urljoin(current_url, next_page)
+        if _origin(resolved) != _origin(self._base_url):
+            raise ReconciliationAPIError(
+                "RevenueCat active_entitlements next_page resolved outside the trusted API origin",
+                error_code="UNTRUSTED_PAGINATION_ORIGIN",
+            )
+        return resolved
+
     async def get_active_entitlements(self, app_user_id: str) -> List[Dict[str, Any]]:
         """Returns the customer's active-entitlement items (each a dict
         with at least `entitlement_id`, optionally `expires_at`),
         following documented pagination (`next_page`) up to
-        MAX_ACTIVE_ENTITLEMENT_PAGES."""
+        MAX_ACTIVE_ENTITLEMENT_PAGES. See the module docstring for the
+        trusted-origin and loop-detection guarantees this enforces
+        before ever issuing a request to a `next_page` value."""
         url = f"{self._base_url}/projects/{self._project_id}/customers/{quote(app_user_id, safe='')}/active_entitlements"
         headers = {"Authorization": f"Bearer {self._api_key}"}
 
         items: List[Dict[str, Any]] = []
         pages_fetched = 0
+        seen_urls: set = set()
         async with httpx.AsyncClient(timeout=self._timeout_seconds, transport=self._transport) as client:
             while url is not None:
                 if pages_fetched >= MAX_ACTIVE_ENTITLEMENT_PAGES:
@@ -126,6 +173,13 @@ class RevenueCatAPIClient:
                         MAX_ACTIVE_ENTITLEMENT_PAGES, app_user_id,
                     )
                     break
+                if url in seen_urls:
+                    raise ReconciliationAPIError(
+                        "RevenueCat active_entitlements next_page looped back to an already-fetched page",
+                        error_code="PAGINATION_LOOP_DETECTED",
+                    )
+                seen_urls.add(url)
+
                 try:
                     response = await client.get(url, headers=headers)
                 except httpx.HTTPError as e:
@@ -142,8 +196,10 @@ class RevenueCatAPIClient:
 
                 payload = response.json()
                 items.extend(payload.get("items") or [])
-                url = payload.get("next_page") or None
                 pages_fetched += 1
+
+                next_page = payload.get("next_page") or None
+                url = self._resolve_and_validate_next_page(url, next_page) if next_page is not None else None
 
         return items
 

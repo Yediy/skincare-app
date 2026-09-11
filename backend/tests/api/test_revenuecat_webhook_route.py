@@ -11,8 +11,11 @@ Durable-row assertions go through billing_db_pool (the skincare_billing
 role), not app_db_pool -- the ordinary skincare_app role has no read
 grant on revenuecat_webhook_events at all after migration
 9815eb266923 (see tests/database/test_revenuecat_billing_privilege.py).
-`jobs` assertions stay on app_db_pool since skincare_app keeps its
-pre-existing SELECT grant on that table.
+`jobs` assertions also go through billing_db_pool: migration
+4e5cda3a6bb0 scopes skincare_app's row-level security to job_type <>
+'revenuecat_webhook', so the ordinary runtime role can no longer see a
+`revenuecat_webhook` job at all (see
+tests/database/test_revenuecat_jobs_isolation.py).
 """
 import asyncio
 import hashlib
@@ -37,6 +40,14 @@ def _sign(body: bytes, secret: str, timestamp: int) -> str:
 
 @pytest.fixture(autouse=True)
 def _configure_webhook_secrets(monkeypatch):
+    # Every test in this file exercises the route as it behaves with
+    # RevenueCat billing turned on -- revenuecat_billing_enabled
+    # defaults to False (settings.py), and the route now deliberately
+    # 404s when it's off (see test_revenuecat_webhook_route_disabled_
+    # is_a_deliberate_404 below), so this must be forced True here or
+    # every test in this file would 404 instead of exercising the
+    # verify/insert/enqueue contract they actually test.
+    monkeypatch.setattr(settings, "revenuecat_billing_enabled", True)
     monkeypatch.setattr(settings, "revenuecat_webhook_auth", AUTH_VALUE)
     monkeypatch.setattr(settings, "revenuecat_webhook_signing_secret", SIGNING_SECRET)
 
@@ -79,7 +90,7 @@ def _headers(body: bytes) -> dict:
     }
 
 
-async def test_valid_webhook_accepted_creates_durable_event_and_job(client, billing_db_pool, app_db_pool):
+async def test_valid_webhook_accepted_creates_durable_event_and_job(client, billing_db_pool):
     event_id = str(uuid.uuid4())
     body = _event_body(event_id)
 
@@ -93,7 +104,7 @@ async def test_valid_webhook_accepted_creates_durable_event_and_job(client, bill
     assert event_row is not None
     assert event_row["event_type"] == "INITIAL_PURCHASE"
 
-    job_row = await app_db_pool.fetchrow(
+    job_row = await billing_db_pool.fetchrow(
         "SELECT * FROM jobs WHERE job_type = 'revenuecat_webhook' AND request_id = $1", f"revenuecat:{event_id}"
     )
     assert job_row is not None
@@ -191,7 +202,7 @@ async def test_missing_signature_rejected(client):
     assert response.status_code == 401
 
 
-async def test_duplicate_delivery_is_idempotent(client, billing_db_pool, app_db_pool):
+async def test_duplicate_delivery_is_idempotent(client, billing_db_pool):
     event_id = str(uuid.uuid4())
     body = _event_body(event_id)
 
@@ -204,7 +215,7 @@ async def test_duplicate_delivery_is_idempotent(client, billing_db_pool, app_db_
     event_count = await billing_db_pool.fetchval(
         "SELECT COUNT(*) FROM revenuecat_webhook_events WHERE revenuecat_event_id = $1", event_id
     )
-    job_count = await app_db_pool.fetchval(
+    job_count = await billing_db_pool.fetchval(
         "SELECT COUNT(*) FROM jobs WHERE job_type = 'revenuecat_webhook' AND request_id = $1", f"revenuecat:{event_id}"
     )
     assert event_count == 1
@@ -212,7 +223,7 @@ async def test_duplicate_delivery_is_idempotent(client, billing_db_pool, app_db_
 
 
 async def test_ten_concurrent_duplicate_deliveries_create_exactly_one_event_and_one_job(
-    client, billing_db_pool, app_db_pool,
+    client, billing_db_pool,
 ):
     event_id = str(uuid.uuid4())
     body = _event_body(event_id)
@@ -227,8 +238,25 @@ async def test_ten_concurrent_duplicate_deliveries_create_exactly_one_event_and_
     event_count = await billing_db_pool.fetchval(
         "SELECT COUNT(*) FROM revenuecat_webhook_events WHERE revenuecat_event_id = $1", event_id
     )
-    job_count = await app_db_pool.fetchval(
+    job_count = await billing_db_pool.fetchval(
         "SELECT COUNT(*) FROM jobs WHERE job_type = 'revenuecat_webhook' AND request_id = $1", f"revenuecat:{event_id}"
     )
     assert event_count == 1
     assert job_count == 1
+
+
+async def test_webhook_route_is_a_deliberate_404_when_billing_disabled(client, monkeypatch):
+    """Overrides the autouse fixture's forced-enabled default -- proves
+    the route fails deliberately (404) rather than relying on an
+    uninitialized billing pool to blow up as an accidental 500. Also
+    proves this isn't merely "verification runs first and rejects
+    everything": even a genuinely well-formed, correctly-signed
+    delivery still 404s when billing is off."""
+    monkeypatch.setattr(settings, "revenuecat_billing_enabled", False)
+
+    event_id = str(uuid.uuid4())
+    body = _event_body(event_id)
+
+    response = await client.post("/api/v2/webhooks/revenuecat", content=body, headers=_headers(body))
+
+    assert response.status_code == 404

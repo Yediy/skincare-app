@@ -70,7 +70,7 @@ _REVENUECAT_SAFE_KWARGS = dict(
     revenuecat_webhook_signing_secret="a-real-configured-signing-secret",
     revenuecat_api_key="a-real-configured-api-key",
     revenuecat_project_id="a-real-configured-project-id",
-    revenuecat_billing_database_url="postgresql://skincare_billing:REDACTED@db.internal.example.com:5432/skincare",
+    revenuecat_billing_database_url="postgresql://skincare_billing_runtime:REDACTED@db.internal.example.com:5432/skincare",
 )
 
 
@@ -115,8 +115,25 @@ def test_production_rejects_revenuecat_billing_database_url_with_dev_marker():
         Settings(
             _env_file=None,
             **{**_SAFE_PROD_KWARGS, **_REVENUECAT_SAFE_KWARGS,
-               "revenuecat_billing_database_url": "postgresql://skincare_billing:skincare_billing_dev_only@localhost:5432/skincare"},
+               "revenuecat_billing_database_url": "postgresql://skincare_billing_runtime:skincare_billing_dev_only@localhost:5432/skincare"},
         )
+
+
+def test_production_rejects_known_dev_billing_credential_even_off_localhost():
+    """`skincare_billing_dev_only` is rejected as its own marker, not
+    merely caught incidentally by the `localhost` check above --
+    proven here against a real-looking production host, since
+    `skincare_billing` itself being NOLOGIN (migration 9815eb266923)
+    means this exact literal could otherwise slip through as
+    plausible-looking runtime-login copy-paste."""
+    with pytest.raises(ValueError) as exc_info:
+        Settings(
+            _env_file=None,
+            **{**_SAFE_PROD_KWARGS, **_REVENUECAT_SAFE_KWARGS,
+               "revenuecat_billing_database_url":
+                   "postgresql://skincare_billing_runtime:skincare_billing_dev_only@db.internal.example.com:5432/skincare"},
+        )
+    assert "skincare_billing_dev_only" in str(exc_info.value)
 
 
 def test_development_config_unaffected_by_revenuecat_billing_flag():

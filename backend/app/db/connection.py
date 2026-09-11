@@ -88,3 +88,12 @@ def get_billing_db_pool() -> asyncpg.Pool:
     if _billing_pool is None:
         raise RuntimeError("Billing database pool not initialized -- call init_billing_db_pool() at startup")
     return _billing_pool
+
+
+def get_billing_db_pool_if_initialized() -> Optional[asyncpg.Pool]:
+    """Like get_billing_db_pool(), but returns None instead of raising
+    when the billing pool was never initialized (REVENUECAT_BILLING_
+    ENABLED=false), rather than treating "not configured" as the same
+    startup bug as "configured but unreachable". Used by /health/ready,
+    which needs to tell those two cases apart."""
+    return _billing_pool

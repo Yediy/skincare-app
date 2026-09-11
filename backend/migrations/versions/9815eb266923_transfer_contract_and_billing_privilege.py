@@ -82,12 +82,14 @@ def upgrade() -> None:
     needs) and introduces a new, dedicated `skincare_billing` role that
     holds them instead, plus the `jobs` grants webhook ingestion and
     the RevenueCat worker need to durably enqueue/claim/acknowledge
-    jobs in the same transaction as their table writes. `skincare_app`
-    can no longer manufacture billing truth under any circumstance --
-    not merely "cannot manufacture *another user's*" truth, the
-    stronger claim this pass's brief requires. See
-    BILLING_ARCHITECTURE.md's "Database privilege boundary" section
-    and tests/database/test_revenuecat_billing_privilege.py.
+    jobs in the same transaction as their table writes (further scoped
+    to only the `revenuecat_webhook` job_type by row-level security --
+    see migration <jobs_billing_isolation> below). `skincare_app` can
+    no longer manufacture billing truth under any circumstance -- not
+    merely "cannot manufacture *another user's*" truth, the stronger
+    claim this pass's brief requires. See BILLING_ARCHITECTURE.md's
+    "Database privilege boundary" section and
+    tests/database/test_revenuecat_billing_privilege.py.
 
     `skincare_billing` is NOSUPERUSER / NOCREATEDB / NOCREATEROLE /
     NOBYPASSRLS, same posture as `skincare_app` -- it is still subject
@@ -95,6 +97,25 @@ def upgrade() -> None:
     `app.current_user_id` to the row's own user_id before writing,
     exactly as `skincare_app` did), least privilege rather than a
     blanket bypass.
+
+    `skincare_billing` itself is created NOLOGIN -- it is a pure
+    privilege/group role, not a connectable credential, and this
+    migration never embeds a password for it (an independent review of
+    an earlier version of this migration caught exactly that: a known
+    `LOGIN PASSWORD 'skincare_billing_dev_only'` shipped inside a
+    schema migration, which is a real secret an application schema
+    migration must never carry, dev-only or not). The actual
+    connectable login (`skincare_billing_runtime` in this repository's
+    own dev/CI infrastructure -- see tests/conftest.py -- or whatever a
+    given deployment names its equivalent) is provisioned outside this
+    migration, with a secret from that deployment's own secret manager,
+    and granted membership in this role (`GRANT skincare_billing TO
+    <runtime login>`) so it inherits exactly these privileges and no
+    more. `app/config.py::_reject_unsafe_production_config` still
+    rejects `skincare_billing_dev_only` (and every other known dev/CI
+    marker) in `REVENUECAT_BILLING_DATABASE_URL` as defense in depth,
+    even though this NOLOGIN design means that literal credential can
+    never actually exist in production.
 
     `skincare_billing` also needs plain SELECT on `users`:
     `_resolve_user()` (app/domain/revenuecat_entitlement_processor.py)
@@ -129,7 +150,7 @@ def upgrade() -> None:
         DO $$
         BEGIN
             IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'skincare_billing') THEN
-                CREATE ROLE skincare_billing WITH LOGIN PASSWORD 'skincare_billing_dev_only'
+                CREATE ROLE skincare_billing WITH NOLOGIN
                     NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
             END IF;
         END
