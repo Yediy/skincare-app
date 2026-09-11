@@ -71,6 +71,16 @@ Now real, not unused. `app/queue/` (migration `2e77bc462867`, plus `9db3e5856a79
 **How is it restored?** Provider/operator action; out of this application's scope.
 **Blast radius:** Deployment operations only, not live traffic — as long as the principle above actually holds, which is why it's a binding architectural rule and not just a preference.
 
+## RevenueCat (billing provider)
+
+**What happens if this disappears?** No impact on `/analyze`, `POST /api/v2/analyses`, or any quota decision — `RevenueCatEntitlementService` reads only the local `user_entitlements` projection, never RevenueCat's API (see `BILLING_ARCHITECTURE.md`'s "Provider failure / staleness policy"). Two things do stop working: (1) new webhook deliveries obviously can't arrive if RevenueCat itself is down, so the local projection stops receiving updates until it recovers (RevenueCat's own retry policy — up to 5 attempts over ~2.5 hours — covers a transient RevenueCat-side blip once it's back); (2) `RevenueCatReconciliationService`'s outbound `GET /v2/projects/.../customers/...` calls fail (`ReconciliationAPIError`), so drift-correction is unavailable until RevenueCat is reachable again.
+
+**Can users still log in?** Yes.
+**Can analysis continue?** Yes, using whatever `user_entitlements` state was last projected — this is the entire point of the local-projection design.
+**Can data be lost?** No — every webhook event RevenueCat successfully delivers (before or after an outage) is durably received and processed exactly once; nothing is lost by this application's own logic. RevenueCat's own delivery guarantees (retries with backoff) are what determine whether an event sent *during* a RevenueCat-side outage eventually arrives at all — outside this application's control.
+**How is it restored?** No action needed from this application once RevenueCat is reachable again — queued webhook deliveries resume, and a future reconciliation run (see `OPEN_ENGINEERING_ITEMS.md` — not yet scheduled automatically) can correct any drift accumulated during the outage.
+**Blast radius:** Entitlement-projection freshness only, bounded by however long RevenueCat itself is unreachable — never analysis availability.
+
 ## Cloudflare (edge/DNS/proxy, if used in front of the API)
 
 **What happens if this disappears?** Total outage from the public internet's perspective, regardless of how healthy every component behind it is — this is the single point of failure the whole topology funnels through (`PRODUCTION_ARCHITECTURE.md`'s target topology diagram). Mitigations (multi-provider DNS failover, etc.) are a launch-topology decision, not an application-code one, and are out of scope for this document.

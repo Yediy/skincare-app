@@ -85,6 +85,57 @@ def quota_denial(*, user_id: str) -> None:
     _emit("quota_denial", user_id=user_id)
 
 
+def revenuecat_webhook_received(*, event_type: str) -> None:
+    _emit("revenuecat_webhook_received", event_type=event_type)
+
+
+def revenuecat_webhook_rejected(*, reason: str) -> None:
+    """reason is always one of app.security.revenuecat_webhook.
+    WebhookVerificationError's closed code set -- never a header value,
+    secret, or raw signature."""
+    _emit("revenuecat_webhook_rejected", reason=reason)
+
+
+def revenuecat_event_duplicate(*, event_type: str) -> None:
+    _emit("revenuecat_event_duplicate", event_type=event_type)
+
+
+def revenuecat_event_stale(*, event_type: str) -> None:
+    _emit("revenuecat_event_stale", event_type=event_type)
+
+
+def revenuecat_event_processed(*, event_type: str) -> None:
+    _emit("revenuecat_event_processed", event_type=event_type)
+
+
+def revenuecat_event_failed(*, event_type: str, error_code: str) -> None:
+    _emit("revenuecat_event_failed", event_type=event_type, error_code=error_code)
+
+
+def entitlement_activated(*, event_type: str) -> None:
+    _emit("entitlement_activated", event_type=event_type)
+
+
+def entitlement_expired(*, event_type: str) -> None:
+    _emit("entitlement_expired", event_type=event_type)
+
+
+def entitlement_revoked(*, event_type: str) -> None:
+    _emit("entitlement_revoked", event_type=event_type)
+
+
+def reconciliation_success(*, user_id: str, mismatch_found: bool) -> None:
+    _emit("reconciliation_success", user_id=user_id, mismatch_found=mismatch_found)
+
+
+def reconciliation_mismatch(*, user_id: str, local_status: Optional[str], remote_active: bool) -> None:
+    _emit("reconciliation_mismatch", user_id=user_id, local_status=local_status, remote_active=remote_active)
+
+
+def reconciliation_failure(*, user_id: str, error_code: str) -> None:
+    _emit("reconciliation_failure", user_id=user_id, error_code=error_code)
+
+
 def rate_limit_denial(*, policy: str, identity_kind: str) -> None:
     """identity_kind: "ip" | "user" -- the *kind* of identity that was
     limited, never the actual IP/user_id value, so this one call site

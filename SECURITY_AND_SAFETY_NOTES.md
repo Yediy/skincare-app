@@ -59,9 +59,20 @@ Full detail in `ASYNC_ANALYSIS_ARCHITECTURE.md` and `RAW_IMAGE_LIFECYCLE.md`. Su
 - **Worker retry classification is a closed, explicit set.** A known-bad-input exception (`NoFaceDetectedError`, `CaptureQualityFailedError`, an invalid image, an invalid/nonexistent durable request state) is always terminal — retrying a bad photo cannot fix it. Everything else defaults retryable, bounded by the job's own `max_attempts`, so an unanticipated failure mode still dead-letters eventually rather than retrying forever.
 - **A dead-lettered job always releases quota and marks the durable request `FAILED`** (`AnalysisExecutionService.mark_terminal_failure()`) — the client-facing `GET /api/v2/analyses/{id}` never returns a raw exception message or stack trace for a `FAILED` analysis, only one of a closed set of safe error-code classifications.
 
+## Billing (RevenueCat) — this pass
+
+Full detail in `BILLING_ARCHITECTURE.md`. Safety-relevant properties, all tested (`backend/tests/security/test_revenuecat_webhook_verification.py`, `backend/tests/api/test_revenuecat_webhook_route.py`, `backend/tests/database/test_revenuecat_rls.py`):
+
+- **Webhook verification is real, not cosmetic.** HMAC-SHA256 is computed over the exact raw request body bytes (never a parsed-and-reserialized copy — proven by a test that a semantically-identical but differently-whitespaced body fails verification), compared with `hmac.compare_digest` (constant-time), with a bounded timestamp-tolerance window. Neither the Authorization header value, the signing secret, nor the raw HMAC signature is ever logged.
+- **No unrestricted write path to premium access.** No HTTP route accepts a client-supplied entitlement status. `user_entitlements` has RLS (blocks cross-user writes regardless of query shape) and a real foreign key tying any webhook-attributed write to a durably-received, verified event — forging a row via that path requires first passing HMAC + Authorization verification, not just knowing SQL. No `DELETE` grant on the table.
+- **Never trusts an unvalidated identity string.** `app_user_id` (and `TRANSFER`'s source/destination ids) must resolve to a real `users.id` or the event fails closed (`FAILED`, `UNKNOWN_APP_USER_ID`) — no entitlement row is fabricated for an unresolvable id.
+- **Out-of-order delivery cannot corrupt state.** A stale event (older `event_timestamp_ms` than what's already projected) is a genuine no-op at the database level (single `INSERT ... ON CONFLICT ... WHERE` statement), not a race-prone read-then-write.
+- **A provider outage cannot take down analysis.** `RevenueCatEntitlementService` performs exactly one local `SELECT`, proven by a test that fails loudly if it ever constructs an HTTP client.
+- **Sandbox purchases cannot grant production access.** `environment` is part of `user_entitlements`' own uniqueness scope, and `RevenueCatEntitlementService` filters by the running environment on top of that.
+- **Production fail-closed.** `REVENUECAT_BILLING_ENABLED=true` with any of the four required secrets blank/placeholder refuses to start, same posture as every other production config check in `app/config.py`.
+
 ## What's explicitly NOT done (see CV_VALIDATION_LIMITATIONS.md and OPEN_ENGINEERING_ITEMS.md for full detail)
 
-- No billing/subscription/webhook code of any kind exists in this repository; RevenueCat is not integrated (the `EntitlementService` seam it will plug into is real and built, see above).
 - No catalog-administration route exists — catalog data is migration/fixture-only, not writable via any HTTP path.
 - No cell-based routing, replication, or sharding exists — `home_region`/`cell_id` are metadata-readiness columns only (see `PRODUCTION_ARCHITECTURE.md` principle 7).
 - No metrics/Prometheus backend is deployed — `app/observability/events.py`'s structured events are real, wired-in log lines, not yet fed into a time-series/alerting system.

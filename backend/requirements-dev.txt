@@ -1,7 +1,10 @@
 # Test-only additions on top of the production dependency set. Not
 # installed in the Docker runtime image -- see requirements.txt.
+# httpx now lives in requirements.txt itself (a real production
+# dependency, not test-only -- see its comment there); tests use the
+# same pinned version via -r below, and also use it directly as an
+# HTTP test client (tests/conftest.py's ASGITransport-based client).
 -r requirements.txt
 
 pytest==9.1.1
 pytest-asyncio==1.4.0
-httpx==0.27.0

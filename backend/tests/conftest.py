@@ -171,7 +171,8 @@ async def clean_database(request):
             await conn.execute(
                 "TRUNCATE TABLE refresh_tokens, user_profiles, consent_events, jobs, analysis_usage, "
                 "user_ingredient_constraints, analysis_product_recommendations, analysis_measurements, "
-                "analysis_results, analysis_requests, users RESTART IDENTITY CASCADE"
+                "analysis_results, analysis_requests, user_entitlements, revenuecat_webhook_events, "
+                "users RESTART IDENTITY CASCADE"
             )
         finally:
             await conn.close()

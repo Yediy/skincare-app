@@ -6,7 +6,7 @@ This describes the application as it **actually exists right now**, verified by 
 
 ## What this repository is
 
-A FastAPI backend (`backend/app/main.py`) with real authentication, a real Postgres database (behind a restricted, non-superuser runtime role with row-level security on every user-owned application table), a real CV pipeline (MediaPipe landmarks → real head pose → 8 skin/face metrics, each with real per-metric confidence and abstention), a real domain-driven planning/safety layer, a normalized product/ingredient catalog with formulation-level safety evaluation, atomic Redis rate limiting and an atomic usage-quota reservation ledger, a real pytest suite with CI, and a real production container image, health/readiness endpoints, fail-closed production config validation, and a provider-neutral object storage abstraction. No mobile app exists (the `mobile/` directory is empty scaffolding). No billing/RevenueCat integration, ranking, or async CV worker exist yet.
+A FastAPI backend (`backend/app/main.py`) with real authentication, a real Postgres database (behind a restricted, non-superuser runtime role with row-level security on every user-owned application table), a real CV pipeline (MediaPipe landmarks → real head pose → 8 skin/face metrics, each with real per-metric confidence and abstention), a real domain-driven planning/safety layer, a normalized product/ingredient catalog with formulation-level safety evaluation, atomic Redis rate limiting and an atomic usage-quota reservation ledger, a real pytest suite with CI, and a real production container image, health/readiness endpoints, fail-closed production config validation, and a provider-neutral object storage abstraction. A real RevenueCat webhook-driven billing synchronization foundation now exists (`BILLING_ARCHITECTURE.md`) — off by default (`REVENUECAT_BILLING_ENABLED=false`). No mobile app exists (the `mobile/` directory is empty scaffolding). No ranking or affiliate monetization exist yet.
 
 ## HTTP / API layer — `VERIFIED_IMPLEMENTED`
 
@@ -116,9 +116,6 @@ Full detail in `USAGE_AND_RATE_LIMIT_ARCHITECTURE.md`. Summary:
 
 ## What does not exist, at all (confirmed by direct inspection this pass, same as before except where noted)
 
-- No billing/subscription/webhook code of any kind (RevenueCat is
-  deliberately not integrated this pass — see "Usage/rate-limit foundation"
-  above for the abstraction seam that will absorb it).
 - No offer/product catalog with pricing, availability, or affiliate/
   commission data. **What changed**: a real product-matching step now
   connects `PlanService`'s abstract categories to concrete catalog
@@ -141,6 +138,10 @@ Full detail in `USAGE_AND_RATE_LIMIT_ARCHITECTURE.md`. Summary:
   abstention, no-compatible-product, quota/rate-limit denial) — a
   genuine step past "nothing but stdlib `logging`", but still not a
   time-series metrics/alerting system.
+
+## Billing (RevenueCat) — `VERIFIED_IMPLEMENTED` (this pass), off by default
+
+Full detail in `BILLING_ARCHITECTURE.md` and `ENTITLEMENT_STATE_MACHINE.md`. Summary: a webhook endpoint (`POST /api/v2/webhooks/revenuecat`, HMAC + Authorization-header verified against the raw request body) durably records every RevenueCat event (`revenuecat_webhook_events`, migration `a1c9f3e7b2d4`) and enqueues it on the existing `JobQueue` — no entitlement logic runs inline in the webhook request. A dedicated worker (`app/workers/revenuecat_webhook_worker.py`) processes events idempotently into a local, provider-neutral projection (`user_entitlements`), respecting RevenueCat's real cancellation-vs-expiration-vs-refund semantics, out-of-order delivery, and transfer/alias handling (`app/domain/revenuecat_entitlement_processor.py`). `RevenueCatEntitlementService` (`app/domain/entitlement.py`) reads only this local projection — never RevenueCat's API — behind the same `EntitlementService` interface `FreeTierEntitlementService` has always implemented, so a RevenueCat outage cannot make analysis unavailable. `RevenueCatReconciliationService` corrects drift against RevenueCat's real REST API, single-user or bounded-batch, not wired to any automatic trigger yet. `REVENUECAT_BILLING_ENABLED` defaults `false`; production startup refuses to enable it without all four required secrets configured. 35 new tests, all against real Postgres, no DB mocking.
 
 ## Test foundation and CI — `VERIFIED_IMPLEMENTED`
 

@@ -11,14 +11,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
 
 from app.api.v2.analyses import router as analyses_v2_router
+from app.api.v2.webhooks import router as webhooks_v2_router
 from app.config import settings
 from app.cv.pipeline import FacialAnalysisPipeline, NoFaceDetectedError, CaptureQualityFailedError
 from app.domain.entitlement import (
     AnalysisAlreadyCompletedError,
     AnalysisInProgressError,
-    FreeTierEntitlementService,
     QuotaExceededError,
     UsagePolicyService,
+    build_entitlement_service,
 )
 from app.domain.product_matching_service import ProductMatchingService
 from app.domain.safety_engine import SafetyEngine
@@ -84,6 +85,7 @@ app.add_middleware(
 )
 
 app.include_router(analyses_v2_router)
+app.include_router(webhooks_v2_router)
 
 
 # Constructed once at import time, not per-request -- the MediaPipe model
@@ -91,13 +93,6 @@ app.include_router(analyses_v2_router)
 pipeline = FacialAnalysisPipeline()
 scorer = FacialScorer()
 plan_service = PlanService()
-# Real, working free-tier policy -- not a test-only stub (see
-# app/domain/entitlement.py) -- used until a billing-aware
-# EntitlementService (RevenueCat-backed, a later pass) replaces it.
-# Needs no pool, so it's a safe module-level singleton like the three
-# above; UsagePolicyService itself is constructed per-request in
-# /analyze since it wraps the request-time db pool.
-entitlement_service = FreeTierEntitlementService()
 # Stateless -- safe as a shared singleton, same as pipeline/scorer/
 # plan_service above. ProductMatchingService itself is constructed
 # per-request (it wraps the request-time db pool), sharing this same
@@ -181,7 +176,7 @@ async def analyze(request: AnalyzeRequest, user_id: str = Depends(rate_limit_by_
     )
 
     pool = get_db_pool()
-    usage_policy_service = UsagePolicyService(pool, entitlement_service)
+    usage_policy_service = UsagePolicyService(pool, build_entitlement_service(pool))
     product_matching_service = ProductMatchingService(pool, safety_engine)
 
     try:
