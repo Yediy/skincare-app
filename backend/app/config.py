@@ -111,6 +111,47 @@ class Settings(BaseSettings):
     launch_home_region: str = "us-east"
     launch_cell_id: str = "use1-001"
 
+    # RevenueCat billing synchronization (see BILLING_ARCHITECTURE.md).
+    # Defaults False/unset -- an unconfigured deployment keeps using
+    # FreeTierEntitlementService unmodified (see
+    # app/domain/entitlement.py's build_entitlement_service), same
+    # "off by default, explicit opt-in" posture as
+    # async_image_storage_enabled above. Enabling this without the
+    # three secrets configured is refused outright in production (see
+    # _reject_unsafe_production_config below) -- there is no silent
+    # partial-billing mode.
+    revenuecat_billing_enabled: bool = False
+    revenuecat_webhook_auth: Optional[str] = None
+    revenuecat_webhook_signing_secret: Optional[str] = None
+    revenuecat_api_key: Optional[str] = None
+    revenuecat_project_id: Optional[str] = None
+    # Dedicated connection string for the billing-writer role
+    # (`skincare_billing`, migration <billing_privilege_boundary>) --
+    # never the ordinary `skincare_app` DSN. The ordinary runtime role
+    # can no longer INSERT/UPDATE revenuecat_webhook_events or
+    # user_entitlements at all (see BILLING_ARCHITECTURE.md's "Database
+    # privilege boundary" section), so webhook ingestion, the
+    # RevenueCat worker, and reconciliation all connect through this
+    # DSN instead of settings.database_url. Required whenever
+    # revenuecat_billing_enabled=true in production -- see
+    # _reject_unsafe_production_config below.
+    revenuecat_billing_database_url: Optional[str] = None
+    # This app currently models exactly one paid entitlement -- see
+    # RevenueCatEntitlementService's own docstring for why every event
+    # is projected under this single configured identifier rather than
+    # whatever entitlement_ids a given event happens to carry.
+    revenuecat_entitlement_id: str = "premium"
+    # RevenueCat's own docs suggest ~5 minutes as a reasonable replay
+    # tolerance for HMAC signature timestamps -- not a fabricated
+    # number, see REVENUECAT_INTEGRATION_NOTES.md section 1.
+    revenuecat_webhook_signature_tolerance_seconds: int = 300
+    # Business allowances, not hardcoded anywhere in domain code --
+    # see RevenueCatEntitlementService. free matches
+    # FreeTierEntitlementService's own existing default so enabling
+    # RevenueCat billing with no paying users yet changes nothing.
+    revenuecat_free_tier_allowance: int = 3
+    revenuecat_paid_tier_allowance: int = 100
+
     @property
     def is_production(self) -> bool:
         return self.environment.lower() == "production"
@@ -163,6 +204,34 @@ class Settings(BaseSettings):
                 # Deliberately not including `value` itself in the
                 # message -- it may be the secret key.
                 errors.append(f"{field_name} looks like a placeholder value")
+
+        if self.revenuecat_billing_enabled:
+            for field_name, value in (
+                ("REVENUECAT_WEBHOOK_AUTH", self.revenuecat_webhook_auth),
+                ("REVENUECAT_WEBHOOK_SIGNING_SECRET", self.revenuecat_webhook_signing_secret),
+                ("REVENUECAT_API_KEY", self.revenuecat_api_key),
+                ("REVENUECAT_PROJECT_ID", self.revenuecat_project_id),
+            ):
+                if not value or value.strip().lower() in _PLACEHOLDER_SECRET_VALUES:
+                    errors.append(
+                        f"REVENUECAT_BILLING_ENABLED=true but {field_name} is blank or a placeholder"
+                    )
+
+            if not self.revenuecat_billing_database_url:
+                errors.append(
+                    "REVENUECAT_BILLING_ENABLED=true but REVENUECAT_BILLING_DATABASE_URL is unset -- "
+                    "billing mutation must not fall back to the ordinary runtime DATABASE_URL"
+                )
+            elif self.revenuecat_billing_database_url.strip() == self.database_url.strip():
+                errors.append(
+                    "REVENUECAT_BILLING_DATABASE_URL is identical to DATABASE_URL -- it must "
+                    "connect as the dedicated skincare_billing role, not the ordinary runtime role"
+                )
+            else:
+                lowered_billing_url = self.revenuecat_billing_database_url.lower()
+                for marker in _DEV_ONLY_DATABASE_URL_MARKERS:
+                    if marker in lowered_billing_url:
+                        errors.append(f"REVENUECAT_BILLING_DATABASE_URL contains a dev/CI-only marker ({marker!r})")
 
         if errors:
             raise ValueError(

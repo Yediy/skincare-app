@@ -56,6 +56,79 @@ class FreeTierEntitlementService(EntitlementService):
         return self._monthly_allowance
 
 
+class RevenueCatEntitlementService(EntitlementService):
+    """Reads the LOCAL Postgres entitlement projection
+    (user_entitlements, populated by
+    app/domain/revenuecat_entitlement_processor.py) -- never calls the
+    RevenueCat API. This is what makes Section 14 of the billing brief
+    true: a RevenueCat outage affects reconciliation freshness (see
+    app/domain/revenuecat_reconciliation_service.py), never whether
+    POST /api/v2/analyses or the worker can decide a user's allowance,
+    since that decision is one local SELECT.
+
+    Filters by `environment` explicitly (Section 15): a SANDBOX
+    purchase can never satisfy a PRODUCTION allowance check, regardless
+    of what environment this process happens to be running in.
+
+    Allowance is a plain free/paid split (Section 12) -- not a
+    hardcoded number in this class, both values are configuration
+    (settings.revenuecat_free_tier_allowance/paid_tier_allowance),
+    constructor-injected so a test can exercise any pair of values
+    without touching global settings.
+    """
+
+    def __init__(
+        self,
+        pool: asyncpg.Pool,
+        *,
+        entitlement_identifier: str,
+        environment: str,
+        free_allowance: int,
+        paid_allowance: int,
+    ):
+        self._pool = pool
+        self._entitlement_identifier = entitlement_identifier
+        self._environment = environment
+        self._free_allowance = free_allowance
+        self._paid_allowance = paid_allowance
+
+    async def get_analysis_allowance(self, user_id: UUID) -> int:
+        from app.db import revenuecat_repository
+
+        row = await revenuecat_repository.get_entitlement(
+            self._pool, user_id, self._entitlement_identifier, "revenuecat", self._environment,
+        )
+        if row is not None and row["status"] in ("ACTIVE", "GRACE_PERIOD"):
+            return self._paid_allowance
+        return self._free_allowance
+
+
+def build_entitlement_service(pool: asyncpg.Pool) -> EntitlementService:
+    """Composition-root factory (used by app/main.py, app/api/v2/
+    analyses.py, app/workers/analysis_worker.py): every real caller
+    asks for "the current EntitlementService" through this one
+    function rather than constructing FreeTierEntitlementService or
+    RevenueCatEntitlementService directly, so flipping
+    settings.revenuecat_billing_enabled is the only change needed to
+    switch every quota decision in the app -- no call site touches
+    perform_analysis/AnalysisSubmissionService/AnalysisExecutionService
+    to do it (see BILLING_ARCHITECTURE.md's "what this pass does not
+    touch" section). Defaults to FreeTierEntitlementService, so an
+    unconfigured deployment's behavior is byte-for-byte unchanged from
+    before this pass."""
+    from app.config import settings
+
+    if not settings.revenuecat_billing_enabled:
+        return FreeTierEntitlementService(monthly_allowance=settings.revenuecat_free_tier_allowance)
+    return RevenueCatEntitlementService(
+        pool,
+        entitlement_identifier=settings.revenuecat_entitlement_id,
+        environment="PRODUCTION" if settings.is_production else "SANDBOX",
+        free_allowance=settings.revenuecat_free_tier_allowance,
+        paid_allowance=settings.revenuecat_paid_tier_allowance,
+    )
+
+
 def current_period_key(now: Optional[datetime] = None) -> str:
     """Calendar-month period, UTC: "2026-09". The only period
     granularity this pass implements -- documented, not hidden, since

@@ -16,6 +16,12 @@ _ALLOWED_PARAM_NAMES = {
     "request_id", "user_id", "job_id", "job_type", "claimed", "wait_seconds",
     "analysis_id", "outcome", "duration_seconds", "error_code",
     "analysis_request_id", "status", "metric_name", "category", "policy", "identity_kind",
+    # RevenueCat billing events (this pass) -- event_type/reason are
+    # always one of RevenueCat's own closed event-type vocabulary or
+    # this module's own closed WebhookVerificationError codes, never
+    # free text; mismatch_found/local_status/remote_active describe
+    # reconciliation outcomes, never raw provider payload content.
+    "event_type", "reason", "mismatch_found", "local_status", "remote_active",
 }
 
 

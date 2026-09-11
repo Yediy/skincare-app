@@ -194,7 +194,7 @@ async def run_forever(
 async def _main() -> None:
     from app.config import settings
     from app.db.connection import init_db_pool, get_db_pool, close_db_pool
-    from app.domain.entitlement import FreeTierEntitlementService, UsagePolicyService
+    from app.domain.entitlement import UsagePolicyService, build_entitlement_service
     from app.domain.product_matching_service import ProductMatchingService
     from app.domain.safety_engine import SafetyEngine
     from app.cv.pipeline import FacialAnalysisPipeline
@@ -220,7 +220,7 @@ async def _main() -> None:
             pipeline=FacialAnalysisPipeline(),
             scorer=FacialScorer(),
             plan_service=PlanService(),
-            usage_policy_service=UsagePolicyService(pool, FreeTierEntitlementService()),
+            usage_policy_service=UsagePolicyService(pool, build_entitlement_service(pool)),
             product_matching_service=ProductMatchingService(pool, safety_engine),
             safety_engine=safety_engine,
             image_store=EphemeralAnalysisImageStore(object_storage),

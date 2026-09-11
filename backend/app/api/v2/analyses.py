@@ -26,9 +26,9 @@ from app.domain.analysis_submission_service import (
 from app.domain.entitlement import (
     AnalysisAlreadyCompletedError,
     AnalysisInProgressError,
-    FreeTierEntitlementService,
     QuotaExceededError,
     UsagePolicyService,
+    build_entitlement_service,
 )
 from app.domain.user_placement_service import UserPlacementNotFoundError, UserPlacementService
 from app.middleware.rate_limiter import ANALYSIS_POLICY, GENERAL_POLICY, rate_limit_by_user
@@ -37,11 +37,6 @@ from app.storage.ephemeral_image_store import EphemeralAnalysisImageStore
 from app.storage.r2 import CloudflareR2ObjectStorage
 
 router = APIRouter(prefix="/api/v2/analyses", tags=["analyses"])
-
-# Real, working free-tier policy -- same singleton rationale as
-# app/main.py's own module-level entitlement_service (stateless, no
-# pool, safe to share across requests).
-_entitlement_service = FreeTierEntitlementService()
 
 
 def _build_submission_service() -> AnalysisSubmissionService:
@@ -63,7 +58,7 @@ def _build_submission_service() -> AnalysisSubmissionService:
     )
     return AnalysisSubmissionService(
         pool,
-        usage_policy_service=UsagePolicyService(pool, _entitlement_service),
+        usage_policy_service=UsagePolicyService(pool, build_entitlement_service(pool)),
         image_store=EphemeralAnalysisImageStore(object_storage),
         job_queue=PostgresJobQueue(pool),
         async_image_storage_enabled=settings.async_image_storage_enabled,
