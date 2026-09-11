@@ -64,16 +64,18 @@ def test_production_rejects_revenuecat_billing_enabled_without_secrets():
         Settings(_env_file=None, **_SAFE_PROD_KWARGS, revenuecat_billing_enabled=True)
 
 
+_REVENUECAT_SAFE_KWARGS = dict(
+    revenuecat_billing_enabled=True,
+    revenuecat_webhook_auth="a-real-configured-auth-value",
+    revenuecat_webhook_signing_secret="a-real-configured-signing-secret",
+    revenuecat_api_key="a-real-configured-api-key",
+    revenuecat_project_id="a-real-configured-project-id",
+    revenuecat_billing_database_url="postgresql://skincare_billing:REDACTED@db.internal.example.com:5432/skincare",
+)
+
+
 def test_production_accepts_revenuecat_billing_enabled_with_all_secrets_configured():
-    settings = Settings(
-        _env_file=None,
-        **_SAFE_PROD_KWARGS,
-        revenuecat_billing_enabled=True,
-        revenuecat_webhook_auth="a-real-configured-auth-value",
-        revenuecat_webhook_signing_secret="a-real-configured-signing-secret",
-        revenuecat_api_key="a-real-configured-api-key",
-        revenuecat_project_id="a-real-configured-project-id",
-    )
+    settings = Settings(_env_file=None, **_SAFE_PROD_KWARGS, **_REVENUECAT_SAFE_KWARGS)
     assert settings.revenuecat_billing_enabled is True
 
 
@@ -85,7 +87,35 @@ def test_production_rejects_revenuecat_billing_enabled_with_only_some_secrets_co
             revenuecat_billing_enabled=True,
             revenuecat_webhook_auth="a-real-configured-auth-value",
             revenuecat_webhook_signing_secret="a-real-configured-signing-secret",
+            revenuecat_billing_database_url=_REVENUECAT_SAFE_KWARGS["revenuecat_billing_database_url"],
             # api_key/project_id left unset
+        )
+
+
+def test_production_rejects_revenuecat_billing_enabled_without_billing_database_url():
+    """Billing mutation must not silently fall back to the ordinary
+    runtime DATABASE_URL -- see migration 9815eb266923."""
+    kwargs = {**_REVENUECAT_SAFE_KWARGS}
+    kwargs.pop("revenuecat_billing_database_url")
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, **_SAFE_PROD_KWARGS, **kwargs)
+
+
+def test_production_rejects_revenuecat_billing_database_url_identical_to_database_url():
+    with pytest.raises(ValueError):
+        Settings(
+            _env_file=None,
+            **{**_SAFE_PROD_KWARGS, **_REVENUECAT_SAFE_KWARGS,
+               "revenuecat_billing_database_url": _SAFE_PROD_KWARGS["database_url"]},
+        )
+
+
+def test_production_rejects_revenuecat_billing_database_url_with_dev_marker():
+    with pytest.raises(ValueError):
+        Settings(
+            _env_file=None,
+            **{**_SAFE_PROD_KWARGS, **_REVENUECAT_SAFE_KWARGS,
+               "revenuecat_billing_database_url": "postgresql://skincare_billing:skincare_billing_dev_only@localhost:5432/skincare"},
         )
 
 

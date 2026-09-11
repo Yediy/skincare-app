@@ -7,6 +7,7 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 _pool: Optional[asyncpg.Pool] = None
+_billing_pool: Optional[asyncpg.Pool] = None
 
 
 async def init_db_pool(dsn: Optional[str] = None) -> asyncpg.Pool:
@@ -51,3 +52,39 @@ def get_db_pool() -> asyncpg.Pool:
     if _pool is None:
         raise RuntimeError("Database pool not initialized -- call init_db_pool() at startup")
     return _pool
+
+
+async def init_billing_db_pool(dsn: Optional[str] = None) -> asyncpg.Pool:
+    """Separate pool connected as the dedicated `skincare_billing` role
+    (migration <billing_privilege_boundary>), never the ordinary
+    `skincare_app` role `_pool` above connects as. Only initialized
+    when RevenueCat billing is enabled -- see app/main.py's lifespan
+    and BILLING_ARCHITECTURE.md's "Database privilege boundary"
+    section for which call sites (webhook ingestion, the RevenueCat
+    worker, reconciliation) use this pool instead of get_db_pool()."""
+    global _billing_pool
+    if _billing_pool is None:
+        _billing_pool = await asyncpg.create_pool(
+            dsn=dsn or settings.revenuecat_billing_database_url,
+            min_size=settings.db_pool_min_size,
+            max_size=settings.db_pool_max_size,
+            timeout=settings.db_pool_connect_timeout_seconds,
+            command_timeout=settings.db_pool_command_timeout_seconds,
+            server_settings={"application_name": "skincare-app-billing"},
+        )
+        logger.info("Billing database pool initialized")
+    return _billing_pool
+
+
+async def close_billing_db_pool():
+    global _billing_pool
+    if _billing_pool is not None:
+        await _billing_pool.close()
+        _billing_pool = None
+        logger.info("Billing database pool closed")
+
+
+def get_billing_db_pool() -> asyncpg.Pool:
+    if _billing_pool is None:
+        raise RuntimeError("Billing database pool not initialized -- call init_billing_db_pool() at startup")
+    return _billing_pool

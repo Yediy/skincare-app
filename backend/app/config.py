@@ -125,6 +125,17 @@ class Settings(BaseSettings):
     revenuecat_webhook_signing_secret: Optional[str] = None
     revenuecat_api_key: Optional[str] = None
     revenuecat_project_id: Optional[str] = None
+    # Dedicated connection string for the billing-writer role
+    # (`skincare_billing`, migration <billing_privilege_boundary>) --
+    # never the ordinary `skincare_app` DSN. The ordinary runtime role
+    # can no longer INSERT/UPDATE revenuecat_webhook_events or
+    # user_entitlements at all (see BILLING_ARCHITECTURE.md's "Database
+    # privilege boundary" section), so webhook ingestion, the
+    # RevenueCat worker, and reconciliation all connect through this
+    # DSN instead of settings.database_url. Required whenever
+    # revenuecat_billing_enabled=true in production -- see
+    # _reject_unsafe_production_config below.
+    revenuecat_billing_database_url: Optional[str] = None
     # This app currently models exactly one paid entitlement -- see
     # RevenueCatEntitlementService's own docstring for why every event
     # is projected under this single configured identifier rather than
@@ -205,6 +216,22 @@ class Settings(BaseSettings):
                     errors.append(
                         f"REVENUECAT_BILLING_ENABLED=true but {field_name} is blank or a placeholder"
                     )
+
+            if not self.revenuecat_billing_database_url:
+                errors.append(
+                    "REVENUECAT_BILLING_ENABLED=true but REVENUECAT_BILLING_DATABASE_URL is unset -- "
+                    "billing mutation must not fall back to the ordinary runtime DATABASE_URL"
+                )
+            elif self.revenuecat_billing_database_url.strip() == self.database_url.strip():
+                errors.append(
+                    "REVENUECAT_BILLING_DATABASE_URL is identical to DATABASE_URL -- it must "
+                    "connect as the dedicated skincare_billing role, not the ordinary runtime role"
+                )
+            else:
+                lowered_billing_url = self.revenuecat_billing_database_url.lower()
+                for marker in _DEV_ONLY_DATABASE_URL_MARKERS:
+                    if marker in lowered_billing_url:
+                        errors.append(f"REVENUECAT_BILLING_DATABASE_URL contains a dev/CI-only marker ({marker!r})")
 
         if errors:
             raise ValueError(

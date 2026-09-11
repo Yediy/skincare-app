@@ -50,10 +50,21 @@ async def lifespan(app: FastAPI):
     fixture never triggers this either way (it wires db_connection._pool/
     redis_client._redis_client directly, same as it did before this
     change), so this is a pure mechanical migration, not a behavior
-    change for anything under test."""
+    change for anything under test.
+
+    The billing pool (`skincare_billing` role) is only initialized
+    when RevenueCat billing is actually enabled -- an unconfigured
+    deployment has no REVENUECAT_BILLING_DATABASE_URL to connect with,
+    and doesn't need one."""
     await init_db_pool()
     await init_redis()
+    if settings.revenuecat_billing_enabled:
+        from app.db.connection import init_billing_db_pool
+        await init_billing_db_pool()
     yield
+    if settings.revenuecat_billing_enabled:
+        from app.db.connection import close_billing_db_pool
+        await close_billing_db_pool()
     await close_db_pool()
     await close_redis()
 

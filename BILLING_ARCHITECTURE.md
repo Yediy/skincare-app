@@ -1,6 +1,6 @@
 # Billing Architecture (RevenueCat)
 
-**Commit this document describes:** the `feat/revenuecat-entitlement-sync` branch, base `master` at `76fcaa2b454ef390a4e50e38160ca5e011448e31`.
+**Commit this document describes:** the `feat/revenuecat-entitlement-sync` branch, base `master` at `76fcaa2b454ef390a4e50e38160ca5e011448e31`. Hardened by an independent review pass (migration `9815eb266923`, same branch) that corrected four merge blockers found in the original version: the `TRANSFER` field contract, the reconciliation REST endpoint, the database privilege boundary, and `entitlement_ids` enforcement — see the sections below, each marked where it changed.
 
 Classification used throughout: **DESIGNED** (documented, no code), **IMPLEMENTED** (real code exists and runs), **TESTED** (real automated test coverage exists), **DEFERRED** (explicitly out of scope for this pass, tracked in `OPEN_ENGINEERING_ITEMS.md`).
 
@@ -16,25 +16,26 @@ RevenueCat
     v
 POST /api/v2/webhooks/revenuecat        app/api/v2/webhooks.py
     |  verify_webhook_request()          app/security/revenuecat_webhook.py
-    |  record_event() + enqueue()        app/db/revenuecat_repository.py, one transaction
+    |  record_event() + enqueue()        app/db/revenuecat_repository.py, one transaction,
+    |                                     over the BILLING pool (skincare_billing role)
     v  HTTP 200 (no entitlement logic ran inline)
-revenuecat_webhook_events (durable)     migration a1c9f3e7b2d4
+revenuecat_webhook_events (durable)     migration a1c9f3e7b2d4 / 9815eb266923
     |
     v  claimed by
-revenuecat_webhook_worker                app/workers/revenuecat_webhook_worker.py
+revenuecat_webhook_worker                app/workers/revenuecat_webhook_worker.py, also the billing pool
     |  process_webhook_event()           app/domain/revenuecat_entitlement_processor.py
     v
-user_entitlements (local projection)    migration a1c9f3e7b2d4
+user_entitlements (local projection)    migration a1c9f3e7b2d4 / 9815eb266923
     ^
-    |  reads only, no RevenueCat API call
+    |  reads only, no RevenueCat API call, ordinary skincare_app pool
 RevenueCatEntitlementService              app/domain/entitlement.py
     |
     v
 UsagePolicyService (unchanged)           app/domain/entitlement.py
     ^
-    |  corrective, out-of-band
+    |  corrective, out-of-band, the billing pool
 RevenueCatReconciliationService          app/domain/revenuecat_reconciliation_service.py
-    |  GET /v2/projects/{id}/customers/{app_user_id}
+    |  GET /v2/projects/{id}/customers/{customer_id}/active_entitlements
     v
 RevenueCat REST API
 ```
@@ -56,21 +57,32 @@ Those five/six modules import nothing from this pass. The only change any of the
 
 ## Identity — IMPLEMENTED, TESTED
 
-The application's own `users.id` UUID is the canonical RevenueCat App User ID (Section 2 of the brief) — never email/username. `app/domain/revenuecat_entitlement_processor.py::_resolve_user` enforces this: `app_user_id` (and, for `TRANSFER`, `transferred_from`/`transferred_to`) must parse as a UUID *and* match a real `users.id`, or the event fails closed (`UNKNOWN_APP_USER_ID`, no entitlement row created for anyone). See `REVENUECAT_INTEGRATION_NOTES.md` section 4 for why this sidesteps most of RevenueCat's own alias-merge complexity.
+The application's own `users.id` UUID is the canonical RevenueCat App User ID (Section 2 of the brief) — never email/username. `app/domain/revenuecat_entitlement_processor.py::_resolve_user` enforces this: a lifecycle event's `app_user_id` must parse as a UUID *and* match a real `users.id`, or the event fails closed (`UNKNOWN_APP_USER_ID`, no entitlement row created for anyone). `TRANSFER`'s `transferred_from`/`transferred_to` entries go through the same `_resolve_user`, but an unresolvable entry there is *not* a hard failure the way an unresolvable lifecycle `app_user_id` is — see "TRANSFER handling" below and `REVENUECAT_INTEGRATION_NOTES.md` section 3. See `REVENUECAT_INTEGRATION_NOTES.md` section 4 for why this sidesteps most of RevenueCat's own alias-merge complexity.
 
 ## Database model — IMPLEMENTED, TESTED
 
-Migration `a1c9f3e7b2d4`:
+Migrations `a1c9f3e7b2d4` and `9815eb266923`:
 
-- **`revenuecat_webhook_events`** — durable receipt log, `revenuecat_event_id UNIQUE`. No RLS (a provider-level log, not literally user-owned — same rationale as the pre-existing `jobs` table); no route ever exposes it to a normal user. Never stores an Authorization header value, HMAC secret, or raw signature.
-- **`user_entitlements`** — the local projection. `UNIQUE(user_id, entitlement_identifier, provider, environment)`; RLS scoped by `app.current_user_id`, same pattern as `analysis_requests`/`user_profiles`; `source_event_id` has a real foreign key into `revenuecat_webhook_events(revenuecat_event_id)`. No `DELETE` grant. See `ENTITLEMENT_STATE_MACHINE.md` for the status enum and transition table.
+- **`revenuecat_webhook_events`** — durable receipt log, `revenuecat_event_id UNIQUE`. No RLS (a provider-level log, not literally user-owned — same rationale as the pre-existing `jobs` table); no route ever exposes it to a normal user. Never stores an Authorization header value, HMAC secret, or raw signature. `app_user_id`/`environment` are **nullable** (`9815eb266923`) — a real `TRANSFER` delivery carries neither/only sometimes the latter, and this table stores exactly what RevenueCat sent, never a fabricated value. `processing_status` (now `VARCHAR(30)`) has two additional terminal values beyond the original four — see `ENTITLEMENT_STATE_MACHINE.md`.
+- **`user_entitlements`** — the local projection. `UNIQUE(user_id, entitlement_identifier, provider, environment)`; RLS scoped by `app.current_user_id`, same pattern as `analysis_requests`/`user_profiles`; `source_event_id` has a real foreign key into `revenuecat_webhook_events(revenuecat_event_id)` (nullable, for reconciliation-driven corrections with no single event to attribute to). No `DELETE` grant, for either role that can write it. See `ENTITLEMENT_STATE_MACHINE.md` for the status enum and transition table.
 
-"Runtime role cannot forge arbitrary premium access through an unrestricted write path" concretely means, and is tested (`tests/database/test_revenuecat_rls.py`):
+## Database privilege boundary — IMPLEMENTED, TESTED (migration `9815eb266923`)
 
-1. No HTTP route accepts a client-supplied entitlement status.
-2. RLS blocks a write targeting another user's row regardless of the query's own `WHERE` clause (`InsufficientPrivilegeError`).
-3. A write claiming `source_event_id` must reference a row that already passed webhook verification and durable insertion — fabricating one requires first getting past HMAC + Authorization (`ForeignKeyViolationError` otherwise).
-4. No `DELETE` grant — a status transition supersedes a row, never erases the audit trail.
+**This corrects a real gap in the original pass.** The original migration granted the *ordinary* runtime role (`skincare_app` — what every HTTP request in this application connects as) direct `INSERT`/`UPDATE` on both `revenuecat_webhook_events` and `user_entitlements`, and described this as safe because RLS blocks cross-user writes. That claim was too narrow: RLS only stops a request from writing *someone else's* row — nothing stopped the ordinary role, under an ordinary request's own session context, from writing an `ACTIVE` row for **itself** (`source_event_id = NULL` satisfies the nullable FK; `WITH CHECK (user_id = current_setting('app.current_user_id'))` is satisfied because the row genuinely is the caller's own). `tests/database/test_revenuecat_billing_privilege.py::test_ordinary_role_cannot_insert_its_own_active_entitlement_even_with_null_source_event` is the test that would have caught this and previously did not exist.
+
+Fixed by introducing a dedicated, least-privilege `skincare_billing` role (`NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS`, same posture as `skincare_app`, still fully subject to `user_entitlements`' own RLS policy — not a bypass):
+
+| Role | `revenuecat_webhook_events` | `user_entitlements` | `jobs` | `users` |
+|---|---|---|---|---|
+| `skincare_app` (ordinary runtime) | no grant at all | `SELECT` only | `SELECT`/`INSERT`/`UPDATE` (pre-existing, for non-billing job types) | `SELECT`/`INSERT`/`UPDATE`/`DELETE` (pre-existing) |
+| `skincare_billing` (dedicated) | `SELECT`/`INSERT`/`UPDATE` | `SELECT`/`INSERT`/`UPDATE` | `SELECT`/`INSERT`/`UPDATE` (needed to enqueue/claim/acknowledge `revenuecat_webhook` jobs in the same transaction as its own table writes) | `SELECT` only (identity resolution via `_resolve_user`, never a write) |
+
+Webhook ingestion (`app/api/v2/webhooks.py`), the RevenueCat worker (`app/workers/revenuecat_webhook_worker.py`), and `RevenueCatReconciliationService` all connect through `app/db/connection.py::get_billing_db_pool()` (a second pool, `REVENUECAT_BILLING_DATABASE_URL`, initialized only when `REVENUECAT_BILLING_ENABLED=true`). `RevenueCatEntitlementService`'s read path — the only revenuecat-aware code on the ordinary request-serving path — keeps using the ordinary `skincare_app` pool via `get_db_pool()`, unchanged. Production config validation (`app/config.py`) refuses to start with billing enabled and no `REVENUECAT_BILLING_DATABASE_URL` configured, or one identical to `DATABASE_URL`, or one carrying a dev/CI marker.
+
+The correct, now-actually-tested claim is: **the ordinary application runtime role cannot manufacture billing truth, period** — not merely "cannot manufacture *another user's*" (RLS's own, narrower guarantee). Proven in two files:
+
+- `tests/database/test_revenuecat_billing_privilege.py`: `skincare_app` cannot `INSERT` a webhook event row, cannot `UPDATE` one, cannot `INSERT` its own `ACTIVE` entitlement (even with `source_event_id = NULL` and its own `user_id`), cannot `UPDATE` its own entitlement to `ACTIVE`, cannot `DELETE` one — and still *can* read its own entitlement (the one thing it needs). `skincare_billing` can persist a verified webhook, project an entitlement, and correct one via reconciliation, and is confirmed `NOSUPERUSER`/`NOBYPASSRLS` via a direct `pg_roles` query.
+- `tests/database/test_revenuecat_rls.py`: RLS itself, exercised through `skincare_billing` (the only role that can write the table at all) — cross-user writes still blocked, the `source_event_id` FK still blocks forging attribution to a never-received event, still no `DELETE` grant for anyone.
 
 ## Webhook security — IMPLEMENTED, TESTED
 
@@ -86,7 +98,11 @@ Two layers, deliberately: `revenuecat_webhook_events.revenuecat_event_id UNIQUE`
 
 ## Event semantics — IMPLEMENTED, TESTED
 
-See `ENTITLEMENT_STATE_MACHINE.md` for the full table. Highlights: `CANCELLATION` never revokes access by itself (only `EXPIRATION` does) unless `cancel_reason=CUSTOMER_SUPPORT` (a refund, revoked immediately); `BILLING_ISSUE` enters `GRACE_PERIOD`, not revoked; `TRANSFER` revokes every resolvable source and activates the destination in the same processing pass, so a processed transfer can never leave both sides holding paid access.
+See `ENTITLEMENT_STATE_MACHINE.md` for the full table and `REVENUECAT_INTEGRATION_NOTES.md` section 6 for which event types are deliberately unsupported and why. Highlights: `CANCELLATION` never revokes access by itself (only `EXPIRATION` does) unless `cancel_reason=CUSTOMER_SUPPORT` (a refund, revoked immediately, **without** fabricating `will_renew=false` — refund and auto-renew-off are independent facts, see `REVENUECAT_INTEGRATION_NOTES.md` section 3); `BILLING_ISSUE` enters `GRACE_PERIOD`, not revoked.
+
+**`entitlement_ids` enforcement (migration `9815eb266923`, `app/domain/revenuecat_entitlement_processor.py`).** The original pass applied every supported lifecycle event unconditionally to `settings.revenuecat_entitlement_id`, regardless of which entitlement(s) the event's own `entitlement_ids` actually named — meaning an unrelated RevenueCat product could grant or revoke this app's premium. Fixed: every lifecycle mutation now first checks `settings.revenuecat_entitlement_id in (event.entitlement_ids or [])`; a mismatch (or `null`) is a durably-received, successfully-processed `NOT_RELEVANT` outcome — never an error, never retried, never a projection write. `tests/domain/test_revenuecat_entitlement_processor.py` proves this for `INITIAL_PURCHASE`/`RENEWAL`/`CANCELLATION`/`EXPIRATION` against an unrelated or `null` `entitlement_ids`.
+
+**`TRANSFER` handling (migration `9815eb266923`).** The original pass modeled `TRANSFER` as if it carried `app_user_id` (the destination) — it does not; RevenueCat's real payload carries only `transferred_from`/`transferred_to` (both always present) and `environment` (sometimes present). Fixed: the webhook route's required-field validation is event-type-aware (`TRANSFER` requires non-empty `transferred_from`/`transferred_to`, never `app_user_id`); the processor resolves every `transferred_to` entry and requires exactly one distinct resolvable local destination (zero or more than one both fail closed to `RECONCILIATION_REQUIRED`, never guessing or granting multiple unrelated users access); a missing `environment` also fails closed to `RECONCILIATION_REQUIRED` rather than a fabricated SANDBOX/PRODUCTION guess. Every resolvable source is revoked before the destination is activated (fail-safe ordering), so a processed transfer can never leave both sides holding paid access, and a partial failure favors temporary denial over duplicate paid entitlement. See `REVENUECAT_INTEGRATION_NOTES.md` section 3 and `ENTITLEMENT_STATE_MACHINE.md`.
 
 ## Sandbox/production isolation — IMPLEMENTED, TESTED
 
@@ -98,15 +114,15 @@ See `ENTITLEMENT_STATE_MACHINE.md` for the full table. Highlights: `CANCELLATION
 
 ## Reconciliation — IMPLEMENTED, TESTED (single-user and batch); scheduling is DEFERRED
 
-`app/domain/revenuecat_reconciliation_service.py::RevenueCatReconciliationService`. `reconcile_user` compares local projection against one live `GET /v2/projects/{project_id}/customers/{app_user_id}` call and corrects on mismatch; `reconcile_batch` runs a bounded list of users with a real inter-call delay (`DEFAULT_BATCH_DELAY_SECONDS`) and never lets one user's API failure abort the rest of the batch. Neither is wired to any HTTP route or cron in this pass — Section 13's "do not reconcile every user on every request" is satisfied by there being no automatic trigger at all yet, not by a rate limit on one.
+`app/domain/revenuecat_reconciliation_service.py::RevenueCatReconciliationService`. **Corrected (migration `9815eb266923`):** the original client called a nonexistent `?expand=active_entitlements` query parameter on the plain customer-lookup endpoint; it now calls the real, documented, paginated `GET /v2/projects/{project_id}/customers/{customer_id}/active_entitlements` resource, follows `next_page` up to a bounded page count, and maps `401`/`403`/`404`/`429`/`5xx`/network failures to distinct error codes rather than one generic exception. `reconcile_user` compares local projection against that call and corrects on mismatch — without fabricating `will_renew=true` (the endpoint doesn't return renewal state; a correction to `ACTIVE` preserves whatever `will_renew` was already locally known). `reconcile_batch` runs a bounded list of users with a real inter-call delay (`DEFAULT_BATCH_DELAY_SECONDS`) and never lets one user's API failure abort the rest of the batch. Neither is wired to any HTTP route or cron in this pass — Section 13's "do not reconcile every user on every request" is satisfied by there being no automatic trigger at all yet, not by a rate limit on one. See `REVENUECAT_INTEGRATION_NOTES.md` section 5 for the full corrected contract.
 
 ## Observability — IMPLEMENTED
 
-`app/observability/events.py`: `revenuecat_webhook_received`, `revenuecat_webhook_rejected` (reason code only, never secret material), `revenuecat_event_duplicate`, `revenuecat_event_stale`, `revenuecat_event_processed`, `revenuecat_event_failed`, `entitlement_activated`, `entitlement_expired`, `entitlement_revoked`, `reconciliation_success`, `reconciliation_mismatch`, `reconciliation_failure`. Structural test (`tests/domain/test_observability_events.py`) enforces every event function's parameter list stays inside a closed, non-PII vocabulary.
+`app/observability/events.py`: `revenuecat_webhook_received`, `revenuecat_webhook_rejected` (reason code only, never secret material), `revenuecat_event_duplicate`, `revenuecat_event_stale`, `revenuecat_event_processed`, `revenuecat_event_failed`, `revenuecat_event_requires_reconciliation`, `revenuecat_event_not_relevant`, `entitlement_activated`, `entitlement_expired`, `entitlement_revoked`, `reconciliation_success`, `reconciliation_mismatch`, `reconciliation_failure`. Structural test (`tests/domain/test_observability_events.py`) enforces every event function's parameter list stays inside a closed, non-PII vocabulary.
 
 ## Test coverage — TESTED
 
-`tests/security/test_revenuecat_webhook_verification.py`, `tests/api/test_revenuecat_webhook_route.py`, `tests/domain/test_revenuecat_entitlement_processor.py`, `tests/domain/test_revenuecat_entitlement_service.py`, `tests/domain/test_revenuecat_reconciliation_service.py`, `tests/database/test_revenuecat_rls.py`, plus additions to `tests/unit/test_config_validation.py` and `tests/domain/test_observability_events.py`. All run against real Postgres (no mocked DB), same convention as the rest of this repository.
+`tests/security/test_revenuecat_webhook_verification.py`, `tests/api/test_revenuecat_webhook_route.py`, `tests/domain/test_revenuecat_entitlement_processor.py`, `tests/domain/test_revenuecat_entitlement_service.py`, `tests/domain/test_revenuecat_reconciliation_service.py`, `tests/domain/test_revenuecat_reconciliation_http_contract.py` (the real `RevenueCatAPIClient` against `httpx.MockTransport`), `tests/database/test_revenuecat_rls.py`, `tests/database/test_revenuecat_billing_privilege.py`, plus additions to `tests/unit/test_config_validation.py`. All run against real Postgres (no mocked DB, except the RevenueCat HTTP transport itself, which has no reachable real endpoint to test against), same convention as the rest of this repository.
 
 ## DEFERRED (tracked in `OPEN_ENGINEERING_ITEMS.md`)
 

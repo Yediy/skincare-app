@@ -67,17 +67,23 @@ async def run_forever(job_queue: JobQueue, pool, *, poll_interval_seconds: float
 
 
 async def _main() -> None:
-    from app.db.connection import init_db_pool, get_db_pool, close_db_pool
+    """Connects through the dedicated billing pool (`skincare_billing`
+    role, migration 9815eb266923), not the ordinary runtime pool --
+    claiming/acknowledging `revenuecat_webhook` jobs and projecting
+    entitlements both require write privilege the ordinary
+    `skincare_app` role no longer has. See BILLING_ARCHITECTURE.md's
+    "Database privilege boundary" section."""
+    from app.db.connection import init_billing_db_pool, get_billing_db_pool, close_billing_db_pool
     from app.queue.postgres_queue import PostgresJobQueue
 
-    await init_db_pool()
+    await init_billing_db_pool()
     try:
-        pool = get_db_pool()
+        pool = get_billing_db_pool()
         job_queue = PostgresJobQueue(pool)
         logger.info("revenuecat_webhook_worker: starting main loop")
         await run_forever(job_queue, pool)
     finally:
-        await close_db_pool()
+        await close_billing_db_pool()
 
 
 if __name__ == "__main__":

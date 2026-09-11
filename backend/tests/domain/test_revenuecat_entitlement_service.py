@@ -32,9 +32,13 @@ def _service(pool, environment="PRODUCTION"):
     )
 
 
-async def _seed_entitlement(app_db_pool, user_id, *, status, environment="PRODUCTION"):
+async def _seed_entitlement(billing_db_pool, user_id, *, status, environment="PRODUCTION"):
+    """Seeds through billing_db_pool (skincare_billing) -- the ordinary
+    skincare_app role (what `_service()` below reads through, proving
+    the actual production read path) has no write grant on
+    user_entitlements at all as of migration 9815eb266923."""
     await revenuecat_repository.apply_entitlement_projection(
-        app_db_pool, user_id=user_id, entitlement_identifier=ENTITLEMENT_ID, provider="revenuecat",
+        billing_db_pool, user_id=user_id, entitlement_identifier=ENTITLEMENT_ID, provider="revenuecat",
         status=status, effective_at=T0, expires_at=T0 + timedelta(days=30), will_renew=True,
         environment=environment, source_event_id=None, provider_customer_id=str(user_id),
         last_provider_event_at=T0,
@@ -47,31 +51,31 @@ async def test_user_with_no_entitlement_row_gets_free_allowance(db_pool, app_db_
     assert allowance == FREE_ALLOWANCE
 
 
-async def test_active_entitlement_gets_paid_allowance(db_pool, app_db_pool):
+async def test_active_entitlement_gets_paid_allowance(db_pool, app_db_pool, billing_db_pool):
     user_id = await _create_user(db_pool, "rces-active@test.com")
-    await _seed_entitlement(app_db_pool, user_id, status="ACTIVE")
+    await _seed_entitlement(billing_db_pool, user_id, status="ACTIVE")
     allowance = await _service(app_db_pool).get_analysis_allowance(user_id)
     assert allowance == PAID_ALLOWANCE
 
 
-async def test_grace_period_entitlement_gets_paid_allowance(db_pool, app_db_pool):
+async def test_grace_period_entitlement_gets_paid_allowance(db_pool, app_db_pool, billing_db_pool):
     user_id = await _create_user(db_pool, "rces-grace@test.com")
-    await _seed_entitlement(app_db_pool, user_id, status="GRACE_PERIOD")
+    await _seed_entitlement(billing_db_pool, user_id, status="GRACE_PERIOD")
     allowance = await _service(app_db_pool).get_analysis_allowance(user_id)
     assert allowance == PAID_ALLOWANCE
 
 
 @pytest.mark.parametrize("status", ["EXPIRED", "REVOKED"])
-async def test_expired_or_revoked_entitlement_gets_free_allowance(db_pool, app_db_pool, status):
+async def test_expired_or_revoked_entitlement_gets_free_allowance(db_pool, app_db_pool, billing_db_pool, status):
     user_id = await _create_user(db_pool, f"rces-{status.lower()}@test.com")
-    await _seed_entitlement(app_db_pool, user_id, status=status)
+    await _seed_entitlement(billing_db_pool, user_id, status=status)
     allowance = await _service(app_db_pool).get_analysis_allowance(user_id)
     assert allowance == FREE_ALLOWANCE
 
 
-async def test_sandbox_entitlement_never_grants_production_allowance(db_pool, app_db_pool):
+async def test_sandbox_entitlement_never_grants_production_allowance(db_pool, app_db_pool, billing_db_pool):
     user_id = await _create_user(db_pool, "rces-sandbox@test.com")
-    await _seed_entitlement(app_db_pool, user_id, status="ACTIVE", environment="SANDBOX")
+    await _seed_entitlement(billing_db_pool, user_id, status="ACTIVE", environment="SANDBOX")
 
     production_service = _service(app_db_pool, environment="PRODUCTION")
     assert await production_service.get_analysis_allowance(user_id) == FREE_ALLOWANCE
@@ -80,7 +84,7 @@ async def test_sandbox_entitlement_never_grants_production_allowance(db_pool, ap
     assert await sandbox_service.get_analysis_allowance(user_id) == PAID_ALLOWANCE
 
 
-async def test_entitlement_service_never_makes_a_network_call(db_pool, app_db_pool, monkeypatch):
+async def test_entitlement_service_never_makes_a_network_call(db_pool, app_db_pool, billing_db_pool, monkeypatch):
     """Proves Section 14 directly: even if RevenueCat's API is
     completely unreachable, the access decision (a local SELECT) must
     still succeed -- simulated here by making any httpx client
@@ -92,7 +96,7 @@ async def test_entitlement_service_never_makes_a_network_call(db_pool, app_db_po
     monkeypatch.setattr(httpx, "AsyncClient", _explode)
 
     user_id = await _create_user(db_pool, "rces-outage@test.com")
-    await _seed_entitlement(app_db_pool, user_id, status="ACTIVE")
+    await _seed_entitlement(billing_db_pool, user_id, status="ACTIVE")
 
     allowance = await _service(app_db_pool).get_analysis_allowance(user_id)
     assert allowance == PAID_ALLOWANCE

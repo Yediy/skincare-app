@@ -15,14 +15,16 @@ job (cron/worker) -- neither is invoked automatically by this pass;
 that scheduling wiring is deliberately left for whoever operates this
 in production, tracked as DEFERRED in OPEN_ENGINEERING_ITEMS.md.
 
-Response parsing is defensive by design: REVENUECAT_INTEGRATION_NOTES.md
-section 5 documents that the exact v2 "get a customer" response shape
-could not be reproduced verbatim from the official docs in this pass's
-research. An unexpected/missing field is treated as "no active
-entitlement found" (safe default -- never silently assume paid access
-from an unparseable response) rather than raised as a parsing
-exception, and is exactly the kind of thing `reconciliation_mismatch`
-exists to surface for a human to look at.
+Uses RevenueCat's documented v2 "list a customer's active entitlements"
+resource (`GET /projects/{project_id}/customers/{customer_id}/
+active_entitlements`) -- not `GET /customers/{customer_id}?expand=
+active_entitlements`, which does not exist; that endpoint's only
+documented `expand` value is `attributes`. See
+REVENUECAT_INTEGRATION_NOTES.md section 5 for the verified contract.
+The response is a paginated `object: "list"` resource
+(`items`/`next_page`/`url`) -- this client follows `next_page` up to a
+bounded page count so the configured entitlement can never be falsely
+declared absent merely because it appears on a later page.
 """
 import asyncio
 import logging
@@ -41,76 +43,123 @@ from app.observability import events as observability_events
 logger = logging.getLogger(__name__)
 
 REVENUECAT_API_BASE_URL = "https://api.revenuecat.com/v2"
-_ACTIVE_STATUS_VALUES = {"active", "trialing", "in_grace_period"}
+# Real, deliberate bound: a customer with a legitimately large history
+# of entitlement grants still resolves within this many pages: if the
+# configured entitlement hasn't shown up by then, treat it as absent
+# rather than looping on a misbehaving/malicious next_page chain
+# forever.
+MAX_ACTIVE_ENTITLEMENT_PAGES = 20
 # Minimum spacing between successive RevenueCat API calls in a batch --
 # real backoff, not a fabricated SLA number: generous enough that a
 # reconciliation sweep of even a few hundred users cannot itself look
 # like abusive traffic to RevenueCat's own API rate limiting.
 DEFAULT_BATCH_DELAY_SECONDS = 0.25
 
+_STATUS_ERROR_CODES = {
+    401: "UNAUTHORIZED",
+    403: "FORBIDDEN",
+    404: "CUSTOMER_NOT_FOUND",
+    429: "RATE_LIMITED",
+}
+
 
 class ReconciliationAPIError(Exception):
     """Raised when the RevenueCat API call itself fails (network error,
     non-2xx status). Distinct from a mismatch (which is a successful
     call whose result disagrees with local state) -- see
-    reconciliation_failure vs. reconciliation_mismatch."""
+    reconciliation_failure vs. reconciliation_mismatch. `error_code` is
+    a closed, deliberately-mapped classification
+    (UNAUTHORIZED/FORBIDDEN/CUSTOMER_NOT_FOUND/RATE_LIMITED/
+    SERVER_ERROR/NETWORK_ERROR), never a raw exception message, so a
+    caller can distinguish "RevenueCat is down" from "our own API key
+    is wrong" without parsing text."""
+
+    def __init__(self, message: str, *, error_code: str, status_code: Optional[int] = None):
+        self.error_code = error_code
+        self.status_code = status_code
+        super().__init__(message)
+
+
+def _error_code_for_status(status_code: int) -> str:
+    if status_code in _STATUS_ERROR_CODES:
+        return _STATUS_ERROR_CODES[status_code]
+    if status_code >= 500:
+        return "SERVER_ERROR"
+    return "HTTP_ERROR"
 
 
 class RevenueCatAPIClient:
-    """Thin wrapper around the one RevenueCat REST endpoint this pass
-    needs -- GET a customer's active entitlements. See
-    REVENUECAT_INTEGRATION_NOTES.md section 5."""
+    """Thin wrapper around RevenueCat's documented v2 active-entitlements
+    resource. See REVENUECAT_INTEGRATION_NOTES.md section 5.
 
-    def __init__(self, api_key: str, project_id: str, *, base_url: str = REVENUECAT_API_BASE_URL, timeout_seconds: float = 10.0):
+    `transport` (an httpx.BaseTransport, e.g. httpx.MockTransport) is
+    accepted purely for testing -- production code never passes it, so
+    a real httpx.AsyncClient with real networking is what actually
+    runs."""
+
+    def __init__(
+        self, api_key: str, project_id: str, *, base_url: str = REVENUECAT_API_BASE_URL,
+        timeout_seconds: float = 10.0, transport: Optional[httpx.BaseTransport] = None,
+    ):
         self._api_key = api_key
         self._project_id = project_id
         self._base_url = base_url
         self._timeout_seconds = timeout_seconds
+        self._transport = transport
 
-    async def get_customer(self, app_user_id: str) -> Dict[str, Any]:
-        url = f"{self._base_url}/projects/{self._project_id}/customers/{quote(app_user_id, safe='')}"
+    async def get_active_entitlements(self, app_user_id: str) -> List[Dict[str, Any]]:
+        """Returns the customer's active-entitlement items (each a dict
+        with at least `entitlement_id`, optionally `expires_at`),
+        following documented pagination (`next_page`) up to
+        MAX_ACTIVE_ENTITLEMENT_PAGES."""
+        url = f"{self._base_url}/projects/{self._project_id}/customers/{quote(app_user_id, safe='')}/active_entitlements"
         headers = {"Authorization": f"Bearer {self._api_key}"}
-        try:
-            async with httpx.AsyncClient(timeout=self._timeout_seconds) as client:
-                response = await client.get(url, params={"expand": "active_entitlements"}, headers=headers)
-            response.raise_for_status()
-            return response.json()
-        except httpx.HTTPError as e:
-            raise ReconciliationAPIError(f"{e.__class__.__name__}: {e}") from e
+
+        items: List[Dict[str, Any]] = []
+        pages_fetched = 0
+        async with httpx.AsyncClient(timeout=self._timeout_seconds, transport=self._transport) as client:
+            while url is not None:
+                if pages_fetched >= MAX_ACTIVE_ENTITLEMENT_PAGES:
+                    logger.warning(
+                        "get_active_entitlements: hit MAX_ACTIVE_ENTITLEMENT_PAGES=%d for app_user_id=%s, "
+                        "stopping pagination",
+                        MAX_ACTIVE_ENTITLEMENT_PAGES, app_user_id,
+                    )
+                    break
+                try:
+                    response = await client.get(url, headers=headers)
+                except httpx.HTTPError as e:
+                    raise ReconciliationAPIError(
+                        f"{e.__class__.__name__}: {e}", error_code="NETWORK_ERROR",
+                    ) from e
+
+                if response.status_code >= 400:
+                    raise ReconciliationAPIError(
+                        f"RevenueCat active_entitlements returned HTTP {response.status_code}",
+                        error_code=_error_code_for_status(response.status_code),
+                        status_code=response.status_code,
+                    )
+
+                payload = response.json()
+                items.extend(payload.get("items") or [])
+                url = payload.get("next_page") or None
+                pages_fetched += 1
+
+        return items
 
 
-def _extract_active_entitlement(customer: Dict[str, Any], entitlement_identifier: str) -> Optional[Dict[str, Any]]:
-    entitlements = customer.get("active_entitlements") or customer.get("entitlements") or {}
-    items = entitlements.get("items") if isinstance(entitlements, dict) else entitlements
-    if not items:
-        return None
+def _find_entitlement(items: List[Dict[str, Any]], entitlement_identifier: str) -> Optional[Dict[str, Any]]:
     for item in items:
-        if not isinstance(item, dict):
-            continue
-        if item.get("entitlement_id") == entitlement_identifier or item.get("id") == entitlement_identifier:
+        if isinstance(item, dict) and item.get("entitlement_id") == entitlement_identifier:
             return item
     return None
 
 
-def _remote_gives_access(entitlement: Optional[Dict[str, Any]]) -> bool:
-    if entitlement is None:
-        return False
-    if "gives_access" in entitlement:
-        return bool(entitlement["gives_access"])
-    return str(entitlement.get("status", "")).lower() in _ACTIVE_STATUS_VALUES
-
-
-def _remote_expires_at(entitlement: Dict[str, Any]) -> Optional[datetime]:
-    if "expiration_at_ms" in entitlement and entitlement["expiration_at_ms"]:
-        return datetime.fromtimestamp(entitlement["expiration_at_ms"] / 1000, tz=timezone.utc)
-    for key in ("expires_date", "expires_at"):
-        value = entitlement.get(key)
-        if value:
-            try:
-                return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-            except ValueError:
-                return None
-    return None
+def _remote_expires_at(item: Dict[str, Any]) -> Optional[datetime]:
+    expires_at_ms = item.get("expires_at")
+    if not expires_at_ms:
+        return None
+    return datetime.fromtimestamp(expires_at_ms / 1000, tz=timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -144,13 +193,13 @@ class RevenueCatReconciliationService:
         local_active = local_status in ("ACTIVE", "GRACE_PERIOD")
 
         try:
-            customer = await self._api_client.get_customer(str(user_id))
+            items = await self._api_client.get_active_entitlements(str(user_id))
         except ReconciliationAPIError as e:
-            observability_events.reconciliation_failure(user_id=str(user_id), error_code=e.__class__.__name__)
+            observability_events.reconciliation_failure(user_id=str(user_id), error_code=e.error_code)
             raise
 
-        remote_entitlement = _extract_active_entitlement(customer, self._entitlement_identifier)
-        remote_active = _remote_gives_access(remote_entitlement)
+        remote_entitlement = _find_entitlement(items, self._entitlement_identifier)
+        remote_active = remote_entitlement is not None
 
         if local_active == remote_active:
             observability_events.reconciliation_success(user_id=str(user_id), mismatch_found=False)
@@ -165,11 +214,23 @@ class RevenueCatReconciliationService:
 
         now = datetime.now(timezone.utc)
         if remote_active:
+            # The active-entitlements resource does not document a
+            # renewal-state field (no fabricated will_renew=True from a
+            # response that never said so) -- preserve whatever
+            # renewal preference was already locally known; a freshly-
+            # discovered entitlement with no prior local row has no
+            # renewal metadata to preserve, so it stays unknown/True by
+            # the same "unknown, no access consequence either way"
+            # reasoning as the refund-cancellation case in
+            # app/domain/revenuecat_entitlement_processor.py. A future
+            # pass wanting authoritative renewal state should query a
+            # documented subscription resource, not synthesize one here.
+            preserved_will_renew = local["will_renew"] if local is not None else True
             await revenuecat_repository.apply_entitlement_projection(
                 self._pool, user_id=user_id, entitlement_identifier=self._entitlement_identifier,
                 provider="revenuecat", status=revenuecat_repository.ACTIVE, effective_at=now,
                 expires_at=_remote_expires_at(remote_entitlement or {}),
-                will_renew=bool((remote_entitlement or {}).get("auto_renewal_status", True)),
+                will_renew=preserved_will_renew,
                 environment=self._environment, source_event_id=None, provider_customer_id=str(user_id),
                 last_provider_event_at=now,
             )

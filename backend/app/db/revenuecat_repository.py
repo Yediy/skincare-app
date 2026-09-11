@@ -34,6 +34,19 @@ PENDING = "PENDING"
 PROCESSED = "PROCESSED"
 STALE_IGNORED = "STALE_IGNORED"
 FAILED = "FAILED"
+# Durably received and verified, but this pass cannot safely apply it
+# without more information -- a TRANSFER with no resolvable
+# environment, zero resolvable local destination users, or more than
+# one distinct resolvable local destination user. Never retried
+# automatically (it isn't an exception), never silently dropped
+# either -- see app/domain/revenuecat_entitlement_processor.py and
+# migration 9815eb266923.
+RECONCILIATION_REQUIRED = "RECONCILIATION_REQUIRED"
+# Durably received, the app_user_id resolved fine, but the event's own
+# `entitlement_ids` do not include settings.revenuecat_entitlement_id
+# -- an unrelated RevenueCat product/entitlement. A normal, successful
+# outcome, not an error.
+NOT_RELEVANT = "NOT_RELEVANT"
 
 ACTIVE = "ACTIVE"
 GRACE_PERIOD = "GRACE_PERIOD"
@@ -53,8 +66,8 @@ async def record_event(
     *,
     revenuecat_event_id: str,
     event_type: str,
-    app_user_id: str,
-    environment: str,
+    app_user_id: Optional[str],
+    environment: Optional[str],
     event_timestamp: datetime,
     payload_json: Dict[str, Any],
     conn: Optional[asyncpg.Connection] = None,

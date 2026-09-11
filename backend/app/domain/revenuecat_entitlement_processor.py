@@ -13,12 +13,30 @@ this pass that talks to RevenueCat's REST API.
 Event-type handling matches REVENUECAT_INTEGRATION_NOTES.md section 3
 exactly -- in particular: CANCELLATION does not revoke access (only
 EXPIRATION does), except when cancel_reason=CUSTOMER_SUPPORT (a
-refund), which does revoke immediately.
+refund), which does revoke immediately but does NOT fabricate
+will_renew=False (refund and auto-renew-off are independent facts --
+see _process_lifecycle_event below).
+
+Two additional contracts this module enforces, both corrections found
+by independent review of the original pass:
+
+1. entitlement_ids gating (Section 4 of the billing brief / migration
+   9815eb266923's docstring): a lifecycle event only mutates the
+   locally-projected premium entitlement when
+   settings.revenuecat_entitlement_id appears in the event's own
+   entitlement_ids. An unrelated RevenueCat product/entitlement is a
+   durably-received, successfully-processed NOT_RELEVANT outcome --
+   never an error, never retried, never allowed to grant/revoke this
+   app's premium access.
+2. TRANSFER carries no app_user_id at all (transferred_from/
+   transferred_to only, environment sometimes) -- see
+   _process_transfer below and REVENUECAT_INTEGRATION_NOTES.md
+   section 2.
 """
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 from uuid import UUID
 
 import asyncpg
@@ -28,8 +46,16 @@ from app.db import revenuecat_repository
 from app.observability import events as observability_events
 
 PROVIDER = "revenuecat"
+TRANSFER_EVENT_TYPE = "TRANSFER"
 
 _ENTITLEMENT_ACTIVE_EVENT_TYPES = {"INITIAL_PURCHASE", "RENEWAL", "PRODUCT_CHANGE", "UNCANCELLATION"}
+# Every lifecycle event type whose semantics are actually about this
+# app's one configured entitlement, and therefore must be checked
+# against the event's own entitlement_ids before it may mutate
+# anything. Everything else (VIRTUAL_CURRENCY_TRANSACTION,
+# EXPERIMENT_ENROLLMENT, etc.) already falls through to the
+# unconditional durable-receipt-only branch below and needs no gating.
+_ENTITLEMENT_GATED_EVENT_TYPES = _ENTITLEMENT_ACTIVE_EVENT_TYPES | {"CANCELLATION", "EXPIRATION", "BILLING_ISSUE"}
 _REFUND_CANCEL_REASON = "CUSTOMER_SUPPORT"
 
 
@@ -40,17 +66,34 @@ class WebhookEventNotFoundError(Exception):
 
 
 class UnresolvableAppUserIdError(Exception):
-    """Raised when an event's app_user_id (or a TRANSFER's source/
-    destination id) does not parse as a UUID, or parses but does not
-    match any real users.id. Per Section 11 of the brief ("do not trust
-    arbitrary alias strings to map to application users without
-    validation"), this is a hard failure, not a best-effort guess --
-    the event is marked FAILED, not silently dropped or applied against
-    a fabricated identity."""
+    """Raised for a lifecycle event whose app_user_id does not parse as
+    a UUID, or parses but does not match any real users.id. Per Section
+    11 of the brief ("do not trust arbitrary alias strings to map to
+    application users without validation"), this is a hard failure,
+    not a best-effort guess -- the event is marked FAILED, not silently
+    dropped or applied against a fabricated identity.
+
+    TRANSFER does NOT use this exception (see _process_transfer):
+    an unresolvable transfer participant is a normal, expected
+    occurrence (an alias that was never one of this app's own users)
+    handled by resolving what can be resolved and failing closed via
+    RECONCILIATION_REQUIRED when the destination itself can't be
+    pinned down -- not a hard error."""
 
     def __init__(self, app_user_id: str):
         self.app_user_id = app_user_id
         super().__init__(f"app_user_id does not resolve to a real user: {app_user_id!r}")
+
+
+@dataclass(frozen=True)
+class _Outcome:
+    """What process_webhook_event should record as this event's final
+    processing_status, plus an optional machine-readable reason code
+    (revenuecat_webhook_events.last_error_code -- a misnomer today for
+    a non-error reason code, kept for schema compatibility)."""
+
+    status: str
+    error_code: Optional[str] = None
 
 
 def _ms_to_datetime(value: Optional[int]) -> Optional[datetime]:
@@ -98,7 +141,17 @@ def _emit_transition_event(result: revenuecat_repository.EntitlementProjection, 
 async def _process_lifecycle_event(
     pool: asyncpg.Pool, event: Dict[str, Any], event_type: str, environment: str, event_timestamp: datetime,
     revenuecat_event_id: str,
-) -> bool:
+) -> _Outcome:
+    if event_type in _ENTITLEMENT_GATED_EVENT_TYPES:
+        entitlement_ids = event.get("entitlement_ids") or []
+        if settings.revenuecat_entitlement_id not in entitlement_ids:
+            # A real, durably-received event for a product/entitlement
+            # this deployment does not treat as its premium
+            # entitlement -- successfully processed as "nothing to do
+            # here," never an error, never retried, and critically:
+            # never allowed to touch this user's premium projection.
+            return _Outcome(status=revenuecat_repository.NOT_RELEVANT)
+
     app_user_id = event.get("app_user_id")
     user_id = await _resolve_user(pool, app_user_id)
     if user_id is None:
@@ -114,9 +167,22 @@ async def _process_lifecycle_event(
         if event.get("cancel_reason") == _REFUND_CANCEL_REASON:
             # A current-period refund -- revoke immediately, never wait
             # for the natural expiration. See
-            # REVENUECAT_INTEGRATION_NOTES.md section 3.
+            # REVENUECAT_INTEGRATION_NOTES.md section 3. Refund and
+            # auto-renew-off are independent facts: a refunded
+            # subscription's renewal preference can still be *on*.
+            # Preserve whatever was already projected rather than
+            # fabricating will_renew=False -- the webhook payload does
+            # not actually tell us the renewal setting changed. No
+            # prior local row exists is the one case with nothing to
+            # preserve; True (RevenueCat's own default posture for a
+            # subscription that hasn't been explicitly cancelled) is
+            # the honest default there, and it has no access
+            # consequence anyway since status is REVOKED either way.
+            existing = await revenuecat_repository.get_entitlement(
+                pool, user_id, settings.revenuecat_entitlement_id, PROVIDER, environment,
+            )
             status = revenuecat_repository.REVOKED
-            will_renew = False
+            will_renew = existing["will_renew"] if existing is not None else True
             expires_at = event_timestamp
         else:
             # Auto-renew turned off (or a billing-driven cancellation
@@ -147,7 +213,7 @@ async def _process_lifecycle_event(
         # (VIRTUAL_CURRENCY_TRANSACTION, EXPERIMENT_ENROLLMENT, etc.)
         # -- durable receipt already happened; there is nothing more
         # to do, and that is a successful, not a stale, outcome.
-        return True
+        return _Outcome(status=revenuecat_repository.PROCESSED)
 
     result = await revenuecat_repository.apply_entitlement_projection(
         pool, user_id=user_id, entitlement_identifier=settings.revenuecat_entitlement_id,
@@ -156,37 +222,78 @@ async def _process_lifecycle_event(
         provider_customer_id=provider_customer_id, last_provider_event_at=event_timestamp,
     )
     _emit_transition_event(result, event_type)
-    return result.applied
+    return _Outcome(status=revenuecat_repository.PROCESSED if result.applied else revenuecat_repository.STALE_IGNORED)
 
 
 async def _process_transfer(
-    pool: asyncpg.Pool, event: Dict[str, Any], environment: str, event_timestamp: datetime,
+    pool: asyncpg.Pool, event: Dict[str, Any], environment: Optional[str], event_timestamp: datetime,
     revenuecat_event_id: str,
-) -> bool:
-    destination_raw = event.get("app_user_id")
-    destination_id = await _resolve_user(pool, destination_raw)
-    if destination_id is None:
-        raise UnresolvableAppUserIdError(str(destination_raw))
+) -> _Outcome:
+    """TRANSFER carries transferred_from/transferred_to (both always
+    present -- enforced by the webhook route's own validation before
+    this event was ever durably stored), never app_user_id. environment
+    is only SOMETIMES present on this event type per RevenueCat's own
+    docs -- see REVENUECAT_INTEGRATION_NOTES.md section 2.
 
-    sources: List[str] = event.get("transferred_from") or []
+    Resolution policy (Section 11 -- never trust an arbitrary alias
+    string): every transferred_to/transferred_from entry is resolved
+    independently; unresolvable entries are simply not local users and
+    are skipped, never treated as a hard failure and never fabricated
+    into a user. Exactly one distinct resolvable local destination is
+    required to proceed -- zero or more than one both fail closed via
+    RECONCILIATION_REQUIRED rather than guessing, so this transfer can
+    never grant premium access to multiple unrelated local users, and
+    can never silently do nothing while pretending it succeeded.
+
+    Ordering (fail-safe): every resolvable source is revoked before the
+    destination is activated, so a partial failure between the two
+    steps favors temporary denial over duplicate paid entitlement.
+    """
+    if environment is None:
+        return _Outcome(status=revenuecat_repository.RECONCILIATION_REQUIRED, error_code="UNRESOLVED_ENVIRONMENT")
+
+    transferred_to: List[str] = event.get("transferred_to") or []
+    transferred_from: List[str] = event.get("transferred_from") or []
+
+    resolved_destinations: Set[UUID] = set()
+    for raw in transferred_to:
+        resolved = await _resolve_user(pool, raw)
+        if resolved is not None:
+            resolved_destinations.add(resolved)
+
+    if len(resolved_destinations) == 0:
+        return _Outcome(
+            status=revenuecat_repository.RECONCILIATION_REQUIRED,
+            error_code="NO_RESOLVABLE_TRANSFER_DESTINATION",
+        )
+    if len(resolved_destinations) > 1:
+        return _Outcome(
+            status=revenuecat_repository.RECONCILIATION_REQUIRED,
+            error_code="AMBIGUOUS_TRANSFER_DESTINATION",
+        )
+    destination_id = next(iter(resolved_destinations))
+
+    resolved_sources: Set[UUID] = set()
+    for raw in transferred_from:
+        resolved = await _resolve_user(pool, raw)
+        if resolved is not None and resolved != destination_id:
+            # Unresolvable, or a self-transfer -- nothing to revoke.
+            # An unresolvable source most likely means that alias was
+            # never one of this app's own users to begin with; the
+            # destination side (never duplicating paid access) is the
+            # side this app's brief requires to be correct above all
+            # else.
+            resolved_sources.add(resolved)
+
     expires_at = _ms_to_datetime(event.get("expiration_at_ms"))
     any_applied = False
 
-    for source_raw in sources:
-        source_id = await _resolve_user(pool, source_raw)
-        if source_id is None or source_id == destination_id:
-            # Unresolvable or self-transfer -- nothing to revoke.
-            # Deliberately not a hard failure: the destination side of
-            # a transfer is the side this pass's brief requires to be
-            # correct above all else (never duplicate paid access), and
-            # an unresolvable *source* id most likely means that source
-            # was never one of this app's own users to begin with.
-            continue
+    for source_id in resolved_sources:
         result = await revenuecat_repository.apply_entitlement_projection(
             pool, user_id=source_id, entitlement_identifier=settings.revenuecat_entitlement_id,
             provider=PROVIDER, status=revenuecat_repository.REVOKED, effective_at=event_timestamp,
             expires_at=event_timestamp, will_renew=False, environment=environment,
-            source_event_id=revenuecat_event_id, provider_customer_id=str(source_raw),
+            source_event_id=revenuecat_event_id, provider_customer_id=str(source_id),
             last_provider_event_at=event_timestamp,
         )
         _emit_transition_event(result, "TRANSFER_SOURCE_REVOKED")
@@ -196,11 +303,13 @@ async def _process_transfer(
         pool, user_id=destination_id, entitlement_identifier=settings.revenuecat_entitlement_id,
         provider=PROVIDER, status=revenuecat_repository.ACTIVE, effective_at=event_timestamp,
         expires_at=expires_at, will_renew=True, environment=environment,
-        source_event_id=revenuecat_event_id, provider_customer_id=str(destination_raw),
+        source_event_id=revenuecat_event_id, provider_customer_id=str(destination_id),
         last_provider_event_at=event_timestamp,
     )
     _emit_transition_event(dest_result, "TRANSFER_DESTINATION_ACTIVATED")
-    return any_applied or dest_result.applied
+    any_applied = any_applied or dest_result.applied
+
+    return _Outcome(status=revenuecat_repository.PROCESSED if any_applied else revenuecat_repository.STALE_IGNORED)
 
 
 async def process_webhook_event(pool: asyncpg.Pool, webhook_event_id: UUID) -> None:
@@ -219,15 +328,15 @@ async def process_webhook_event(pool: asyncpg.Pool, webhook_event_id: UUID) -> N
     payload = json.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
     event = payload.get("event", payload)
     event_type = event_row["event_type"]
-    environment = event_row["environment"]
+    environment = event_row["environment"]  # may be None for a TRANSFER RevenueCat sent with no environment
     event_timestamp = event_row["event_timestamp"]
     revenuecat_event_id = event_row["revenuecat_event_id"]
 
     try:
-        if event_type == "TRANSFER":
-            applied = await _process_transfer(pool, event, environment, event_timestamp, revenuecat_event_id)
+        if event_type == TRANSFER_EVENT_TYPE:
+            outcome = await _process_transfer(pool, event, environment, event_timestamp, revenuecat_event_id)
         else:
-            applied = await _process_lifecycle_event(
+            outcome = await _process_lifecycle_event(
                 pool, event, event_type, environment, event_timestamp, revenuecat_event_id,
             )
     except UnresolvableAppUserIdError:
@@ -237,7 +346,14 @@ async def process_webhook_event(pool: asyncpg.Pool, webhook_event_id: UUID) -> N
         observability_events.revenuecat_event_failed(event_type=event_type, error_code="UNKNOWN_APP_USER_ID")
         return
 
-    final_status = revenuecat_repository.PROCESSED if applied else revenuecat_repository.STALE_IGNORED
-    await revenuecat_repository.mark_event_result(pool, webhook_event_id, status=final_status)
-    if final_status == revenuecat_repository.PROCESSED:
+    await revenuecat_repository.mark_event_result(
+        pool, webhook_event_id, status=outcome.status, error_code=outcome.error_code,
+    )
+    if outcome.status == revenuecat_repository.PROCESSED:
         observability_events.revenuecat_event_processed(event_type=event_type)
+    elif outcome.status == revenuecat_repository.RECONCILIATION_REQUIRED:
+        observability_events.revenuecat_event_requires_reconciliation(
+            event_type=event_type, error_code=outcome.error_code or "UNKNOWN",
+        )
+    elif outcome.status == revenuecat_repository.NOT_RELEVANT:
+        observability_events.revenuecat_event_not_relevant(event_type=event_type)

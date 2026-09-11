@@ -95,6 +95,13 @@ TEST_DATABASE_URL = os.environ["DATABASE_URL"]
 # app_instance is what actually proves the app works correctly under
 # the same restricted role production uses, RLS included.
 APP_DATABASE_URL = "postgresql://skincare_app:skincare_app_dev_only@localhost:5432/skincare_test"
+# The dedicated billing-writer role (migration 9815eb266923) -- the
+# only role permitted to INSERT/UPDATE revenuecat_webhook_events or
+# user_entitlements. Using this, not APP_DATABASE_URL/TEST_DATABASE_URL,
+# for RevenueCat webhook ingestion/worker/reconciliation tests is what
+# proves those paths work under the same restricted, least-privilege
+# role production uses -- see tests/database/test_revenuecat_billing_privilege.py.
+BILLING_DATABASE_URL = "postgresql://skincare_billing:skincare_billing_dev_only@localhost:5432/skincare_test"
 TEST_REDIS_URL = os.environ["REDIS_URL"]
 
 
@@ -138,6 +145,16 @@ async def app_db_pool(migrated_test_database):
     await pool.close()
 
 
+@pytest_asyncio.fixture
+async def billing_db_pool(migrated_test_database):
+    """The dedicated skincare_billing role's own pool -- see
+    BILLING_DATABASE_URL above. Separate from both db_pool (superuser)
+    and app_db_pool (the ordinary, now-write-restricted runtime role)."""
+    pool = await asyncpg.create_pool(dsn=BILLING_DATABASE_URL, min_size=1, max_size=5)
+    yield pool
+    await pool.close()
+
+
 @pytest_asyncio.fixture(autouse=True)
 async def clean_database(request):
     """Truncates all app tables before each test so tests don't leak
@@ -163,7 +180,7 @@ async def clean_database(request):
     argument (which would reintroduce the exact per-test pool churn
     this fixture exists to avoid)."""
     needs_db = bool(
-        {"db_pool", "app_db_pool", "client", "app_instance"} & set(request.fixturenames)
+        {"db_pool", "app_db_pool", "billing_db_pool", "client", "app_instance"} & set(request.fixturenames)
     )
     if needs_db:
         conn = await asyncpg.connect(dsn=TEST_DATABASE_URL)
@@ -194,16 +211,18 @@ async def redis_client():
 
 
 @pytest_asyncio.fixture
-async def app_instance(db_pool, app_db_pool, redis_client):
+async def app_instance(db_pool, app_db_pool, billing_db_pool, redis_client):
     """The real FastAPI app, wired to the *restricted* app_db_pool
-    (the skincare_app role, not the superuser db_pool) and test Redis
-    client, instead of running its own startup/shutdown events (which
-    would create a second, competing pool/client). `db_pool` is
-    unused directly here (`clean_database` no longer depends on it --
-    it opens its own one-off connection instead) but is kept as a
-    dependency anyway: this exact fixture set is what the final,
-    fully-green 114-test run (TEST_REPORT.md) verified, and this
-    parameter costs nothing to keep."""
+    (the skincare_app role, not the superuser db_pool), the dedicated
+    billing_db_pool (the skincare_billing role -- what
+    app/api/v2/webhooks.py's get_billing_db_pool() resolves to under
+    test), and test Redis client, instead of running its own
+    startup/shutdown events (which would create a second, competing
+    pool/client). `db_pool` is unused directly here (`clean_database`
+    no longer depends on it -- it opens its own one-off connection
+    instead) but is kept as a dependency anyway: this exact fixture set
+    is what the final, fully-green 114-test run (TEST_REPORT.md)
+    verified, and this parameter costs nothing to keep."""
     from app import main as main_module
 
     main_module.app.dependency_overrides.clear()
@@ -211,11 +230,13 @@ async def app_instance(db_pool, app_db_pool, redis_client):
     from app import redis_client as redis_module
 
     db_connection._pool = app_db_pool
+    db_connection._billing_pool = billing_db_pool
     redis_module._redis_client = redis_client
 
     yield main_module.app
 
     db_connection._pool = None
+    db_connection._billing_pool = None
     redis_module._redis_client = None
 
 
