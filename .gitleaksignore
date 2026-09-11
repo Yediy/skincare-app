@@ -1,0 +1,13 @@
+# gitleaks false-positive exceptions -- each entry is a specific,
+# reviewed finding, never a blanket rule/path ignore. See
+# backend/.trivyignore for the equivalent pattern used for Trivy.
+#
+# ca9d437e...:backend/tests/security/test_revenuecat_webhook_verification.py:generic-api-key:14
+# A short, high-entropy-looking but entirely fake test-fixture webhook
+# signing secret (RevenueCat HMAC verification unit tests). Superseded
+# in commit b263283 by a longer, lower-entropy literal following this
+# repository's existing "...-never-used-outside-pytest-..." test-secret
+# convention (see tests/conftest.py's JWT_SECRET), which gitleaks does
+# not flag -- kept here only because the original commit (part of this
+# same PR) still contains the old literal in its diff.
+ca9d437e47da18c284667e23317ae59527bdf85e:backend/tests/security/test_revenuecat_webhook_verification.py:generic-api-key:14
