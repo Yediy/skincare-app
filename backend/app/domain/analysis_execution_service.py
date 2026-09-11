@@ -21,8 +21,21 @@ Called only by app/workers/analysis_worker.py, never directly by an
 HTTP route -- the worker owns retry classification/dead-lettering
 (which of this module's exceptions are retryable is that module's
 concern, not this one's).
+
+Heartbeat-starvation fix: the worker's visibility heartbeat
+(app/workers/analysis_worker.py's _heartbeat_loop) is a plain asyncio
+task on the same event loop this service's execute() runs on. A
+synchronous, multi-second MediaPipe/OpenCV call sitting directly on
+that loop would starve the heartbeat for its whole duration -- long
+enough, under a short enough visibility timeout, for a second worker
+to legitimately reclaim a job the first is still actively processing.
+execute() passes its own dedicated single-thread executor (see
+__init__ below) into compute_analysis() so the CV call runs off-loop;
+scoring/planning/DB work after it stays on the loop unchanged.
 """
+from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import dataclass
+from typing import Optional
 from uuid import UUID
 
 import asyncpg
@@ -88,6 +101,7 @@ class AnalysisExecutionService:
         product_matching_service: ProductMatchingService,
         safety_engine: SafetyEngine,
         image_store: EphemeralAnalysisImageStore,
+        cv_executor: Optional[Executor] = None,
     ):
         self._pool = pool
         self._pipeline = pipeline
@@ -97,6 +111,23 @@ class AnalysisExecutionService:
         self._product_matching_service = product_matching_service
         self._safety_engine = safety_engine
         self._image_store = image_store
+        # Dedicated, single-thread, owned by this one worker process's
+        # AnalysisExecutionService instance for its entire lifetime --
+        # deliberately not the default asyncio.to_thread pool (which
+        # draws from several threads with no guarantee a given call
+        # lands on the same one as the last). `self._pipeline`'s
+        # underlying MediaPipe FaceMesh/tflite objects are not
+        # documented as safe to invoke from arbitrary/varying threads;
+        # a single fixed thread sidesteps that question entirely
+        # rather than assuming the answer is "yes". Still only ever one
+        # call in flight at a time either way -- this worker already
+        # processes one job at a time (see app/workers/analysis_worker.
+        # py's run_forever) -- so max_workers=1 costs nothing and
+        # removes a class of risk for free. See compute_analysis()'s
+        # cv_executor docstring for the other half of this fix.
+        self._cv_executor = cv_executor or ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="analysis-cv"
+        )
 
     async def execute(self, user_id: UUID, analysis_request_id: UUID) -> ExecutionOutcome:
         req = await analysis_repository.get_request_by_id(self._pool, user_id, analysis_request_id)
@@ -133,6 +164,7 @@ class AnalysisExecutionService:
             self._pool, user_id, image_bytes,
             pipeline=self._pipeline, scorer=self._scorer, plan_service=self._plan_service,
             product_matching_service=self._product_matching_service, safety_engine=self._safety_engine,
+            cv_executor=self._cv_executor,
         )
 
         # Part VI, Phase 30's atomic commit: result + measurements +

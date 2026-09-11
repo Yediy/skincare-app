@@ -30,7 +30,7 @@ from app.domain.entitlement import (
     QuotaExceededError,
     UsagePolicyService,
 )
-from app.domain.user_placement_service import UserPlacementService
+from app.domain.user_placement_service import UserPlacementNotFoundError, UserPlacementService
 from app.middleware.rate_limiter import ANALYSIS_POLICY, GENERAL_POLICY, rate_limit_by_user
 from app.queue.postgres_queue import PostgresJobQueue
 from app.storage.ephemeral_image_store import EphemeralAnalysisImageStore
@@ -96,7 +96,16 @@ async def submit_analysis(
     pool = get_db_pool()
     user_uuid = uuid.UUID(user_id)
 
-    placement = await UserPlacementService(pool).get_placement(user_uuid)
+    try:
+        placement = await UserPlacementService(pool).get_placement(user_uuid)
+    except UserPlacementNotFoundError:
+        # rate_limit_by_user/get_current_user already verified this
+        # user_id's row exists moments ago -- reaching here means it
+        # vanished in between (or a genuine upstream bug), not that
+        # this user was never real. Fail closed rather than silently
+        # falling back to launch defaults as if they had been durably
+        # assigned to nobody's row.
+        raise HTTPException(status_code=500, detail="Unable to resolve account placement.")
 
     try:
         result = await service.submit(

@@ -61,9 +61,11 @@ already created at submission time -- so it calls `compute_analysis()`
 directly and never reserves a second slot for the same logical
 request. See ASYNC_ANALYSIS_ARCHITECTURE.md.
 """
+import asyncio
 import base64
+from concurrent.futures import Executor
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from uuid import UUID
 
 import asyncpg
@@ -135,6 +137,7 @@ async def compute_analysis(
     plan_service: PlanService,
     product_matching_service: ProductMatchingService,
     safety_engine: SafetyEngine,
+    cv_executor: Optional[Executor] = None,
 ) -> AnalysisResult:
     """The quota-independent core of a facial analysis: raw image bytes
     in, CV -> scoring -> abstract plan -> product matching -> routine
@@ -148,11 +151,38 @@ async def compute_analysis(
 
     NoFaceDetectedError / CaptureQualityFailedError / ValueError from
     `pipeline.analyze()` propagate unchanged -- all three were already
-    framework-agnostic exceptions before this module existed."""
+    framework-agnostic exceptions before this module existed.
+
+    cv_executor (Part VI heartbeat-starvation fix): pipeline.analyze()
+    is a long, synchronous, CPU-bound MediaPipe/OpenCV call. Left as a
+    direct call on the current coroutine's thread, it blocks whatever
+    event loop that coroutine is running on for its entire duration --
+    harmless for `perform_analysis`'s synchronous HTTP request (nothing
+    else on that request depends on the loop staying free), but fatal
+    for AnalysisExecutionService's async worker, whose visibility
+    heartbeat is itself just another task on that same loop: a blocked
+    loop means a heartbeat that can't fire, which means a second worker
+    can reclaim the "stalled" job out from under the first while it is
+    still very much alive and working. Passing an Executor here runs
+    pipeline.analyze() via `loop.run_in_executor()` instead, freeing the
+    event loop (and its heartbeat) for the call's duration. Left as
+    `None` (the default, and what `perform_analysis` below always uses)
+    the call runs exactly as it always did -- direct, on this coroutine.
+    Whether that executor may safely run more than one call concurrently,
+    or from more than one thread over its lifetime, is the caller's
+    concern, not this function's -- see
+    AnalysisExecutionService.__init__ for why the worker path uses a
+    dedicated single-thread executor rather than the default thread
+    pool."""
     from app.db.profile_repository import get_profile
     from app.observability import events as observability_events
 
-    extraction_result = pipeline.analyze(image_bytes)
+    if cv_executor is not None:
+        extraction_result = await asyncio.get_running_loop().run_in_executor(
+            cv_executor, pipeline.analyze, image_bytes
+        )
+    else:
+        extraction_result = pipeline.analyze(image_bytes)
 
     metric_results = extraction_result["metric_results"]
     capture_assessment = extraction_result["capture_assessment"]
