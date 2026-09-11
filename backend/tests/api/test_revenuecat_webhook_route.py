@@ -17,8 +17,8 @@ import pytest
 
 from app.config import settings
 
-AUTH_VALUE = "webhook-route-auth-token"
-SIGNING_SECRET = "webhook-route-signing-secret"
+AUTH_VALUE = "test-only-webhook-route-auth-value-never-used-outside-pytest-0123456789"
+SIGNING_SECRET = "test-only-webhook-route-signing-secret-never-used-outside-pytest-0123456789"
 
 
 def _sign(body: bytes, secret: str, timestamp: int) -> str:

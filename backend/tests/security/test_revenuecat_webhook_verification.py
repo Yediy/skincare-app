@@ -11,8 +11,8 @@ from app.config import settings
 from app.security.revenuecat_webhook import WebhookVerificationError, verify_webhook_request
 
 RAW_BODY = b'{"event": {"type": "INITIAL_PURCHASE", "id": "evt_1"}}'
-SECRET = "test-signing-secret-0123456789"
-AUTH_VALUE = "test-webhook-auth-token"
+SECRET = "test-only-webhook-signing-secret-never-used-outside-pytest-0123456789"
+AUTH_VALUE = "test-only-webhook-auth-value-never-used-outside-pytest-0123456789"
 
 
 def _sign(body: bytes, secret: str, timestamp: int) -> str:
