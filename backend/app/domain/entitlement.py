@@ -24,6 +24,7 @@ from uuid import UUID
 import asyncpg
 
 from app.db import usage_repository
+from app.observability import events as observability_events
 
 
 class EntitlementService(ABC):
@@ -73,10 +74,43 @@ class QuotaExceededError(Exception):
     app/domain/analysis_service.py -- the HTTP layer maps it to 429."""
 
 
+class AnalysisAlreadyCompletedError(Exception):
+    """Raised when request_id replays a reservation that already
+    reached CONSUMED -- the analysis already ran to completion once.
+    Part II, Phase 14's "never compute again if persisted result
+    exists": this pass does not yet have an analysis_results table
+    (Part III) to fetch and return the old result from, so the honest,
+    correctly-scoped behavior today is to refuse to recompute rather
+    than silently doing the (expensive, quota-double-charging) work
+    again -- the HTTP layer maps this to 409. Once analysis_results
+    exists, the caller catching this can be upgraded to actually
+    return the persisted result instead of raising to the client."""
+
+    def __init__(self, reservation_id: UUID):
+        self.reservation_id = reservation_id
+        super().__init__(f"request_id already completed (reservation {reservation_id})")
+
+
+class AnalysisInProgressError(Exception):
+    """Raised when request_id replays a reservation still RESERVED by
+    a *different* attempt (a concurrent caller, or an earlier attempt
+    that hasn't reached consume()/release() yet) -- as opposed to a
+    RELEASED reservation this exact call just legitimately
+    re-activated (see UsageReservation.replay/just_reactivated). Do
+    not create duplicate compute for the same in-flight request_id --
+    the HTTP layer maps this to 409."""
+
+    def __init__(self, reservation_id: UUID):
+        self.reservation_id = reservation_id
+        super().__init__(f"request_id already in progress (reservation {reservation_id})")
+
+
 @dataclass(frozen=True)
 class UsageReservation:
     id: Optional[UUID]
     replay: bool  # True if this is an idempotent replay of an existing request_id, not a fresh reservation
+    just_reactivated: bool = False  # True only if this call performed a RELEASED -> RESERVED transition
+    attempt_count: int = 1
 
 
 class UsagePolicyService:
@@ -96,10 +130,22 @@ class UsagePolicyService:
         result = await usage_repository.reserve(self._pool, user_id, request_id, period_key, allowance)
 
         if result.status == usage_repository.DENIED:
+            observability_events.quota_denial(user_id=str(user_id))
             raise QuotaExceededError(
                 f"Analysis allowance ({allowance}/period) exhausted for the current period."
             )
-        return UsageReservation(id=result.id, replay=result.replay)
+        if result.status == usage_repository.CONSUMED:
+            raise AnalysisAlreadyCompletedError(result.id)
+        if result.status == usage_repository.RESERVED and result.replay and not result.just_reactivated:
+            raise AnalysisInProgressError(result.id)
+
+        # Either a genuinely fresh reservation, or a legitimate
+        # RELEASED -> RESERVED reactivation (just_reactivated=True) --
+        # both are real go-ahead-and-compute outcomes.
+        return UsageReservation(
+            id=result.id, replay=result.replay,
+            just_reactivated=result.just_reactivated, attempt_count=result.attempt_count,
+        )
 
     async def consume_reservation(self, user_id: UUID, reservation_id: UUID) -> None:
         await usage_repository.consume(self._pool, user_id, reservation_id)

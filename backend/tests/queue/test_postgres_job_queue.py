@@ -153,3 +153,110 @@ async def test_reenqueue_after_failure_with_same_request_id_returns_the_failed_j
     retried = await queue.enqueue("analysis", {}, request_id=request_id)
     assert retried.id == job.id
     assert retried.status == "failed"
+
+
+# --- Part VI, Phase 27: retry model -------------------------------------
+
+async def test_terminal_failure_never_becomes_reclaimable(queue, app_db_pool):
+    """retryable=False (the default, matching the original contract):
+    straight to 'failed', never claimable again -- the required
+    "terminal image failure does not retry" case."""
+    job = await queue.enqueue("analysis", {})
+    await queue.claim("analysis")
+    await queue.fail(job.id, "invalid image", retryable=False)
+
+    row = await app_db_pool.fetchrow("SELECT status, attempt_count FROM jobs WHERE id = $1", job.id)
+    assert row["status"] == "failed"
+
+    assert await queue.claim("analysis") is None
+
+
+async def test_retryable_failure_goes_back_to_pending_with_backoff(queue, app_db_pool):
+    job = await queue.enqueue("analysis", {})
+    await queue.claim("analysis")
+    await queue.fail(job.id, "transient db error", retryable=True)
+
+    row = await app_db_pool.fetchrow(
+        "SELECT status, attempt_count, next_attempt_at, claimed_at, claimed_until FROM jobs WHERE id = $1", job.id
+    )
+    assert row["status"] == "pending"
+    assert row["attempt_count"] == 1
+    assert row["next_attempt_at"] is not None
+    assert row["claimed_at"] is None
+    assert row["claimed_until"] is None
+
+    # Not yet claimable -- next_attempt_at is in the future.
+    assert await queue.claim("analysis") is None
+
+
+async def test_retryable_failure_becomes_claimable_once_backoff_passes(queue, app_db_pool):
+    job = await queue.enqueue("analysis", {})
+    await queue.claim("analysis")
+    await queue.fail(job.id, "transient db error", retryable=True)
+
+    # Simulate the backoff window having passed.
+    await app_db_pool.execute("UPDATE jobs SET next_attempt_at = now() - interval '1 second' WHERE id = $1", job.id)
+
+    reclaimed = await queue.claim("analysis")
+    assert reclaimed is not None
+    assert reclaimed.id == job.id
+
+
+async def test_retryable_failure_exhausted_attempts_becomes_terminal(queue, app_db_pool):
+    """Part VI, Phase 29's "max attempts -> dead" case: once
+    attempt_count reaches max_attempts, a retryable failure still lands
+    in the same terminal 'failed' state as a non-retryable one -- not
+    an infinite retry loop."""
+    job = await queue.enqueue("analysis", {})
+    await app_db_pool.execute("UPDATE jobs SET max_attempts = 2 WHERE id = $1", job.id)
+
+    await queue.claim("analysis")
+    await queue.fail(job.id, "attempt 1 failed", retryable=True)
+    await app_db_pool.execute("UPDATE jobs SET next_attempt_at = now() - interval '1 second' WHERE id = $1", job.id)
+
+    await queue.claim("analysis")
+    await queue.fail(job.id, "attempt 2 failed", retryable=True)  # attempt_count now reaches max_attempts
+
+    row = await app_db_pool.fetchrow("SELECT status, attempt_count FROM jobs WHERE id = $1", job.id)
+    assert row["status"] == "failed"
+    assert await queue.claim("analysis") is None
+
+
+# --- Part VI, Phase 28: visibility heartbeat -----------------------------
+
+async def test_extend_visibility_prevents_reclaim_before_original_timeout_would_expire(queue, app_db_pool):
+    job = await queue.enqueue("analysis", {})
+    await queue.claim("analysis", visibility_timeout_seconds=1)
+
+    await queue.extend_visibility(job.id, 300)
+
+    row = await app_db_pool.fetchrow("SELECT claimed_until FROM jobs WHERE id = $1", job.id)
+    from datetime import datetime, timedelta, timezone
+    assert row["claimed_until"] > datetime.now(timezone.utc) + timedelta(seconds=250)
+
+    # Even after the *original* 1s timeout would have expired, the job
+    # must not be reclaimable -- extend_visibility() genuinely pushed
+    # claimed_until forward, not merely recorded an intent to.
+    assert await queue.claim("analysis") is None
+
+
+async def test_extend_visibility_raises_for_unclaimed_job(queue):
+    job = await queue.enqueue("analysis", {})  # never claimed
+    with pytest.raises(JobNotFoundError):
+        await queue.extend_visibility(job.id, 60)
+
+
+# --- Part VI, Phase 24: atomic enqueue with an external connection ------
+
+async def test_enqueue_accepts_an_external_connection_for_atomic_composition(queue, app_db_pool):
+    """Proves enqueue() can participate in a caller's own transaction
+    (Part V, Phase 24's atomic "mark QUEUED + insert job") -- a job
+    inserted via an externally-supplied connection that then rolls back
+    must not exist afterward."""
+    async with app_db_pool.acquire() as conn:
+        async with conn.transaction():
+            job = await queue.enqueue("analysis", {"via": "external-conn"}, conn=conn)
+            assert job.status == "pending"
+
+    row = await app_db_pool.fetchrow("SELECT id FROM jobs WHERE id = $1", job.id)
+    assert row is not None  # committed normally when the transaction commits

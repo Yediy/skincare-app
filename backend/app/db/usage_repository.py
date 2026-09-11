@@ -13,14 +13,39 @@ never racing another concurrent attempt for the same user+period. The
 lock is released automatically at transaction end (commit or
 rollback); no manual unlock, and nothing is held across requests.
 
-Idempotency guarantee: request_id is globally UNIQUE (schema-level).
-reserve() checks for an existing row by request_id *inside* the locked
-section (not before acquiring the lock -- see the docstring on why
-that ordering matters) and returns it, replay=True, for any status
-including RELEASED -- matching the same idempotency philosophy already
-established by app/queue/postgres_queue.py's jobs table: one
-request_id maps to one row forever, and a genuinely new attempt
-requires a new request_id, not a retry of an old one.
+Idempotency + retry semantics (Part II, Phase 14 -- corrected this
+pass): request_id is globally UNIQUE (schema-level) and maps to
+exactly one row, but that row's status is no longer permanently
+terminal the way the previous pass's docstring claimed. Three distinct
+outcomes for an existing row, matched exactly to this pass's own
+specification:
+
+  - CONSUMED: the logical operation already completed. Never reserve
+    again, never compute again -- reserve() returns it as a replay
+    with status=CONSUMED and takes no other action; the caller
+    (app/domain/entitlement.py's UsagePolicyService) is the layer that
+    turns that into "don't recompute."
+  - RESERVED: another attempt for this exact request_id is already
+    pending/in-flight (a concurrent caller, or a still-running earlier
+    attempt that hasn't reached consume()/release() yet). reserve()
+    returns it as a replay with status=RESERVED and
+    just_reactivated=False -- the caller must not create duplicate
+    compute for it.
+  - RELEASED: the previous attempt failed for a legitimate reason and
+    gave its slot back. This one may be re-reserved -- atomically,
+    subject to *current* quota availability (a released slot does not
+    grant a free pass around the allowance check), transitioning
+    RELEASED -> RESERVED and incrementing attempt_count. Returned as a
+    replay with status=RESERVED and just_reactivated=True, so the
+    caller can tell "you may proceed, this is a legitimate retry"
+    apart from the plain-RESERVED "someone else already owns this"
+    case above -- both come back with status=RESERVED, but only one of
+    them should trigger real computation.
+
+A release()d-then-successfully-retried reservation always ends
+CONSUMED, never stranded in RELEASED -- consume()/release() act on the
+same `id` regardless of whether it came from a fresh INSERT or a
+RELEASED->RESERVED UPDATE.
 
 analysis_usage has row-level security (migration ee276e90a60f), same
 pattern as user_profiles/consent_events: every query here sets
@@ -38,7 +63,8 @@ RELEASED = "RELEASED"
 # In-memory-only outcome, never a value the `status` column itself can
 # hold (see the table's CHECK constraint) -- returned when the
 # advisory-locked count-check finds the user's allowance for this
-# period already exhausted, so no row is inserted at all.
+# period already exhausted, so no row is inserted (or re-activated) at
+# all.
 DENIED = "DENIED"
 
 
@@ -47,6 +73,13 @@ class Reservation:
     id: Optional[UUID]
     status: str  # RESERVED | CONSUMED | RELEASED | DENIED
     replay: bool  # True if this is an existing row returned via idempotent replay, not a fresh reservation
+    # True only when THIS call performed a RELEASED -> RESERVED
+    # transition (a legitimate retry the caller should proceed with).
+    # False for a fresh reservation (replay is also False there) and
+    # for a replay of an already-RESERVED/CONSUMED row (the caller
+    # must NOT proceed with new computation in either of those cases).
+    just_reactivated: bool = False
+    attempt_count: int = 1
 
 
 async def reserve(
@@ -73,10 +106,45 @@ async def reserve(
             )
 
             existing = await conn.fetchrow(
-                "SELECT id, status FROM analysis_usage WHERE request_id = $1", request_id
+                "SELECT id, status, attempt_count FROM analysis_usage WHERE request_id = $1", request_id
             )
             if existing is not None:
-                return Reservation(id=existing["id"], status=existing["status"], replay=True)
+                if existing["status"] in (RESERVED, CONSUMED):
+                    # Already pending/in-flight, or already completed
+                    # -- either way, this call creates nothing new.
+                    return Reservation(
+                        id=existing["id"], status=existing["status"], replay=True,
+                        just_reactivated=False, attempt_count=existing["attempt_count"],
+                    )
+
+                # RELEASED: may be re-reserved, subject to the user's
+                # *current* allowance -- a released slot does not
+                # bypass the quota check.
+                count = await conn.fetchval(
+                    """
+                    SELECT COUNT(*) FROM analysis_usage
+                    WHERE user_id = $1 AND period_key = $2 AND status IN ('RESERVED', 'CONSUMED')
+                    """,
+                    user_id, period_key,
+                )
+                if count >= allowance:
+                    return Reservation(id=None, status=DENIED, replay=True, attempt_count=existing["attempt_count"])
+
+                row = await conn.fetchrow(
+                    """
+                    UPDATE analysis_usage
+                    SET status = 'RESERVED', reserved_at = now(),
+                        consumed_at = NULL, released_at = NULL,
+                        attempt_count = attempt_count + 1
+                    WHERE id = $1
+                    RETURNING id, status, attempt_count
+                    """,
+                    existing["id"],
+                )
+                return Reservation(
+                    id=row["id"], status=row["status"], replay=True,
+                    just_reactivated=True, attempt_count=row["attempt_count"],
+                )
 
             count = await conn.fetchval(
                 """
@@ -93,7 +161,7 @@ async def reserve(
                     """
                     INSERT INTO analysis_usage (user_id, request_id, period_key, status, reserved_at)
                     VALUES ($1, $2, $3, 'RESERVED', now())
-                    RETURNING id, status
+                    RETURNING id, status, attempt_count
                     """,
                     user_id, request_id, period_key,
                 )
@@ -106,11 +174,14 @@ async def reserve(
                 # lock keys, so not serialized against each other, but
                 # the schema's own UNIQUE(request_id) still catches it.
                 existing = await conn.fetchrow(
-                    "SELECT id, status FROM analysis_usage WHERE request_id = $1", request_id
+                    "SELECT id, status, attempt_count FROM analysis_usage WHERE request_id = $1", request_id
                 )
-                return Reservation(id=existing["id"], status=existing["status"], replay=True)
+                return Reservation(
+                    id=existing["id"], status=existing["status"], replay=True,
+                    attempt_count=existing["attempt_count"],
+                )
 
-            return Reservation(id=row["id"], status=row["status"], replay=False)
+            return Reservation(id=row["id"], status=row["status"], replay=False, attempt_count=row["attempt_count"])
 
 
 async def consume(pool: asyncpg.Pool, user_id: UUID, reservation_id: UUID) -> None:
@@ -132,11 +203,11 @@ async def consume(pool: asyncpg.Pool, user_id: UUID, reservation_id: UUID) -> No
 async def release(pool: asyncpg.Pool, user_id: UUID, reservation_id: UUID) -> None:
     """Marks a RESERVED reservation RELEASED after the analysis it
     gated failed for a legitimate reason (not the user's fault) --
-    frees the quota slot back up: release()d reservations are excluded
+    frees the quota slot back up: RELEASED reservations are excluded
     from reserve()'s COUNT(*) check, so a released slot can be
-    consumed again by a *new* request_id (not this same one -- see
-    this module's docstring on why request_id maps to one row
-    forever)."""
+    consumed again either by a new request_id, or by retrying the same
+    request_id (Part II, Phase 14 -- reserve() now allows
+    RELEASED -> RESERVED)."""
     async with pool.acquire() as conn:
         async with conn.transaction():
             await conn.execute("SELECT set_config('app.current_user_id', $1, true)", str(user_id))

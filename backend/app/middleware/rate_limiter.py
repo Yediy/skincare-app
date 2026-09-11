@@ -34,6 +34,7 @@ from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
 from app.config import settings
+from app.observability import events as observability_events
 
 # KEYS[1] = the per-identity+policy+window counter key
 # ARGV[1] = window_seconds
@@ -150,6 +151,11 @@ async def _enforce(policy: RateLimitPolicy, identity: str) -> None:
             detail=f"Rate limiting for '{policy.name}' is temporarily unavailable; try again shortly.",
         )
     if not result.allowed:
+        # identity_kind only ("ip"/"user"), never the identity value
+        # itself -- see app/observability/events.py's own docstring
+        # for why this one event deliberately never carries the real
+        # IP/user_id.
+        observability_events.rate_limit_denial(policy=policy.name, identity_kind=identity.split(":", 1)[0])
         raise HTTPException(
             status_code=429,
             detail="Too many requests.",

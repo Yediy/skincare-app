@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 import pytest
 
 from app.domain.entitlement import (
+    AnalysisAlreadyCompletedError,
+    AnalysisInProgressError,
     FreeTierEntitlementService,
     QuotaExceededError,
     UsagePolicyService,
@@ -55,19 +57,58 @@ async def test_usage_policy_service_raises_quota_exceeded_once_allowance_used(db
         await policy.reserve_analysis(user_id, str(uuid.uuid4()))
 
 
-async def test_usage_policy_service_replay_does_not_raise_quota_exceeded(db_pool, app_db_pool):
-    """A retried call with the same request_id must return the
-    existing reservation, not be treated as a second request against
-    an exhausted allowance."""
+async def test_usage_policy_service_reserved_replay_raises_in_progress_not_quota_exceeded(db_pool, app_db_pool):
+    """Part II, Phase 14: a retried call with the same request_id
+    while the original is still RESERVED (in-flight) must never be
+    treated as a second request against an exhausted allowance -- but
+    it also must not silently proceed to duplicate compute. It raises
+    AnalysisInProgressError specifically, distinct from
+    QuotaExceededError."""
     user_id = await _create_user(db_pool, "entitlement-replay@test.com")
     policy = UsagePolicyService(app_db_pool, FreeTierEntitlementService(monthly_allowance=1))
     request_id = str(uuid.uuid4())
 
     first = await policy.reserve_analysis(user_id, request_id)
-    second = await policy.reserve_analysis(user_id, request_id)
 
-    assert first.id == second.id
-    assert second.replay is True
+    with pytest.raises(AnalysisInProgressError) as exc_info:
+        await policy.reserve_analysis(user_id, request_id)
+    assert exc_info.value.reservation_id == first.id
+
+
+async def test_usage_policy_service_consumed_replay_raises_already_completed(db_pool, app_db_pool):
+    """A replay of a request_id whose analysis already ran to
+    completion must never trigger a second computation (or a second
+    quota charge) -- raises AnalysisAlreadyCompletedError."""
+    user_id = await _create_user(db_pool, "entitlement-consumed-replay@test.com")
+    policy = UsagePolicyService(app_db_pool, FreeTierEntitlementService(monthly_allowance=3))
+    request_id = str(uuid.uuid4())
+
+    first = await policy.reserve_analysis(user_id, request_id)
+    await policy.consume_reservation(user_id, first.id)
+
+    with pytest.raises(AnalysisAlreadyCompletedError) as exc_info:
+        await policy.reserve_analysis(user_id, request_id)
+    assert exc_info.value.reservation_id == first.id
+
+
+async def test_usage_policy_service_released_retry_succeeds_and_ends_consumed(db_pool, app_db_pool):
+    """The full required lifecycle: RELEASED -> re-reserve -> success
+    -> CONSUMED."""
+    user_id = await _create_user(db_pool, "entitlement-released-retry@test.com")
+    policy = UsagePolicyService(app_db_pool, FreeTierEntitlementService(monthly_allowance=2))
+    request_id = str(uuid.uuid4())
+
+    first = await policy.reserve_analysis(user_id, request_id)
+    await policy.release_reservation(user_id, first.id)
+
+    retry = await policy.reserve_analysis(user_id, request_id)
+    assert retry.id == first.id
+    assert retry.just_reactivated is True
+    assert retry.attempt_count == 2
+
+    await policy.consume_reservation(user_id, retry.id)
+    row = await db_pool.fetchrow("SELECT status FROM analysis_usage WHERE id = $1", retry.id)
+    assert row["status"] == "CONSUMED"
 
 
 async def test_usage_policy_service_consume_and_release(db_pool, app_db_pool):

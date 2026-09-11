@@ -10,7 +10,7 @@ A FastAPI backend (`backend/app/main.py`) with real authentication, a real Postg
 
 ## HTTP / API layer — `VERIFIED_IMPLEMENTED`
 
-Real FastAPI app (`app/main.py`), 15 routes: `/health/live`, `/health/ready`, `/signup`, `/login`, `/refresh`, `/logout`, `/logout-all`, `/me` (GET + DELETE), `/analyze`, `/profile` (GET + PUT), `/consent`, `/consent/withdraw`. (The unauthenticated `/db-check` debug route was removed alongside the RLS work below — it would have silently returned 0 once `users` gained row-level security, since it never set any session identity.) Startup wires a real Postgres pool and Redis client (`init_db_pool`/`init_redis`); `FacialAnalysisPipeline`, `FacialScorer`, `PlanService` are constructed once at import time and genuinely called from `/analyze` — this call chain is proven by a real end-to-end test running a real photo through it (`tests/integration/test_end_to_end_analysis.py::test_full_chain_good_capture_succeeds`).
+Real FastAPI app (`app/main.py`), 17 routes: `/health/live`, `/health/ready`, `/signup`, `/login`, `/refresh`, `/logout`, `/logout-all`, `/me` (GET + DELETE), `/analyze`, `/profile` (GET + PUT), `/consent`, `/consent/withdraw`, plus v2's `POST /api/v2/analyses` / `GET /api/v2/analyses/{analysis_id}` (`app/api/v2/analyses.py`, an `APIRouter` — the first router mounted outside `main.py` itself). (The unauthenticated `/db-check` debug route was removed alongside the RLS work below — it would have silently returned 0 once `users` gained row-level security, since it never set any session identity.) Startup/shutdown now use FastAPI's `lifespan` context manager (`app/main.py`'s `lifespan()`), replacing the deprecated `@app.on_event` handlers, wiring the same real Postgres pool and Redis client (`init_db_pool`/`init_redis`) — verified directly, not just by absence of the deprecation warning (`tests/database/test_smoke_infra.py::test_lifespan_initializes_and_closes_the_db_pool`). `FacialAnalysisPipeline`, `FacialScorer`, `PlanService` are constructed once at import time and genuinely called from `/analyze` — this call chain is proven by a real end-to-end test running a real photo through it (`tests/integration/test_end_to_end_analysis.py::test_full_chain_good_capture_succeeds`).
 
 ## Authentication — `VERIFIED_IMPLEMENTED`
 
@@ -57,13 +57,20 @@ MediaPipe FaceMesh landmarks → real head pose (`app/cv/head_pose.py`, `cv2.sol
 
 Full detail, including the target architecture this is a first slice of, in `PRODUCTION_ARCHITECTURE.md`, `POSTGRES_OPERATIONS.md`, `DOKPLOY_DEPLOYMENT.md`, `FAILURE_DOMAINS.md`, `SCALING_TRIGGERS.md`.
 
-## Async analysis foundation — `VERIFIED_IMPLEMENTED` (this pass)
+## Async analysis foundation — `VERIFIED_IMPLEMENTED`, now a complete pipeline
 
-- **Domain boundary (Phase 14)**: `app/domain/analysis_service.py`'s `perform_analysis()` is the entire consent-check → decode → CV pipeline → profile fetch → score → plan sequence that used to be inlined directly in `/analyze`'s route handler, extracted into a plain async function with no FastAPI/HTTP dependency — it raises framework-agnostic exceptions (`ConsentRequiredError`, `InvalidImageError`, plus the pre-existing `NoFaceDetectedError`/`CaptureQualityFailedError` left unchanged) and returns a plain `AnalysisResult` dataclass. `pipeline`/`scorer`/`plan_service` are passed in rather than constructed inside, so a future background worker can call this exact function with its own singleton instances. `/analyze` itself is now a thin adapter translating this function's outcomes to HTTP. **Does not change `/analyze`'s behavior or move it onto a queue** — verified by the pre-existing `tests/integration/test_end_to_end_analysis.py` suite passing unchanged, plus 4 new tests in `tests/domain/test_analysis_service.py` that call `perform_analysis()` directly with zero HTTP involved (no `client`/ASGI transport at all) — the actual proof this function doesn't secretly still depend on the web framework.
-- **Job queue abstraction (Phase 15)**: `app/queue/base.py`'s provider-neutral `JobQueue` ABC (`enqueue`/`claim`/`acknowledge`/`fail`) and `app/queue/postgres_queue.py`'s `PostgresJobQueue`, backed by a new generic `jobs` table (migration `2e77bc462867`) rather than a new infrastructure dependency — consistent with this pass's own instruction not to deploy Kafka/Pulsar before it's measured as necessary. Claim exclusivity uses `SELECT ... FOR UPDATE SKIP LOCKED`, proven with a real concurrent-claim test (`asyncio.gather` of 5 claimers against 5 jobs — no two ever receive the same job). **Nothing in the application enqueues onto this yet**, deliberately, same posture as the object storage abstraction before it — `/analyze` still runs synchronously inline.
-- **Idempotent enqueue (Phase 16)**: `PostgresJobQueue.enqueue()`'s `request_id` parameter is deduplicated via a partial unique index (`jobs(job_type, request_id) WHERE request_id IS NOT NULL`) — the same logical request submitted twice returns the same job, not a duplicate, regardless of that job's current status (including after a failure — a genuinely new attempt requires a new `request_id`, a documented, deliberate scope decision). Full end-to-end "`/analyze` request submitted twice → one persisted result" is not yet meaningful, honestly stated: no `measurements`/`analysis_results`/`plans` table exists in this repository at all (unchanged from before this pass; `/analyze`'s response is never persisted, only returned), so job-level idempotency is the real, testable guarantee this pass can honestly claim — see `OPEN_ENGINEERING_ITEMS.md`.
+Full detail in `ASYNC_ANALYSIS_ARCHITECTURE.md`, `RAW_IMAGE_LIFECYCLE.md`, `ANALYSIS_DATA_MODEL.md`, `WORKER_OPERATIONS.md`. What used to be a domain boundary and a job queue with nothing consuming either is now an actual end-to-end async path, real from HTTP submission through worker execution to result retrieval:
 
-16 new job-queue tests (`tests/queue/test_postgres_job_queue.py`) run through the real restricted `skincare_app` role, not mocked.
+- **Shared compute core**: `app/domain/analysis_service.py`'s `compute_analysis()` is the quota-independent CV → scoring → abstract-plan → product-matching → routine-safety sequence, called by both `perform_analysis()` (the synchronous `/analyze` path, which wraps it with its own reserve/consume/release lifecycle) and `AnalysisExecutionService` (the async worker path, which reuses a reservation `AnalysisSubmissionService` already created). Neither path duplicates the CV/planning logic; only the quota-ownership wrapper differs.
+- **Submission** (`app/domain/analysis_submission_service.py`'s `AnalysisSubmissionService`, behind `POST /api/v2/analyses`): consent check → quota reservation → raw image upload to ephemeral object storage → one atomic transaction marking the durable `analysis_requests` row `QUEUED` and enqueuing the worker job. Idempotent by client-supplied `request_id` (required, never manufactured — a retry-oriented async endpoint can't honestly manufacture one). Two failure-saga gaps closed this pass: a `create_request()` failure after a successful reservation now releases it (previously stranded `RESERVED` forever); an upload-succeeded-but-enqueue-failed window now compensates (delete the orphaned object, or if that itself fails, persist its reference independently so the cleanup sweeper can still recover it — see `RAW_IMAGE_LIFECYCLE.md`). Truly concurrent first-time submissions of the same `request_id` resolve to one logical analysis via real DB uniqueness (`analysis_usage`/`analysis_requests`/`jobs`), not a process-local lock.
+- **Execution** (`app/domain/analysis_execution_service.py`'s `AnalysisExecutionService`): loads the durable request, retrieves the raw image, calls `compute_analysis()`, then one atomic transaction (`app/db/analysis_repository.py`'s `commit_analysis_result()`, against `analysis_results`/`analysis_measurements`/`analysis_product_recommendations` — migration `b034483cb876`, a table set this document previously, and incorrectly, described as not existing) writes the result/measurements/product recommendations, marks the request `COMPLETED`, and consumes the reservation — followed by best-effort raw-image deletion. Replaying `execute()` on an already-`COMPLETED` request is a genuine no-op (no recompute, no double consumption), proven directly, not just claimed.
+- **Worker** (`python -m app.workers.analysis_worker`): claims a job (`SELECT ... FOR UPDATE SKIP LOCKED`), runs a background heartbeat (`extend_visibility`) alongside `execute()` so a long CV run doesn't lose its claim to another worker — proven with a real timing test, not a mocked clock. Classifies failures into a closed set of terminal (bad image, no face, invalid state) vs. everything-else-retryable (bounded by the job's own `max_attempts`), and only releases quota / marks the request `FAILED` on a genuinely terminal outcome (`fail()` now returns whether it left the job terminal, precisely so the worker can tell a requeue apart from a dead letter).
+- **Retrieval** (`GET /api/v2/analyses/{analysis_id}`): owner-only (RLS-enforced — another user's analysis 404s identically to a nonexistent one), returns the persisted result once `COMPLETED`, and a closed set of safe error-code classifications (never a raw exception message) once `FAILED`.
+- **Cell-readiness metadata**: `users.home_region`/`cell_id` (migration `219c52642ed4`) + `UserPlacementService`, snapshotted onto each `analysis_requests` row at submission — metadata only, no routing/replication built.
+
+Test coverage: `tests/domain/test_analysis_submission_service.py` (9), `tests/domain/test_analysis_execution_service.py` (8), `tests/workers/test_analysis_worker.py` (5, including the real heartbeat/concurrent-claim test), `tests/api/test_analyses_v2.py` (8, full HTTP path with real signup/login/consent).
+
+16 pre-existing job-queue tests (`tests/queue/test_postgres_job_queue.py`) plus new retry-backoff/heartbeat coverage, all run through the real restricted `skincare_app` role, not mocked.
 
 ## Product catalog — `VERIFIED_IMPLEMENTED` (this pass)
 
@@ -112,17 +119,28 @@ Full detail in `USAGE_AND_RATE_LIMIT_ARCHITECTURE.md`. Summary:
 - No billing/subscription/webhook code of any kind (RevenueCat is
   deliberately not integrated this pass — see "Usage/rate-limit foundation"
   above for the abstraction seam that will absorb it).
-- No offer/product catalog with pricing, availability, or commercial
-  ranking — the normalized catalog above has real ingredient/safety data,
-  but no price, no affiliate/commission data, and no ranking system
-  connecting it to `PlanService`'s recommendations.
+- No offer/product catalog with pricing, availability, or affiliate/
+  commission data. **What changed**: a real product-matching step now
+  connects `PlanService`'s abstract categories to concrete catalog
+  formulations (`ProductMatchingService` + `SafetyEngine.
+  evaluate_product_formulation()`, via `apply_product_matching_and_
+  routine_safety()`) — but its ordering ("compatibility ordering") is
+  explicitly SAFE-before-RESTRICTED / market-exactness / verification
+  freshness / a stable tie-break, never called "clinical efficacy" or
+  "commercial ranking", because no such data or evidence exists to
+  rank by. See `PRODUCT_RECOMMENDATION_PIPELINE.md`.
 - No mobile app source (`mobile/` is empty directory scaffolding).
-- No notification system.
-- No `measurements`/`analysis_results`/`plans` persistence table — `/analyze`'s output is still returned only, never stored, so "one persisted result per idempotent request" isn't yet a claim this repository can make (job-level idempotency is; see above).
-- No CV worker separation or queue consumer — `/analyze` still runs the CV pipeline synchronously inline on the API's own event loop; `JobQueue`/`PostgresJobQueue` exist but nothing calls `enqueue`/`claim` from a real code path yet.
-- No `home_region`/`cell_id` fields or cell-routing abstraction (Phase 23, deferred).
-- No transactional outbox / domain events (Phase 26, deferred).
-- No metrics/observability pipeline or structured logging beyond Python's stdlib `logging` (Phase 28/29, deferred).
+- No notification system, no transactional outbox / domain events.
+- No cell-based routing, replication, or sharding — `home_region`/
+  `cell_id` are metadata-readiness columns + `UserPlacementService`
+  only (see "Async analysis foundation" above).
+- No metrics/Prometheus backend deployed. `app/observability/events.py`
+  now provides real, wired-in structured log events (analysis
+  submission outcomes, queue claim/wait, processing success/retry/
+  dead-letter, image cleanup failures, capture quality, metric
+  abstention, no-compatible-product, quota/rate-limit denial) — a
+  genuine step past "nothing but stdlib `logging`", but still not a
+  time-series metrics/alerting system.
 
 ## Test foundation and CI — `VERIFIED_IMPLEMENTED`
 

@@ -10,6 +10,7 @@ These env vars are set at import time, before any `app.*` module is
 imported anywhere in the test session -- app.config.settings is a
 module-level singleton, so this must happen first.
 """
+import json
 import os
 
 os.environ["DATABASE_URL"] = "postgresql://postgres:postgres@localhost:5432/skincare_test"
@@ -168,7 +169,9 @@ async def clean_database(request):
         conn = await asyncpg.connect(dsn=TEST_DATABASE_URL)
         try:
             await conn.execute(
-                "TRUNCATE TABLE refresh_tokens, user_profiles, consent_events, jobs, analysis_usage, users RESTART IDENTITY CASCADE"
+                "TRUNCATE TABLE refresh_tokens, user_profiles, consent_events, jobs, analysis_usage, "
+                "user_ingredient_constraints, analysis_product_recommendations, analysis_measurements, "
+                "analysis_results, analysis_requests, users RESTART IDENTITY CASCADE"
             )
         finally:
             await conn.close()
@@ -231,17 +234,19 @@ async def client(app_instance):
 async def synthetic_catalog(db_pool, migrated_test_database):
     """Small, intentionally fictional catalog (fictional brand,
     fictional product names) covering every scenario
-    PRODUCT_CATALOG_ARCHITECTURE.md's test-catalog phase requires:
-    a basic-moisturizer SAFE case, a fragrance/allergen case, a
-    pregnancy/nursing-restricted retinoid case, a sensitive-skin acid
-    case, an ingredient-interaction conflict, and an incomplete
-    (INSUFFICIENT_DATA) formulation. Seeded through db_pool (the
-    superuser/migration-owner connection) -- skincare_app has
-    SELECT-only grants on every catalog table by design (migrations
-    d70e5fc90775/16b82dde6e7d), so it cannot seed its own test data,
-    matching the same test-owner-seeds/runtime-role-reads split
-    app/db/usage_repository.py and every other RLS-protected table in
-    this repository already uses.
+    PRODUCT_CATALOG_ARCHITECTURE.md/PRODUCT_RECOMMENDATION_PIPELINE.md's
+    test-catalog phases require: a basic-moisturizer SAFE case, a
+    fragrance/allergen case, a pregnancy/nursing-restricted retinoid
+    case, a sensitive-skin acid case, a within-formulation
+    ingredient-interaction conflict, a cross-product (routine-level)
+    interaction, incomplete/partial/unknown ingredient-data-status
+    cases, and MAX_FREQUENCY/BARRIER_RECOVERY rules with real
+    parameters. Seeded through db_pool (the superuser/migration-owner
+    connection) -- skincare_app has SELECT-only grants on every
+    catalog table by design (migrations d70e5fc90775/16b82dde6e7d), so
+    it cannot seed its own test data, matching the same
+    test-owner-seeds/runtime-role-reads split app/db/usage_repository.py
+    and every other RLS-protected table in this repository already uses.
 
     Self-contained: truncates every catalog table itself before
     seeding, rather than relying on the (unrelated) clean_database
@@ -289,7 +294,10 @@ async def synthetic_catalog(db_pool, migrated_test_database):
         )
         niacinamide_id = await _ingredient("Niacinamide", "active", aliases=[("Vitamin B3", "common_name")])
 
-        async def _product_with_formulation(name, category, ingredient_ids, sku):
+        async def _product_with_formulation(
+            name, category, ingredient_ids, sku,
+            ingredient_data_status="COMPLETE", market_or_region="global",
+        ):
             product_id = await conn.fetchval(
                 "INSERT INTO products (brand_id, name, normalized_name, category) "
                 "VALUES ($1, $2, $3, $4) RETURNING id",
@@ -297,11 +305,12 @@ async def synthetic_catalog(db_pool, migrated_test_database):
             )
             formulation_id = await conn.fetchval(
                 """
-                INSERT INTO product_formulations (product_id, version, source_type, verified_at)
-                VALUES ($1, '1', 'manufacturer_disclosure', now())
+                INSERT INTO product_formulations
+                    (product_id, version, source_type, verified_at, ingredient_data_status, market_or_region)
+                VALUES ($1, '1', 'manufacturer_disclosure', now(), $2, $3)
                 RETURNING id
                 """,
-                product_id,
+                product_id, ingredient_data_status, market_or_region,
             )
             await conn.execute(
                 "INSERT INTO product_skus (product_id, formulation_id, sku) VALUES ($1, $2, $3)",
@@ -364,10 +373,32 @@ async def synthetic_catalog(db_pool, migrated_test_database):
         # SAFE (this pass's Unknown Formulation Policy).
         incomplete_product_id, incomplete_formulation_id = await _product_with_formulation(
             "Undisclosed Mystery Serum", "vitamin_c_serum", [], "TNX-MYSTERY-01",
+            ingredient_data_status="UNKNOWN",
+        )
+
+        # Part I, Phase 1/2: a formulation CAN have real ingredients
+        # recorded and still not be COMPLETE -- a manufacturer who
+        # disclosed only "contains niacinamide" (PARTIAL) or a listing
+        # the catalog team hasn't verified yet at all (UNKNOWN) must
+        # both still resolve to INSUFFICIENT_DATA, never SAFE, purely
+        # because ingredient_data_status says so -- not because the
+        # ingredient list happens to be empty (that's the *different*,
+        # pre-existing "incomplete" case above).
+        partial_product_id, partial_formulation_id = await _product_with_formulation(
+            "Quick Glow Partial-Disclosure Serum", "vitamin_c_serum",
+            [water_id, niacinamide_id], "TNX-PARTIAL-01", ingredient_data_status="PARTIAL",
+        )
+        unknown_product_id, unknown_formulation_id = await _product_with_formulation(
+            "Unverified Import Brightening Cream", "vitamin_c_serum",
+            [water_id, niacinamide_id], "TNX-UNKNOWN-01", ingredient_data_status="UNKNOWN",
         )
 
         # Ingredient-level rules: pregnancy/nursing exclusion on
-        # retinol, sensitive-skin restriction on glycolic acid.
+        # retinol (HARD excludes), plus a MAX_FREQUENCY restriction
+        # (parameters carries the actual threshold -- Part I, Phase 5)
+        # independent of sensitive skin. Sensitive-skin restriction and
+        # a BARRIER_RECOVERY restriction on glycolic acid (Phase 6 --
+        # inert unless SafetyUsageContext.barrier_recovery_active).
         await conn.execute(
             "INSERT INTO ingredient_rules (ingredient_id, rule_type, severity, action, reason_code) "
             "VALUES ($1, 'PREGNANCY', 'HIGH', 'EXCLUDE', 'PREGNANCY_RESTRICTION')",
@@ -379,22 +410,61 @@ async def synthetic_catalog(db_pool, migrated_test_database):
             retinol_id,
         )
         await conn.execute(
+            """
+            INSERT INTO ingredient_rules (ingredient_id, rule_type, severity, action, reason_code, parameters)
+            VALUES ($1, 'MAX_FREQUENCY', 'MODERATE', 'RESTRICT', 'MAX_FREQUENCY_EXCEEDED', $2::jsonb)
+            """,
+            retinol_id, json.dumps({"maximum_weekly_frequency": 3}),
+        )
+        await conn.execute(
+            """
+            INSERT INTO ingredient_rules (ingredient_id, rule_type, severity, action, reason_code, parameters)
+            VALUES ($1, 'SENSITIVE_SKIN', 'MODERATE', 'RESTRICT', 'SENSITIVE_SKIN_INTENSITY_LIMIT', $2::jsonb)
+            """,
+            glycolic_acid_id, json.dumps({"maximum_weekly_frequency": 2}),
+        )
+        await conn.execute(
             "INSERT INTO ingredient_rules (ingredient_id, rule_type, severity, action, reason_code) "
-            "VALUES ($1, 'SENSITIVE_SKIN', 'MODERATE', 'RESTRICT', 'SENSITIVE_SKIN_INTENSITY_LIMIT')",
+            "VALUES ($1, 'BARRIER_RECOVERY', 'MODERATE', 'RESTRICT', 'BARRIER_RECOVERY_CONFLICT')",
             glycolic_acid_id,
         )
 
         # Pairwise interaction: retinol + glycolic acid together, high
-        # severity -- exercised by the "Dual Active" formulation above.
+        # severity, EXCLUDE_COMBINATION -- exercised by the "Dual
+        # Active" formulation (within-formulation) AND by the
+        # retinol+acid cross-product routine case (different
+        # formulations, same real ingredient pair).
         a_id, b_id = (retinol_id, glycolic_acid_id) if str(retinol_id) < str(glycolic_acid_id) else (glycolic_acid_id, retinol_id)
         await conn.execute(
             """
             INSERT INTO ingredient_interactions
-                (ingredient_a_id, ingredient_b_id, interaction_type, severity, reason_code, recommendation)
+                (ingredient_a_id, ingredient_b_id, interaction_type, severity, reason_code, recommendation, recommended_action)
             VALUES ($1, $2, 'INCOMPATIBLE', 'HIGH', 'ACTIVE_INTERACTION_CONFLICT',
-                    'Alternate nights rather than applying together to avoid over-exfoliation/irritation.')
+                    'Alternate nights rather than applying together to avoid over-exfoliation/irritation.',
+                    'EXCLUDE_COMBINATION')
             """,
             a_id, b_id,
+        )
+
+        # A milder cross-product interaction (niacinamide + glycolic
+        # acid, different formulations -- "acid" and "safe_serum") for
+        # routine-level RESTRICTED-not-UNSAFE testing: SEPARATE_DAYPART
+        # means the routine builder must schedule them into different
+        # dayparts, not exclude the routine outright.
+        c_id, d_id = (
+            (niacinamide_id, glycolic_acid_id)
+            if str(niacinamide_id) < str(glycolic_acid_id)
+            else (glycolic_acid_id, niacinamide_id)
+        )
+        await conn.execute(
+            """
+            INSERT INTO ingredient_interactions
+                (ingredient_a_id, ingredient_b_id, interaction_type, severity, reason_code, recommendation, recommended_action)
+            VALUES ($1, $2, 'REQUIRES_SPACING', 'LOW', 'ACTIVE_INTERACTION_CONFLICT',
+                    'Use niacinamide in the AM and glycolic acid in the PM for best tolerance.',
+                    'SEPARATE_DAYPART')
+            """,
+            c_id, d_id,
         )
 
     return {
@@ -409,11 +479,12 @@ async def synthetic_catalog(db_pool, migrated_test_database):
             "moisturizer": moisturizer_product_id, "fragrance": fragrance_product_id,
             "retinol": retinol_product_id, "acid": acid_product_id, "combo": combo_product_id,
             "safe_serum": safe_serum_product_id, "rebrand": rebrand_product_id,
-            "incomplete": incomplete_product_id,
+            "incomplete": incomplete_product_id, "partial": partial_product_id, "unknown": unknown_product_id,
         },
         "formulations": {
             "moisturizer": moisturizer_formulation_id, "fragrance": fragrance_formulation_id,
             "retinol": retinol_formulation_id, "acid": acid_formulation_id, "combo": combo_formulation_id,
             "safe_serum": safe_serum_formulation_id, "incomplete": incomplete_formulation_id,
+            "partial": partial_formulation_id, "unknown": unknown_formulation_id,
         },
     }

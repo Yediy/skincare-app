@@ -116,7 +116,13 @@ def test_canonical_ingredient_pair_is_order_independent():
 async def test_get_active_rules_for_ingredients(app_db_pool, synthetic_catalog):
     rules = await get_active_rules_for_ingredients(app_db_pool, [synthetic_catalog["ingredients"]["retinol"]])
     rule_types = {r["rule_type"] for r in rules}
-    assert rule_types == {"PREGNANCY", "NURSING"}
+    assert rule_types == {"PREGNANCY", "NURSING", "MAX_FREQUENCY"}
+
+
+async def test_get_active_rules_for_ingredients_decodes_parameters(app_db_pool, synthetic_catalog):
+    rules = await get_active_rules_for_ingredients(app_db_pool, [synthetic_catalog["ingredients"]["retinol"]])
+    max_frequency_rule = next(r for r in rules if r["rule_type"] == "MAX_FREQUENCY")
+    assert max_frequency_rule["parameters"] == {"maximum_weekly_frequency": 3}
 
 
 async def test_get_active_rules_for_ingredients_empty_list(app_db_pool, synthetic_catalog):

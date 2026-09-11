@@ -37,16 +37,45 @@ missing consent never touches quota at all) and before any CV compute
 runs; a failure anywhere in the CV/scoring/plan sequence releases the
 reservation rather than consuming it -- only a fully successful
 analysis consumes the slot.
+
+Production recommendation pass (Part I, Phase 11 -- the P0 closure):
+after PlanService.generate_plan() produces its abstract, category-level
+plan, this function now calls
+app.domain.recommendation_service.apply_product_matching_and_routine_safety()
+to resolve concrete catalog products for it, each evaluated through
+SafetyEngine.evaluate_product_formulation() and cross-checked by
+evaluate_routine_safety() -- the actual production path a concrete
+product recommendation goes through, not merely an interface waiting
+for a caller. See PRODUCT_RECOMMENDATION_PIPELINE.md.
+
+Async-execution pass (Part V/VI): `compute_analysis()` below is the
+quota-independent core this module and
+app.domain.analysis_execution_service.AnalysisExecutionService both
+call -- image bytes in, CV/scoring/plan/product-matching/routine-safety
+out, no reservation, no consumption, no HTTP exceptions. `perform_analysis`
+is now a thin wrapper: it owns the *synchronous* request's reservation
+lifecycle (reserve before compute, consume/release after) around a
+call to the same `compute_analysis()`. The async worker path owns a
+*different* reservation lifecycle -- the one AnalysisSubmissionService
+already created at submission time -- so it calls `compute_analysis()`
+directly and never reserves a second slot for the same logical
+request. See ASYNC_ANALYSIS_ARCHITECTURE.md.
 """
+import asyncio
 import base64
-from dataclasses import dataclass
-from typing import Any, Dict
+from concurrent.futures import Executor
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 from uuid import UUID
 
 import asyncpg
 
 from app.cv.pipeline import FacialAnalysisPipeline
+from app.db.user_constraint_repository import get_unresolved_constraint_flags
 from app.domain.entitlement import UsagePolicyService
+from app.domain.product_matching_service import ProductMatchingService
+from app.domain.recommendation_service import apply_product_matching_and_routine_safety
+from app.domain.safety_engine import SafetyEngine
 from app.ml.scorer import FacialScorer
 from app.services.plan_service import PlanService
 
@@ -87,6 +116,123 @@ class AnalysisResult:
     metric_results: Dict[str, Any]
     capture_assessment: Dict[str, Any]
     eligible_for_longitudinal_comparison: bool
+    # Provenance for every concrete product recommendation the routine
+    # actually carries -- the exact shape
+    # app.db.analysis_repository.commit_analysis_result() needs for its
+    # analysis_product_recommendations rows (Part VI). Already fully
+    # embedded, per-step, inside `plan` too (that's what /analyze's
+    # JSON response reads) -- this is the same data, flattened, for a
+    # caller (AnalysisExecutionService) that needs to persist it as
+    # its own rows rather than read it back out of `plan`.
+    product_recommendations: List[Dict[str, Any]] = field(default_factory=list)
+
+
+async def compute_analysis(
+    pool: asyncpg.Pool,
+    user_id: UUID,
+    image_bytes: bytes,
+    *,
+    pipeline: FacialAnalysisPipeline,
+    scorer: FacialScorer,
+    plan_service: PlanService,
+    product_matching_service: ProductMatchingService,
+    safety_engine: SafetyEngine,
+    cv_executor: Optional[Executor] = None,
+) -> AnalysisResult:
+    """The quota-independent core of a facial analysis: raw image bytes
+    in, CV -> scoring -> abstract plan -> product matching -> routine
+    safety out. No reservation, no consumption, no HTTP exceptions, no
+    consent check -- every one of those is a *caller* concern (a
+    synchronous request's reservation lifecycle in `perform_analysis`
+    below, or the async worker's, which reuses a reservation
+    AnalysisSubmissionService already created). Never call this twice
+    for the same logical request without knowing which caller owns
+    that request's quota slot.
+
+    NoFaceDetectedError / CaptureQualityFailedError / ValueError from
+    `pipeline.analyze()` propagate unchanged -- all three were already
+    framework-agnostic exceptions before this module existed.
+
+    cv_executor (Part VI heartbeat-starvation fix): pipeline.analyze()
+    is a long, synchronous, CPU-bound MediaPipe/OpenCV call. Left as a
+    direct call on the current coroutine's thread, it blocks whatever
+    event loop that coroutine is running on for its entire duration --
+    harmless for `perform_analysis`'s synchronous HTTP request (nothing
+    else on that request depends on the loop staying free), but fatal
+    for AnalysisExecutionService's async worker, whose visibility
+    heartbeat is itself just another task on that same loop: a blocked
+    loop means a heartbeat that can't fire, which means a second worker
+    can reclaim the "stalled" job out from under the first while it is
+    still very much alive and working. Passing an Executor here runs
+    pipeline.analyze() via `loop.run_in_executor()` instead, freeing the
+    event loop (and its heartbeat) for the call's duration. Left as
+    `None` (the default, and what `perform_analysis` below always uses)
+    the call runs exactly as it always did -- direct, on this coroutine.
+    Whether that executor may safely run more than one call concurrently,
+    or from more than one thread over its lifetime, is the caller's
+    concern, not this function's -- see
+    AnalysisExecutionService.__init__ for why the worker path uses a
+    dedicated single-thread executor rather than the default thread
+    pool."""
+    from app.db.profile_repository import get_profile
+    from app.observability import events as observability_events
+
+    if cv_executor is not None:
+        extraction_result = await asyncio.get_running_loop().run_in_executor(
+            cv_executor, pipeline.analyze, image_bytes
+        )
+    else:
+        extraction_result = pipeline.analyze(image_bytes)
+
+    metric_results = extraction_result["metric_results"]
+    capture_assessment = extraction_result["capture_assessment"]
+    eligible_for_longitudinal_comparison = extraction_result["eligible_for_longitudinal_comparison"]
+
+    observability_events.capture_quality(analysis_id=None, status=capture_assessment.quality_status.value)
+    for metric_name, mr in metric_results.items():
+        if mr.status == "ABSTAINED":
+            observability_events.metric_abstention(analysis_id=None, metric_name=metric_name)
+
+    # user_id is real, from a verified access token (sync path) or an
+    # already-durable analysis_requests.user_id (async path) by the
+    # time this is called. The rest is a real persisted profile
+    # (app/db/profile_repository.py) -- falling back to the documented
+    # DEFAULT_PROFILE only if the user has never set one.
+    profile = await get_profile(pool, user_id)
+    user_profile = {"user_id": str(user_id), **profile}
+
+    analysis = scorer.compute_scores(metric_results, capture_quality=capture_assessment.overall_quality)
+    plan = plan_service.generate_plan(
+        analysis["scores"], analysis["insights"], user_profile, capture_assessment.overall_quality
+    )
+
+    # Part I, Phase 11 (the P0 closure): resolve the abstract plan's
+    # categories to real catalog products, each independently
+    # evaluated through SafetyEngine.evaluate_product_formulation()
+    # and routine-level safety -- never produced from category-level
+    # evaluate_offer() alone. has_unresolved_*_constraint flags come
+    # from the normalized table (app/db/user_constraint_repository.py),
+    # the actual source of truth for per-ingredient resolution;
+    # user_profile's own allergies/avoid_ingredients/is_pregnant/
+    # is_nursing/has_sensitive_skin already match the exact shape
+    # SafetyEngine's constraints dict expects, so it's reused
+    # directly rather than rebuilt.
+    unresolved_flags = await get_unresolved_constraint_flags(pool, user_id)
+    recommendation_constraints = {**user_profile, **unresolved_flags}
+    recommendation_result = await apply_product_matching_and_routine_safety(
+        pool, plan, recommendation_constraints,
+        product_matching_service=product_matching_service,
+        safety_engine=safety_engine,
+    )
+
+    return AnalysisResult(
+        plan=plan,
+        scores=analysis["scores"],
+        metric_results=analysis["metric_results"],
+        capture_assessment=capture_assessment.to_dict(),
+        eligible_for_longitudinal_comparison=eligible_for_longitudinal_comparison,
+        product_recommendations=[rec.to_dict() for rec in recommendation_result.product_recommendations],
+    )
 
 
 async def perform_analysis(
@@ -97,9 +243,10 @@ async def perform_analysis(
     scorer: FacialScorer,
     plan_service: PlanService,
     usage_policy_service: UsagePolicyService,
+    product_matching_service: ProductMatchingService,
+    safety_engine: SafetyEngine,
 ) -> AnalysisResult:
     from app.db.consent_repository import REQUIRED_CONSENT_TYPE, REQUIRED_POLICY_VERSION, has_valid_consent
-    from app.db.profile_repository import get_profile
 
     user_uuid = UUID(request.user_id)
 
@@ -114,33 +261,24 @@ async def perform_analysis(
     # analysis proceed again for a replay of an already-CONSUMED
     # request_id is deliberate -- the caller asked for the same
     # logical request's *result*, not a second billable unit of it.
+    #
+    # This is the SYNCHRONOUS path's own reservation, owned start to
+    # finish by this function -- distinct from the async path, where
+    # AnalysisExecutionService reuses a reservation
+    # AnalysisSubmissionService already created and never calls
+    # reserve_analysis() itself. See compute_analysis()'s docstring.
     reservation = await usage_policy_service.reserve_analysis(user_uuid, request.request_id)
 
     try:
         try:
-            image_bytes = base64.b64decode(request.image_base64)
+            image_bytes = base64.b64decode(request.image_base64, validate=True)
         except Exception as e:
             raise InvalidImageError("image_base64 is not valid base64") from e
 
-        # NoFaceDetectedError / CaptureQualityFailedError / ValueError
-        # from here propagate unchanged -- all three were already
-        # framework-agnostic exceptions before this module existed.
-        extraction_result = pipeline.analyze(image_bytes)
-
-        metric_results = extraction_result["metric_results"]
-        capture_assessment = extraction_result["capture_assessment"]
-        eligible_for_longitudinal_comparison = extraction_result["eligible_for_longitudinal_comparison"]
-
-        # user_id is real, from a verified access token by the time
-        # this is called. The rest is a real persisted profile
-        # (app/db/profile_repository.py) -- falling back to the
-        # documented DEFAULT_PROFILE only if the user has never set one.
-        profile = await get_profile(pool, user_uuid)
-        user_profile = {"user_id": request.user_id, **profile}
-
-        analysis = scorer.compute_scores(metric_results, capture_quality=capture_assessment.overall_quality)
-        plan = plan_service.generate_plan(
-            analysis["scores"], analysis["insights"], user_profile, capture_assessment.overall_quality
+        result = await compute_analysis(
+            pool, user_uuid, image_bytes,
+            pipeline=pipeline, scorer=scorer, plan_service=plan_service,
+            product_matching_service=product_matching_service, safety_engine=safety_engine,
         )
     except Exception:
         # A legitimate failure anywhere past the reservation (bad
@@ -156,10 +294,4 @@ async def perform_analysis(
 
     await usage_policy_service.consume_reservation(user_uuid, reservation.id)
 
-    return AnalysisResult(
-        plan=plan,
-        scores=analysis["scores"],
-        metric_results=analysis["metric_results"],
-        capture_assessment=capture_assessment.to_dict(),
-        eligible_for_longitudinal_comparison=eligible_for_longitudinal_comparison,
-    )
+    return result

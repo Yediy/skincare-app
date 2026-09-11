@@ -1,6 +1,7 @@
 import base64
 import logging
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import List, Literal
 
@@ -9,9 +10,18 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
 
+from app.api.v2.analyses import router as analyses_v2_router
 from app.config import settings
 from app.cv.pipeline import FacialAnalysisPipeline, NoFaceDetectedError, CaptureQualityFailedError
-from app.domain.entitlement import FreeTierEntitlementService, QuotaExceededError, UsagePolicyService
+from app.domain.entitlement import (
+    AnalysisAlreadyCompletedError,
+    AnalysisInProgressError,
+    FreeTierEntitlementService,
+    QuotaExceededError,
+    UsagePolicyService,
+)
+from app.domain.product_matching_service import ProductMatchingService
+from app.domain.safety_engine import SafetyEngine
 from app.ml.scorer import FacialScorer
 from app.services.plan_service import PlanService
 from app.db.connection import init_db_pool, close_db_pool
@@ -30,6 +40,23 @@ from app.security.tokens import create_access_token, generate_refresh_token, has
 logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO))
 logger = logging.getLogger(__name__)
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Replaces the deprecated `@app.on_event("startup"/"shutdown")`
+    handlers -- same resource initialization/cleanup, just FastAPI's
+    current lifespan protocol instead. tests/conftest.py's app_instance
+    fixture never triggers this either way (it wires db_connection._pool/
+    redis_client._redis_client directly, same as it did before this
+    change), so this is a pure mechanical migration, not a behavior
+    change for anything under test."""
+    await init_db_pool()
+    await init_redis()
+    yield
+    await close_db_pool()
+    await close_redis()
+
+
 app = FastAPI(
     title="Skincare Priority Engine API",
     version="0.1.0",
@@ -39,6 +66,7 @@ app = FastAPI(
     docs_url="/docs" if settings.enable_docs else None,
     redoc_url="/redoc" if settings.enable_docs else None,
     openapi_url="/openapi.json" if settings.enable_docs else None,
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -55,17 +83,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-@app.on_event("startup")
-async def startup_event():
-    await init_db_pool()
-    await init_redis()
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    await close_db_pool()
-    await close_redis()
+app.include_router(analyses_v2_router)
 
 
 # Constructed once at import time, not per-request -- the MediaPipe model
@@ -80,6 +98,12 @@ plan_service = PlanService()
 # above; UsagePolicyService itself is constructed per-request in
 # /analyze since it wraps the request-time db pool.
 entitlement_service = FreeTierEntitlementService()
+# Stateless -- safe as a shared singleton, same as pipeline/scorer/
+# plan_service above. ProductMatchingService itself is constructed
+# per-request (it wraps the request-time db pool), sharing this same
+# engine instance so formulation-level and routine-level evaluation
+# never disagree about rules_version/behavior mid-request.
+safety_engine = SafetyEngine()
 
 
 @app.get("/health/live")
@@ -158,6 +182,7 @@ async def analyze(request: AnalyzeRequest, user_id: str = Depends(rate_limit_by_
 
     pool = get_db_pool()
     usage_policy_service = UsagePolicyService(pool, entitlement_service)
+    product_matching_service = ProductMatchingService(pool, safety_engine)
 
     try:
         result = await perform_analysis(
@@ -171,6 +196,8 @@ async def analyze(request: AnalyzeRequest, user_id: str = Depends(rate_limit_by_
             scorer=scorer,
             plan_service=plan_service,
             usage_policy_service=usage_policy_service,
+            product_matching_service=product_matching_service,
+            safety_engine=safety_engine,
         )
     except ConsentRequiredError as e:
         raise HTTPException(
@@ -180,6 +207,16 @@ async def analyze(request: AnalyzeRequest, user_id: str = Depends(rate_limit_by_
         )
     except QuotaExceededError as e:
         raise HTTPException(status_code=429, detail=str(e))
+    except AnalysisAlreadyCompletedError as e:
+        raise HTTPException(
+            status_code=409,
+            detail="This request_id already completed. Retry with a new request_id for a new analysis.",
+        )
+    except AnalysisInProgressError as e:
+        raise HTTPException(
+            status_code=409,
+            detail="This request_id is already being processed. Wait for it to finish, or retry with a new request_id.",
+        )
     except InvalidImageError:
         raise HTTPException(status_code=422, detail="image_base64 is not valid base64")
     except NoFaceDetectedError:

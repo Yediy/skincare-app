@@ -6,8 +6,13 @@ consent, profile, authenticated /analyze through the real CV pipeline,
 real scorer, real SafetyEngine, real PlanService, against a real
 database. There is no `plans`/`analysis_results` persistence table in
 this repository, so "plan persisted" is not (and cannot be) tested --
-the plan is returned in the response only. There is no offer/product
-catalog, so "offers matched" is not tested either.
+the plan is returned in the response only. A real, normalized product
+catalog now exists, and /analyze does attach real formulation-level
+product matches to the plan (see
+tests/integration/test_recommendation_pipeline_integration.py, added
+in the production-recommendation pass) -- not duplicated here, since
+this file predates that catalog and stays focused on the CV/scoring/
+capture-assessment path it was written to cover.
 
 Scenarios 2 (excessive yaw), 3 (poor lighting -> abstain), and 8
 (abstained metric can't create a concern) are explicitly marked
