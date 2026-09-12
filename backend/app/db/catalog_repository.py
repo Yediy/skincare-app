@@ -100,13 +100,21 @@ async def list_current_active_formulations_by_category(
     Only ever returns: active products, current formulations, exactly
     the requested market_or_region (never a different specific region
     -- global fallback is the caller's own explicit second call with
-    market_or_region='global', never silently substituted here), and
-    COMPLETE ingredient data (filtered here as an efficiency measure --
-    evaluate_product_formulation() independently re-enforces this same
-    rule regardless, so this is defense in depth, not the only
-    mechanism). Ordered by verification freshness, most recent first,
-    with product_id as a final deterministic tie-break for anything
-    with the same (or no) verified_at."""
+    market_or_region='global', never silently substituted here),
+    COMPLETE ingredient data, and (catalog-ingestion-admin pass,
+    migration 37c88143a9ed) `publication_status = 'PUBLISHED'` --
+    filtered here as an efficiency measure, same posture as the
+    pre-existing ingredient_data_status filter: evaluate_product_
+    formulation() has no notion of publication_status at all (that
+    gate belongs entirely to *discovery*, not to safety evaluation
+    itself -- see CATALOG_INGESTION_ARCHITECTURE.md's "INGESTED !=
+    VERIFIED != PUBLISHED != SAFE FOR EVERY USER" invariant), so this
+    query is the only place a DRAFT/NEEDS_REVIEW/VERIFIED-but-not-yet-
+    PUBLISHED/REJECTED/SUPERSEDED formulation is excluded from ever
+    reaching a user's recommendations at all. Ordered by verification
+    freshness, most recent first, with product_id as a final
+    deterministic tie-break for anything with the same (or no)
+    verified_at."""
     rows = await pool.fetch(
         """
         SELECT f.id, f.product_id, f.market_or_region, f.verified_at, f.ingredient_data_status,
@@ -119,6 +127,7 @@ async def list_current_active_formulations_by_category(
           AND f.is_current = true
           AND f.market_or_region = $2
           AND f.ingredient_data_status = 'COMPLETE'
+          AND f.publication_status = 'PUBLISHED'
         ORDER BY f.verified_at DESC NULLS LAST, f.product_id
         """,
         category, market_or_region,

@@ -8,6 +8,7 @@ logger = logging.getLogger(__name__)
 
 _pool: Optional[asyncpg.Pool] = None
 _billing_pool: Optional[asyncpg.Pool] = None
+_catalog_admin_pool: Optional[asyncpg.Pool] = None
 
 
 async def init_db_pool(dsn: Optional[str] = None) -> asyncpg.Pool:
@@ -97,3 +98,39 @@ def get_billing_db_pool_if_initialized() -> Optional[asyncpg.Pool]:
     startup bug as "configured but unreachable". Used by /health/ready,
     which needs to tell those two cases apart."""
     return _billing_pool
+
+
+async def init_catalog_admin_db_pool(dsn: Optional[str] = None) -> asyncpg.Pool:
+    """Separate pool connected as the dedicated `skincare_catalog_admin`
+    role (migration 13c1fff1867e), never the ordinary `skincare_app`
+    role `_pool` above connects as. Only ever used by
+    `app/catalog_admin` (the ingestion/administration CLI) -- no HTTP
+    route in this pass initializes or touches this pool, matching
+    CATALOG_INGESTION_ARCHITECTURE.md's "admin surface: CLI first"
+    scope decision."""
+    global _catalog_admin_pool
+    if _catalog_admin_pool is None:
+        _catalog_admin_pool = await asyncpg.create_pool(
+            dsn=dsn or settings.catalog_admin_database_url,
+            min_size=1,
+            max_size=settings.db_pool_max_size,
+            timeout=settings.db_pool_connect_timeout_seconds,
+            command_timeout=settings.db_pool_command_timeout_seconds,
+            server_settings={"application_name": "skincare-app-catalog-admin"},
+        )
+        logger.info("Catalog admin database pool initialized")
+    return _catalog_admin_pool
+
+
+async def close_catalog_admin_db_pool():
+    global _catalog_admin_pool
+    if _catalog_admin_pool is not None:
+        await _catalog_admin_pool.close()
+        _catalog_admin_pool = None
+        logger.info("Catalog admin database pool closed")
+
+
+def get_catalog_admin_db_pool() -> asyncpg.Pool:
+    if _catalog_admin_pool is None:
+        raise RuntimeError("Catalog admin database pool not initialized -- call init_catalog_admin_db_pool() first")
+    return _catalog_admin_pool

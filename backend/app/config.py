@@ -28,6 +28,15 @@ _DEV_ONLY_DATABASE_URL_MARKERS = (
     # by copy-paste even though the stronger NOLOGIN-role design
     # already eliminates its production use.
     "skincare_billing_dev_only",
+    # `skincare_catalog_admin` (migration 13c1fff1867e) is NOLOGIN from
+    # the moment it's created -- the billing pass's own lesson (NOLOGIN
+    # + a separately-provisioned runtime login) applied from day one
+    # instead of repeated as a mistake first. Same defense-in-depth
+    # reasoning as skincare_billing_dev_only above: this is the
+    # test/CI-only password tests/conftest.py's skincare_catalog_runtime
+    # role uses, kept as a rejected marker so it can never leak into a
+    # production CATALOG_ADMIN_DATABASE_URL by copy-paste.
+    "skincare_catalog_dev_only",
 )
 _PLACEHOLDER_SECRET_VALUES = {
     "",
@@ -167,6 +176,26 @@ class Settings(BaseSettings):
     revenuecat_free_tier_allowance: int = 3
     revenuecat_paid_tier_allowance: int = 100
 
+    # Catalog ingestion/administration (see
+    # CATALOG_INGESTION_ARCHITECTURE.md). Defaults False/unset -- the
+    # CLI admin tooling (app/catalog_admin) simply refuses to connect
+    # without this configured; unlike revenuecat_billing_enabled, no
+    # HTTP route or runtime behavior is gated by this flag in this pass
+    # (catalog administration is CLI-only, per this pass's own "admin
+    # surface: CLI first" scope decision) -- it exists purely so
+    # production config validation has something to check before an
+    # operator ever runs the CLI against a production database.
+    catalog_admin_enabled: bool = False
+    # Dedicated connection string for the catalog-writer role
+    # (`skincare_catalog_admin`, migration 13c1fff1867e) -- never the
+    # ordinary `skincare_app` DSN, and never `skincare_catalog_admin`
+    # itself (that role is NOLOGIN -- see that migration's docstring).
+    # Required whenever CATALOG_ADMIN_ENABLED=true in production; the
+    # CLI connects through this DSN instead of settings.database_url,
+    # since the ordinary skincare_app role cannot write any catalog
+    # table at all.
+    catalog_admin_database_url: Optional[str] = None
+
     @property
     def is_production(self) -> bool:
         return self.environment.lower() == "production"
@@ -247,6 +276,23 @@ class Settings(BaseSettings):
                 for marker in _DEV_ONLY_DATABASE_URL_MARKERS:
                     if marker in lowered_billing_url:
                         errors.append(f"REVENUECAT_BILLING_DATABASE_URL contains a dev/CI-only marker ({marker!r})")
+
+        if self.catalog_admin_enabled:
+            if not self.catalog_admin_database_url:
+                errors.append(
+                    "CATALOG_ADMIN_ENABLED=true but CATALOG_ADMIN_DATABASE_URL is unset -- "
+                    "catalog mutation must not fall back to the ordinary runtime DATABASE_URL"
+                )
+            elif self.catalog_admin_database_url.strip() == self.database_url.strip():
+                errors.append(
+                    "CATALOG_ADMIN_DATABASE_URL is identical to DATABASE_URL -- it must "
+                    "connect as the dedicated skincare_catalog_admin role, not the ordinary runtime role"
+                )
+            else:
+                lowered_catalog_url = self.catalog_admin_database_url.lower()
+                for marker in _DEV_ONLY_DATABASE_URL_MARKERS:
+                    if marker in lowered_catalog_url:
+                        errors.append(f"CATALOG_ADMIN_DATABASE_URL contains a dev/CI-only marker ({marker!r})")
 
         if errors:
             raise ValueError(

@@ -24,7 +24,7 @@ async def test_redis_connection_can_initialize(redis_client):
 async def test_migrations_reach_head(db_pool):
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT version_num FROM alembic_version")
-    assert row["version_num"] == "1367b870bdcd"
+    assert row["version_num"] == "154080b29153"
 
 
 async def test_lifespan_initializes_and_closes_the_db_pool():

@@ -81,6 +81,16 @@ Now real, not unused. `app/queue/` (migration `2e77bc462867`, plus `9db3e5856a79
 **How is it restored?** No action needed from this application once RevenueCat is reachable again — queued webhook deliveries resume, and a future reconciliation run (see `OPEN_ENGINEERING_ITEMS.md` — not yet scheduled automatically) can correct any drift accumulated during the outage.
 **Blast radius:** Entitlement-projection freshness only, bounded by however long RevenueCat itself is unreachable — never analysis availability.
 
+## Catalog admin CLI / `skincare_catalog_admin` database connection
+
+**What happens if this disappears?** Nothing live-facing — `app/catalog_admin` is an operator-invoked, one-shot CLI process, never a long-running service in the request or worker path (`CATALOG_INGESTION_ARCHITECTURE.md`). If `skincare_catalog_admin`'s connection is unreachable when the CLI is invoked, that one invocation fails immediately (a connection error, or `init_catalog_admin_db_pool()` itself failing) — there is no queued work, no background loop, and no user-facing endpoint that depends on this role or this CLI being available at any given moment.
+
+**Can users still log in?** Yes — entirely unrelated.
+**Can analysis continue?** Yes — `ProductMatchingService`/`SafetyEngine` read the catalog through the ordinary `skincare_app` pool, never through `skincare_catalog_admin`.
+**Can data be lost?** No — every catalog-admin write (`publish()`, review resolutions) is one all-or-nothing transaction; an interrupted CLI invocation rolls back cleanly, same as any other transactional failure in this codebase. Immutable `raw_payload` evidence, once durably received, is never at risk from anything catalog-admin-side failing later.
+**How is it restored?** Re-run the CLI command once the database (or, if it's specifically down, the `skincare_catalog_admin`/`skincare_catalog_runtime` role) is reachable again — idempotent by design (Section 9: the same batch/record/publish re-attempted produces the same logical outcome, never a duplicate) and, since independent review's fourth blocker on this branch, idempotent under real *concurrent* re-attempts too, not just sequential retries — `publish()` locks the import record before any status decision, so a retry racing an in-flight original attempt for the same record safely resolves to the same single logical publication rather than a duplicate formulation.
+**Blast radius:** Whichever single CLI invocation was in flight, and only for as long as an operator is actively trying to ingest/publish at that moment — never live user traffic.
+
 ## Cloudflare (edge/DNS/proxy, if used in front of the API)
 
 **What happens if this disappears?** Total outage from the public internet's perspective, regardless of how healthy every component behind it is — this is the single point of failure the whole topology funnels through (`PRODUCTION_ARCHITECTURE.md`'s target topology diagram). Mitigations (multi-provider DNS failover, etc.) are a launch-topology decision, not an application-code one, and are out of scope for this document.
