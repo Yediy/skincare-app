@@ -126,6 +126,21 @@ BILLING_RUNTIME_TEST_PASSWORD = "skincare_billing_dev_only"
 BILLING_DATABASE_URL = (
     f"postgresql://{BILLING_RUNTIME_ROLE}:{BILLING_RUNTIME_TEST_PASSWORD}@localhost:5432/skincare_test"
 )
+# The dedicated catalog-ingestion/administration role (migration
+# 13c1fff1867e) -- the only role permitted to write any catalog
+# staging/provenance/audit table, or INSERT/UPDATE brands/products/
+# product_formulations/product_skus/ingredients/ingredient_aliases/
+# formulation_ingredients. Created NOLOGIN from the start (unlike
+# skincare_billing's own history, this role never went through a
+# LOGIN-with-hardcoded-password phase -- see that migration's
+# docstring) -- what tests actually connect through is
+# `skincare_catalog_runtime`, provisioned below exactly like
+# `skincare_billing_runtime` above.
+CATALOG_ADMIN_RUNTIME_ROLE = "skincare_catalog_runtime"
+CATALOG_ADMIN_RUNTIME_TEST_PASSWORD = "skincare_catalog_dev_only"
+CATALOG_ADMIN_DATABASE_URL = (
+    f"postgresql://{CATALOG_ADMIN_RUNTIME_ROLE}:{CATALOG_ADMIN_RUNTIME_TEST_PASSWORD}@localhost:5432/skincare_test"
+)
 TEST_REDIS_URL = os.environ["REDIS_URL"]
 
 
@@ -176,14 +191,42 @@ def _provision_test_billing_runtime_role():
         conn.close()
 
 
+def _provision_test_catalog_admin_runtime_role():
+    """Same pattern as _provision_test_billing_runtime_role above, for
+    the catalog-ingestion/administration role -- a test-only LOGIN
+    role granted membership in the NOLOGIN, migration-managed
+    `skincare_catalog_admin` privilege role. See that migration's
+    (13c1fff1867e) docstring."""
+    conn = psycopg2.connect(TEST_DATABASE_URL)
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{CATALOG_ADMIN_RUNTIME_ROLE}') THEN
+                        CREATE ROLE {CATALOG_ADMIN_RUNTIME_ROLE} WITH LOGIN PASSWORD '{CATALOG_ADMIN_RUNTIME_TEST_PASSWORD}'
+                            NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+                    END IF;
+                END
+                $$;
+                """
+            )
+            cur.execute(f"GRANT skincare_catalog_admin TO {CATALOG_ADMIN_RUNTIME_ROLE}")
+    finally:
+        conn.close()
+
+
 @pytest.fixture(scope="session", autouse=True)
 def migrated_test_database():
     """Runs the real Alembic migration chain against the test database
     once per test session -- proves migrations reach head, and gives
     every test a real, correctly-shaped schema (not a hand-rolled one).
-    Then provisions the test-only billing runtime login (see
-    _provision_test_billing_runtime_role) -- deliberately after
-    migrations, deliberately not itself a migration.
+    Then provisions the test-only billing and catalog-admin runtime
+    logins (see _provision_test_billing_runtime_role /
+    _provision_test_catalog_admin_runtime_role) -- deliberately after
+    migrations, deliberately not themselves migrations.
 
     Waits (bounded, test-infra-only) for Postgres and Redis to accept
     connections first -- a cold-started local Postgres/Redis can take
@@ -192,6 +235,7 @@ def migrated_test_database():
     _wait_for_test_infra_ready()
     _run_migrations_to_head()
     _provision_test_billing_runtime_role()
+    _provision_test_catalog_admin_runtime_role()
     yield
 
 
@@ -221,6 +265,44 @@ async def billing_db_pool(migrated_test_database):
     pool = await asyncpg.create_pool(dsn=BILLING_DATABASE_URL, min_size=1, max_size=5)
     yield pool
     await pool.close()
+
+
+@pytest_asyncio.fixture
+async def catalog_admin_db_pool(migrated_test_database):
+    """The dedicated skincare_catalog_admin role's own pool -- see
+    CATALOG_ADMIN_DATABASE_URL above. Separate from db_pool (superuser)
+    and app_db_pool (which has no write grant on any catalog table at
+    all)."""
+    pool = await asyncpg.create_pool(dsn=CATALOG_ADMIN_DATABASE_URL, min_size=1, max_size=5)
+    yield pool
+    await pool.close()
+
+
+@pytest_asyncio.fixture
+async def clean_catalog_ingestion(db_pool):
+    """Truncates the catalog-ingestion staging/review/provenance/audit
+    tables (migration 2de8380d3618) *and* the core production catalog
+    tables before the test runs -- tests using this fixture are the
+    sole owner of their own brands/products/ingredients (they call
+    CatalogPublicationService directly, unlike synthetic_catalog's
+    hand-seeded fixture data), so both truncate together, in one
+    statement, so the CASCADE relationship between them (import
+    records/provenance reference product_formulations) never fights
+    truncation order. Self-contained, same convention as
+    `synthetic_catalog`'s own truncate (catalog-family tables are
+    deliberately outside `clean_database`'s TRUNCATE list -- see that
+    fixture's docstring): tests that need a clean ingestion slate
+    depend on this fixture explicitly rather than relying on
+    unique-suffix-per-test naming."""
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "TRUNCATE TABLE catalog_audit_log, catalog_formulation_provenance, "
+            "catalog_review_items, catalog_import_records, catalog_import_batches, "
+            "catalog_sources, ingredient_interactions, ingredient_rules, "
+            "formulation_ingredients, ingredient_aliases, ingredients, "
+            "product_skus, product_formulations, products, brands "
+            "RESTART IDENTITY CASCADE"
+        )
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -396,8 +478,9 @@ async def synthetic_catalog(db_pool, migrated_test_database):
             formulation_id = await conn.fetchval(
                 """
                 INSERT INTO product_formulations
-                    (product_id, version, source_type, verified_at, ingredient_data_status, market_or_region)
-                VALUES ($1, '1', 'manufacturer_disclosure', now(), $2, $3)
+                    (product_id, version, source_type, verified_at, ingredient_data_status,
+                     market_or_region, publication_status)
+                VALUES ($1, '1', 'manufacturer_disclosure', now(), $2, $3, 'PUBLISHED')
                 RETURNING id
                 """,
                 product_id, ingredient_data_status, market_or_region,

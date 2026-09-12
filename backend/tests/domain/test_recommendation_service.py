@@ -41,8 +41,9 @@ async def _add_formulation_with_ingredient_rule(
         formulation_id = await conn.fetchval(
             """
             INSERT INTO product_formulations
-                (product_id, version, source_type, verified_at, ingredient_data_status, market_or_region)
-            VALUES ($1, '1', 'manufacturer_disclosure', now(), 'COMPLETE', 'global')
+                (product_id, version, source_type, verified_at, ingredient_data_status,
+                 market_or_region, publication_status)
+            VALUES ($1, '1', 'manufacturer_disclosure', now(), 'COMPLETE', 'global', 'PUBLISHED')
             RETURNING id
             """,
             product_id,
@@ -102,8 +103,9 @@ async def _add_formulation_with_internal_exclude_combination(db_pool, brand_id, 
         formulation_id = await conn.fetchval(
             """
             INSERT INTO product_formulations
-                (product_id, version, source_type, verified_at, ingredient_data_status, market_or_region)
-            VALUES ($1, '1', 'manufacturer_disclosure', now(), 'COMPLETE', 'global')
+                (product_id, version, source_type, verified_at, ingredient_data_status,
+                 market_or_region, publication_status)
+            VALUES ($1, '1', 'manufacturer_disclosure', now(), 'COMPLETE', 'global', 'PUBLISHED')
             RETURNING id
             """,
             product_id,

@@ -73,6 +73,14 @@ security. What they do have is a hard read/write split, enforced by
   fixture, seeded via `db_pool`), the same test-owner-seeds/
   runtime-role-reads split every other RLS-protected table in this
   repository already uses.
+- **Superseded by the catalog-ingestion-admin pass:** a real write path
+  now exists — a dedicated `skincare_catalog_admin` database role
+  (still no HTTP route; CLI-only, `python -m app.catalog_admin`) can
+  `INSERT`/`UPDATE` these same tables, plus `product_formulations`'
+  new `publication_status` column. `skincare_app` itself is
+  unaffected — still `SELECT`-only on every table listed here. See
+  `CATALOG_INGESTION_ARCHITECTURE.md` for the full ingestion/
+  publication pipeline and its own privilege-boundary tests.
 
 ## Ingredient resolution — `VERIFIED_IMPLEMENTED`
 

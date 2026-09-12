@@ -150,3 +150,64 @@ def test_development_config_unaffected_by_revenuecat_billing_flag():
         revenuecat_billing_enabled=True,
     )
     assert not settings.is_production
+
+
+# ---------------------------------------------------------------------------
+# Catalog ingestion/administration CLI (CATALOG_INGESTION_ARCHITECTURE.md) --
+# same validation shape as revenuecat_billing above, one dedicated DSN.
+# ---------------------------------------------------------------------------
+
+
+def test_production_rejects_catalog_admin_enabled_without_database_url():
+    with pytest.raises(ValueError) as exc_info:
+        Settings(_env_file=None, **_SAFE_PROD_KWARGS, catalog_admin_enabled=True)
+    assert "CATALOG_ADMIN_DATABASE_URL" in str(exc_info.value)
+
+
+def test_production_accepts_catalog_admin_enabled_with_database_url_configured():
+    settings = Settings(
+        _env_file=None, **_SAFE_PROD_KWARGS, catalog_admin_enabled=True,
+        catalog_admin_database_url="postgresql://skincare_catalog_runtime:REDACTED@db.internal.example.com:5432/skincare",
+    )
+    assert settings.catalog_admin_enabled is True
+
+
+def test_production_rejects_catalog_admin_database_url_identical_to_database_url():
+    with pytest.raises(ValueError):
+        Settings(
+            _env_file=None, **_SAFE_PROD_KWARGS, catalog_admin_enabled=True,
+            catalog_admin_database_url=_SAFE_PROD_KWARGS["database_url"],
+        )
+
+
+def test_production_rejects_catalog_admin_database_url_with_dev_marker():
+    with pytest.raises(ValueError):
+        Settings(
+            _env_file=None, **_SAFE_PROD_KWARGS, catalog_admin_enabled=True,
+            catalog_admin_database_url="postgresql://skincare_catalog_runtime:skincare_catalog_dev_only@localhost:5432/skincare",
+        )
+
+
+def test_production_rejects_known_dev_catalog_credential_even_off_localhost():
+    with pytest.raises(ValueError) as exc_info:
+        Settings(
+            _env_file=None, **_SAFE_PROD_KWARGS, catalog_admin_enabled=True,
+            catalog_admin_database_url=(
+                "postgresql://skincare_catalog_runtime:skincare_catalog_dev_only@db.internal.example.com:5432/skincare"
+            ),
+        )
+    assert "skincare_catalog_dev_only" in str(exc_info.value)
+
+
+def test_development_config_unaffected_by_catalog_admin_flag():
+    settings = Settings(
+        _env_file=None,
+        environment="development",
+        jwt_secret="",
+        database_url="postgresql://postgres:postgres@localhost:5432/skincare",
+        redis_url="redis://localhost:6379/0",
+        enable_docs=True,
+        allowed_origins=["*"],
+        catalog_admin_enabled=True,
+    )
+    assert not settings.is_production
