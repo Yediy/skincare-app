@@ -123,8 +123,8 @@ def test_production_rejects_known_dev_billing_credential_even_off_localhost():
     """`skincare_billing_dev_only` is rejected as its own marker, not
     merely caught incidentally by the `localhost` check above --
     proven here against a real-looking production host, since
-    `skincare_billing` itself being NOLOGIN (migration 9815eb266923)
-    means this exact literal could otherwise slip through as
+    `skincare_billing` itself being NOLOGIN at head (migration
+    1367b870bdcd) means this exact literal could otherwise slip through as
     plausible-looking runtime-login copy-paste."""
     with pytest.raises(ValueError) as exc_info:
         Settings(

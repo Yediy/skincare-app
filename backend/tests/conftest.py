@@ -99,12 +99,14 @@ APP_DATABASE_URL = "postgresql://skincare_app:skincare_app_dev_only@localhost:54
 # only role permitted to INSERT/UPDATE revenuecat_webhook_events or
 # user_entitlements (and, since migration 4e5cda3a6bb0, the only role
 # permitted to touch job_type='revenuecat_webhook' rows on the shared
-# `jobs` queue). `skincare_billing` itself is NOLOGIN -- a pure
+# `jobs` queue). `9815eb266923` itself creates `skincare_billing` as a
+# LOGIN role with a hardcoded password -- that migration is already
+# merged into master and is deliberately never edited in place (see
+# migration 1367b870bdcd's own docstring for exactly why rewriting an
+# already-applied migration is a real bug, not a style nit). Migration
+# 1367b870bdcd, immediately after, transitions it to NOLOGIN -- a pure
 # privilege/group role, deliberately never a connectable credential,
-# even in this test/CI infrastructure (see that migration's docstring
-# for why: an earlier version of this migration shipped a hardcoded
-# LOGIN password for it, which is exactly the mistake NOLOGIN + a
-# separately-provisioned runtime login avoids). What tests actually
+# even in this test/CI infrastructure. What tests actually
 # connect through is `skincare_billing_runtime` -- a LOGIN role with a
 # test-only password, created below (_provision_test_billing_runtime_
 # role), AFTER migrations run, exactly as BILLING_ARCHITECTURE.md
@@ -137,12 +139,13 @@ def _run_migrations_to_head():
 def _provision_test_billing_runtime_role():
     """Creates the test-only LOGIN role tests actually connect through
     as `skincare_billing`'s runtime credential, and grants it
-    membership in that (NOLOGIN, migration-managed) privilege role --
-    deliberately done here, as a one-off test-infrastructure step after
-    migrations run, not inside any Alembic migration. This is test/CI's
-    equivalent of what a real deployment does outside its own migration
-    tooling (BILLING_ARCHITECTURE.md, migration 9815eb266923's
-    docstring): provision the runtime login with a secret from that
+    membership in that (NOLOGIN at head since migration 1367b870bdcd,
+    migration-managed) privilege role -- deliberately done here, as a
+    one-off test-infrastructure step after migrations run, not inside
+    any Alembic migration. This is test/CI's equivalent of what a real
+    deployment does outside its own migration tooling
+    (BILLING_ARCHITECTURE.md, migration 1367b870bdcd's docstring):
+    provision the runtime login with a secret from that
     environment's own source (here, a hardcoded test-only literal is
     the correct choice -- it's exactly the kind of value
     _DEV_ONLY_DATABASE_URL_MARKERS/_PLACEHOLDER_SECRET_VALUES exist to

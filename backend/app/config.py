@@ -13,8 +13,12 @@ _DEV_ONLY_DATABASE_URL_MARKERS = (
     "127.0.0.1",
     "postgres:postgres@",
     "skincare_app_dev_only",
-    # `skincare_billing` (migration 9815eb266923) is NOLOGIN -- a pure
-    # privilege role, never itself a connectable credential -- so this
+    # `skincare_billing` (created LOGIN by migration 9815eb266923,
+    # transitioned to NOLOGIN by migration 1367b870bdcd -- see that
+    # migration's docstring for why the transition is a separate,
+    # forward-only revision rather than an edit to the first one) is
+    # NOLOGIN at head -- a pure privilege role, never itself a
+    # connectable credential -- so this
     # literal password can never actually be production's own billing
     # credential. Kept as a rejected marker anyway, defense in depth:
     # it is still the test/CI-only password tests/conftest.py's
