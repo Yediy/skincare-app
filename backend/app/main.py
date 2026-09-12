@@ -126,10 +126,21 @@ async def liveness():
 @app.get("/health/ready")
 async def readiness():
     """Can this instance safely serve traffic right now? Checks the
-    two hard dependencies every real request needs. Either check
+    two hard dependencies every real request needs, plus a third,
+    conditional one: when REVENUECAT_BILLING_ENABLED=true, the billing
+    pool (`skincare_billing`/`skincare_billing_runtime`, see
+    BILLING_ARCHITECTURE.md) must also be reachable, or this instance
+    cannot actually process a RevenueCat webhook even though the
+    ordinary database/redis checks below would still pass -- without
+    this, readiness could report "ready" while POST /api/v2/webhooks/
+    revenuecat is guaranteed to fail. Deliberately omitted entirely
+    (not merely skipped/ok) when billing is disabled -- an
+    unconfigured deployment's readiness contract is unchanged from
+    before this check existed, matching every other check's own
+    "either check failing fails the whole probe" posture. Either check
     failing fails the whole probe -- a half-working instance should be
     taken out of rotation, not left serving requests doomed to 503."""
-    from app.db.connection import get_db_pool
+    from app.db.connection import get_billing_db_pool_if_initialized, get_db_pool
 
     checks: dict[str, str] = {}
     healthy = True
@@ -149,6 +160,17 @@ async def readiness():
     except Exception as e:
         checks["redis"] = f"unavailable: {e.__class__.__name__}"
         healthy = False
+
+    if settings.revenuecat_billing_enabled:
+        try:
+            billing_pool = get_billing_db_pool_if_initialized()
+            if billing_pool is None:
+                raise RuntimeError("billing pool not initialized")
+            await billing_pool.fetchval("SELECT 1")
+            checks["billing_database"] = "ok"
+        except Exception as e:
+            checks["billing_database"] = f"unavailable: {e.__class__.__name__}"
+            healthy = False
 
     if not healthy:
         raise HTTPException(status_code=503, detail={"status": "not_ready", "checks": checks})

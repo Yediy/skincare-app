@@ -79,6 +79,18 @@ def _validate_event_fields(event: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
 
 @router.post("/revenuecat", status_code=200)
 async def revenuecat_webhook(request: Request):
+    if not settings.revenuecat_billing_enabled:
+        # Deliberate, not an accident of an uninitialized pool: with
+        # billing disabled, get_billing_db_pool() below has never been
+        # initialized (see app/main.py's lifespan) and would raise a
+        # bare RuntimeError, surfacing as an unintentional 500 that
+        # looks like a bug rather than a policy. 404 (not 503): a
+        # deployment that never turned billing on doesn't have this
+        # endpoint, the same way it wouldn't if the route were never
+        # registered at all -- this isn't a transient failure a caller
+        # should retry.
+        raise HTTPException(status_code=404, detail="RevenueCat billing is not enabled on this deployment")
+
     raw_body = await request.body()
 
     try:

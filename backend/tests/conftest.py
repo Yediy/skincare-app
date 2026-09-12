@@ -97,11 +97,35 @@ TEST_DATABASE_URL = os.environ["DATABASE_URL"]
 APP_DATABASE_URL = "postgresql://skincare_app:skincare_app_dev_only@localhost:5432/skincare_test"
 # The dedicated billing-writer role (migration 9815eb266923) -- the
 # only role permitted to INSERT/UPDATE revenuecat_webhook_events or
-# user_entitlements. Using this, not APP_DATABASE_URL/TEST_DATABASE_URL,
-# for RevenueCat webhook ingestion/worker/reconciliation tests is what
+# user_entitlements (and, since migration 4e5cda3a6bb0, the only role
+# permitted to touch job_type='revenuecat_webhook' rows on the shared
+# `jobs` queue). `9815eb266923` itself creates `skincare_billing` as a
+# LOGIN role with a hardcoded password -- that migration is already
+# merged into master and is deliberately never edited in place (see
+# migration 1367b870bdcd's own docstring for exactly why rewriting an
+# already-applied migration is a real bug, not a style nit). Migration
+# 1367b870bdcd, immediately after, transitions it to NOLOGIN -- a pure
+# privilege/group role, deliberately never a connectable credential,
+# even in this test/CI infrastructure. What tests actually
+# connect through is `skincare_billing_runtime` -- a LOGIN role with a
+# test-only password, created below (_provision_test_billing_runtime_
+# role), AFTER migrations run, exactly as BILLING_ARCHITECTURE.md
+# describes a real deployment provisioning its own runtime login
+# outside the schema migration -- and granted membership in
+# `skincare_billing` so it inherits exactly that role's privileges and
+# no more. Using this, not APP_DATABASE_URL/TEST_DATABASE_URL, for
+# RevenueCat webhook ingestion/worker/reconciliation tests is what
 # proves those paths work under the same restricted, least-privilege
 # role production uses -- see tests/database/test_revenuecat_billing_privilege.py.
-BILLING_DATABASE_URL = "postgresql://skincare_billing:skincare_billing_dev_only@localhost:5432/skincare_test"
+BILLING_RUNTIME_ROLE = "skincare_billing_runtime"
+# Test-only password -- also a literal entry in
+# app/config.py::_DEV_ONLY_DATABASE_URL_MARKERS, so production config
+# validation rejects it outright even though the NOLOGIN design above
+# means it can never actually be `skincare_billing`'s own password.
+BILLING_RUNTIME_TEST_PASSWORD = "skincare_billing_dev_only"
+BILLING_DATABASE_URL = (
+    f"postgresql://{BILLING_RUNTIME_ROLE}:{BILLING_RUNTIME_TEST_PASSWORD}@localhost:5432/skincare_test"
+)
 TEST_REDIS_URL = os.environ["REDIS_URL"]
 
 
@@ -112,11 +136,54 @@ def _run_migrations_to_head():
     command.upgrade(cfg, "head")
 
 
+def _provision_test_billing_runtime_role():
+    """Creates the test-only LOGIN role tests actually connect through
+    as `skincare_billing`'s runtime credential, and grants it
+    membership in that (NOLOGIN at head since migration 1367b870bdcd,
+    migration-managed) privilege role -- deliberately done here, as a
+    one-off test-infrastructure step after migrations run, not inside
+    any Alembic migration. This is test/CI's equivalent of what a real
+    deployment does outside its own migration tooling
+    (BILLING_ARCHITECTURE.md, migration 1367b870bdcd's docstring):
+    provision the runtime login with a secret from that
+    environment's own source (here, a hardcoded test-only literal is
+    the correct choice -- it's exactly the kind of value
+    _DEV_ONLY_DATABASE_URL_MARKERS/_PLACEHOLDER_SECRET_VALUES exist to
+    keep out of production, not a real secret needing a real secret
+    manager), then GRANT the privilege role to it.
+
+    Idempotent (`IF NOT EXISTS`, and re-granting an existing membership
+    is a harmless no-op in Postgres) so it's safe to run every session
+    against a persistent local dev database, not just a fresh CI one."""
+    conn = psycopg2.connect(TEST_DATABASE_URL)
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{BILLING_RUNTIME_ROLE}') THEN
+                        CREATE ROLE {BILLING_RUNTIME_ROLE} WITH LOGIN PASSWORD '{BILLING_RUNTIME_TEST_PASSWORD}'
+                            NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+                    END IF;
+                END
+                $$;
+                """
+            )
+            cur.execute(f"GRANT skincare_billing TO {BILLING_RUNTIME_ROLE}")
+    finally:
+        conn.close()
+
+
 @pytest.fixture(scope="session", autouse=True)
 def migrated_test_database():
     """Runs the real Alembic migration chain against the test database
     once per test session -- proves migrations reach head, and gives
     every test a real, correctly-shaped schema (not a hand-rolled one).
+    Then provisions the test-only billing runtime login (see
+    _provision_test_billing_runtime_role) -- deliberately after
+    migrations, deliberately not itself a migration.
 
     Waits (bounded, test-infra-only) for Postgres and Redis to accept
     connections first -- a cold-started local Postgres/Redis can take
@@ -124,6 +191,7 @@ def migrated_test_database():
     would eat that delay as a real failure instead of test setup."""
     _wait_for_test_infra_ready()
     _run_migrations_to_head()
+    _provision_test_billing_runtime_role()
     yield
 
 

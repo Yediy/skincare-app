@@ -219,9 +219,15 @@ async def test_billing_role_can_correct_an_entitlement_via_reconciliation(db_poo
 
 async def test_billing_role_is_not_a_superuser_or_rls_bypass(db_pool):
     row = await db_pool.fetchrow(
-        "SELECT rolsuper, rolcreatedb, rolcreaterole, rolbypassrls FROM pg_roles WHERE rolname = 'skincare_billing'"
+        "SELECT rolcanlogin, rolsuper, rolcreatedb, rolcreaterole, rolbypassrls "
+        "FROM pg_roles WHERE rolname = 'skincare_billing'"
     )
     assert row is not None
+    # NOLOGIN at head (migration 1367b870bdcd, after 9815eb266923
+    # originally created it LOGIN) -- see
+    # tests/database/test_billing_role_migration_lineage.py for the
+    # migration-lineage regression guard behind this.
+    assert row["rolcanlogin"] is False
     assert row["rolsuper"] is False
     assert row["rolcreatedb"] is False
     assert row["rolcreaterole"] is False

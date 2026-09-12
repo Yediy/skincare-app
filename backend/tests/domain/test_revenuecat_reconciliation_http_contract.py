@@ -85,8 +85,15 @@ async def test_parses_the_real_documented_response_shape():
 
 
 async def test_follows_pagination_via_next_page():
+    """RevenueCat's documented `next_page` form is a path RELATIVE to
+    the API host, e.g. `/v2/projects/.../active_entitlements?starting_
+    after=...` -- never an absolute URL. This is the real contract
+    (see REVENUECAT_INTEGRATION_NOTES.md section 5), not a fabricated
+    one -- a client that only worked against a fabricated absolute
+    `next_page` would break against RevenueCat's real API."""
     page_1_url = f"{REVENUECAT_API_BASE_URL}/projects/{PROJECT_ID}/customers/user-abc-123/active_entitlements"
-    page_2_url = f"{page_1_url}?starting_after=cursor123"
+    relative_next_page = f"/v2/projects/{PROJECT_ID}/customers/user-abc-123/active_entitlements?starting_after=cursor123"
+    page_2_url = f"{REVENUECAT_API_BASE_URL}/projects/{PROJECT_ID}/customers/user-abc-123/active_entitlements?starting_after=cursor123"
     requested_urls = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -94,7 +101,7 @@ async def test_follows_pagination_via_next_page():
         if str(request.url) == page_1_url:
             return httpx.Response(
                 200,
-                json={"object": "list", "items": [{"entitlement_id": "other_ent"}], "next_page": page_2_url},
+                json={"object": "list", "items": [{"entitlement_id": "other_ent"}], "next_page": relative_next_page},
             )
         return httpx.Response(
             200, json={"object": "list", "items": [{"entitlement_id": "premium", "expires_at": None}], "next_page": None},
@@ -110,12 +117,13 @@ async def test_follows_pagination_via_next_page():
 async def test_pagination_is_bounded_by_a_maximum_page_count():
     """The configured entitlement being on a very late page must not
     turn into an infinite/unbounded fetch loop -- a deliberate cap
-    stops it instead."""
+    stops it instead. Each next_page is a distinct, documented-relative
+    path so this never trips loop detection before hitting the cap."""
     call_count = {"n": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
         call_count["n"] += 1
-        next_page = f"{REVENUECAT_API_BASE_URL}/projects/{PROJECT_ID}/customers/user-abc-123/active_entitlements?page={call_count['n']}"
+        next_page = f"/v2/projects/{PROJECT_ID}/customers/user-abc-123/active_entitlements?page={call_count['n']}"
         return httpx.Response(200, json={"object": "list", "items": [], "next_page": next_page})
 
     client = _client(handler)
@@ -123,6 +131,61 @@ async def test_pagination_is_bounded_by_a_maximum_page_count():
 
     assert items == []
     assert call_count["n"] == MAX_ACTIVE_ENTITLEMENT_PAGES
+
+
+async def test_cross_origin_next_page_is_rejected_without_leaking_authorization():
+    """A malformed or compromised response pointing `next_page` at an
+    absolute, cross-origin URL must never be followed -- doing so would
+    carry the RevenueCat Authorization header to an arbitrary host."""
+    page_1_url = f"{REVENUECAT_API_BASE_URL}/projects/{PROJECT_ID}/customers/user-abc-123/active_entitlements"
+    requested = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(str(request.url))
+        assert "evil.example" not in str(request.url)
+        return httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "items": [{"entitlement_id": "other_ent"}],
+                "next_page": "https://evil.example/steal",
+            },
+        )
+
+    client = _client(handler)
+    with pytest.raises(ReconciliationAPIError) as exc_info:
+        await client.get_active_entitlements("user-abc-123")
+
+    assert exc_info.value.error_code == "UNTRUSTED_PAGINATION_ORIGIN"
+    # Only the legitimate first page was ever requested -- the client
+    # never issued a request to evil.example, so no Authorization
+    # header (or anything else) could have reached it.
+    assert requested == [page_1_url]
+
+
+async def test_repeating_next_page_loop_is_detected_and_fails_closed():
+    """A next_page that resolves back to an already-fetched page (a
+    misbehaving or malicious provider response) must not spin forever
+    -- it fails closed with a deliberate error classification instead,
+    independent of the page-count bound."""
+    relative_next_page = f"/v2/projects/{PROJECT_ID}/customers/user-abc-123/active_entitlements"
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        return httpx.Response(
+            200,
+            json={"object": "list", "items": [{"entitlement_id": "other_ent"}], "next_page": relative_next_page},
+        )
+
+    client = _client(handler)
+    with pytest.raises(ReconciliationAPIError) as exc_info:
+        await client.get_active_entitlements("user-abc-123")
+
+    assert exc_info.value.error_code == "PAGINATION_LOOP_DETECTED"
+    # Fetched the looping page exactly once before detecting the repeat
+    # -- not zero (it's a legitimate page) and not unbounded.
+    assert call_count["n"] == 1
 
 
 @pytest.mark.parametrize(

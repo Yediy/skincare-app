@@ -261,11 +261,22 @@ documented resource is a separate, dedicated endpoint:
     "url": "..."
   }
   ```
-  `RevenueCatAPIClient.get_active_entitlements()` follows `next_page`
-  up to a bounded `MAX_ACTIVE_ENTITLEMENT_PAGES` (20) so the configured
-  entitlement can't be falsely declared absent merely because it's on a
-  later page, while still refusing to loop forever on a pathological
-  `next_page` chain. The configured entitlement is "active" iff its
+  `next_page` is documented as a path *relative* to the API host (e.g.
+  `/v2/projects/{project_id}/customers/{customer_id}/active_entitlements
+  ?starting_after=...`), never an absolute URL -- an earlier version of
+  this client's own test suite got this wrong (asserted against a
+  fabricated absolute `next_page`), caught by a second independent
+  review. `RevenueCatAPIClient.get_active_entitlements()` follows
+  `next_page` up to a bounded `MAX_ACTIVE_ENTITLEMENT_PAGES` (20) so the
+  configured entitlement can't be falsely declared absent merely
+  because it's on a later page, while still refusing to loop forever on
+  a pathological `next_page` chain (detected explicitly, independent of
+  the page bound). It also requires every resolved `next_page` to still
+  share this base URL's scheme/host/port, rejecting (fail-closed) any
+  that don't -- since every request carries the RevenueCat API key in
+  an `Authorization` header, a malformed or compromised response must
+  never be able to redirect pagination, and that header, to an
+  arbitrary host. The configured entitlement is "active" iff its
   `entitlement_id` appears in `items`; `expires_at` (milliseconds) is
   the only other field this pass relies on. **Does not** depend on
   fabricated fields the previous version assumed -- `active_entitlements.
