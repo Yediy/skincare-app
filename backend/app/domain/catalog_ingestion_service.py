@@ -29,8 +29,8 @@ from uuid import UUID
 import asyncpg
 
 from app.db import catalog_admin_repository as repo
-from app.db.catalog_repository import resolve_ingredient
 from app.domain.catalog_normalization import MalformedRecordError, normalize_record
+from app.domain.catalog_validation import reconcile_review_state
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +40,6 @@ logger = logging.getLogger(__name__)
 MAX_FILE_BYTES = 50 * 1024 * 1024  # 50MB whole-file ceiling
 MAX_RECORD_BYTES = 2 * 1024 * 1024  # 2MB per individual record
 MAX_RECORDS_PER_BATCH = 5000
-
-_UNVERIFIED_SOURCE_TYPE = "user_submitted_unverified"
 
 
 class ImportRejectedError(Exception):
@@ -137,6 +135,20 @@ class CatalogIngestionService:
                 code="FILE_TOO_LARGE",
             )
 
+        # Small hardening (independent review): an inactive source must
+        # not go on quietly producing new imports -- deactivating a
+        # source is meaningless if import_file() ignores it. Checked
+        # even for dry_run, same as every other rejection above/below --
+        # a preview should reflect the same real outcome, not a more
+        # permissive one. This is deliberately just a status check, not
+        # a source-management system: activation/deactivation itself
+        # happens via `create-source`/direct SQL, not here.
+        source = await repo.get_source_by_id(self._pool, source_id)
+        if source is None:
+            raise ImportRejectedError(f"unknown source_id {source_id}", code="SOURCE_NOT_FOUND")
+        if not source["active"]:
+            raise ImportRejectedError(f"source {source_id} is not active", code="SOURCE_INACTIVE")
+
         raw_records = _parse_raw_records(file_bytes, file_format)
         if not raw_records:
             raise ImportRejectedError("file contains no records", code="EMPTY_FILE")
@@ -194,7 +206,17 @@ class CatalogIngestionService:
                     batch_id=batch["id"], batch_is_new=True, records_total=len(raw_records), records=outcomes,
                 )
 
-    def _normalize_only(self, raw_payload: Dict[str, Any]) -> ImportRecordOutcome:
+    def _normalize_only(self, raw_payload: Any) -> ImportRecordOutcome:
+        if not isinstance(raw_payload, dict):
+            # A syntactically valid JSON value (string/number/bool/
+            # null/array) at record position -- not the malformed-shape
+            # case normalize_record() itself catches (which requires a
+            # dict to even attempt field-level validation), and not
+            # something `.get`/normalization may ever be called on.
+            return ImportRecordOutcome(
+                import_record_id=None, external_record_id="?", status="MALFORMED",
+                validation_errors=["NON_OBJECT_RECORD"],
+            )
         external_record_id = str(raw_payload.get("external_record_id") or "?")
         if len(json.dumps(raw_payload).encode("utf-8")) > MAX_RECORD_BYTES:
             return ImportRecordOutcome(
@@ -213,9 +235,9 @@ class CatalogIngestionService:
         )
 
     async def _ingest_one_raw_record(
-        self, conn: asyncpg.Connection, batch_id: UUID, raw_payload: Dict[str, Any],
+        self, conn: asyncpg.Connection, batch_id: UUID, raw_payload: Any,
     ) -> ImportRecordOutcome:
-        if "_malformed_line" in raw_payload:
+        if isinstance(raw_payload, dict) and set(raw_payload.keys()) == {"_malformed_line"}:
             external_record_id = f"_malformed_line_{raw_payload['_malformed_line']}"
             record, is_new = await repo.get_or_create_import_record(
                 conn, batch_id=batch_id, external_record_id=external_record_id,
@@ -230,6 +252,20 @@ class CatalogIngestionService:
                 import_record_id=record["id"], external_record_id=external_record_id,
                 status="MALFORMED", is_new=is_new, validation_errors=["MALFORMED_JSON_LINE"],
             )
+
+        if not isinstance(raw_payload, dict):
+            # Section 22/Blocker 1: syntactically valid JSON (a plain
+            # string/number/bool/null/array at record position, from
+            # either a JSON top-level array element or a JSONL line)
+            # is NOT a malformed *parse* -- it parsed fine -- but it is
+            # not a record, and nothing downstream (normalize_record(),
+            # `.get`, membership tests meant for mappings) may ever be
+            # called on it. Classified and persisted exactly like any
+            # other single-record MALFORMED outcome, bounded the same
+            # way (an oversized scalar/array never has its actual
+            # content stored) -- never aborts the batch, never silently
+            # dropped.
+            return await self._ingest_non_object_record(conn, batch_id, raw_payload)
 
         raw_bytes = json.dumps(raw_payload, sort_keys=True).encode("utf-8")
         external_record_id = str(raw_payload.get("external_record_id") or "")
@@ -286,6 +322,48 @@ class CatalogIngestionService:
             import_record_id=record["id"], external_record_id=external_record_id, status="NORMALIZED",
         )
 
+    async def _ingest_non_object_record(
+        self, conn: asyncpg.Connection, batch_id: UUID, raw_payload: Any,
+    ) -> ImportRecordOutcome:
+        """A record position holding a syntactically valid but
+        non-object JSON value (string/number/bool/null/array). Bounded
+        the same way as any other record -- an oversized value never
+        has its actual content persisted, only a small placeholder
+        recording that it was rejected for size -- and the value
+        itself is wrapped in a small object before being stored, so
+        `raw_payload` stays uniformly dict-shaped for every row in this
+        table, MALFORMED or not."""
+        try:
+            serialized = json.dumps(raw_payload, sort_keys=True)
+        except (TypeError, ValueError):
+            serialized = json.dumps(str(raw_payload))
+        raw_bytes = serialized.encode("utf-8")
+        payload_sha256 = _sha256_hex(raw_bytes)
+        external_record_id = f"_non_object_record_{payload_sha256[:16]}"
+
+        if len(raw_bytes) > MAX_RECORD_BYTES:
+            stored_payload = {
+                "_rejected": "PAYLOAD_TOO_LARGE", "byte_length": len(raw_bytes),
+                "json_type": type(raw_payload).__name__,
+            }
+            validation_errors = ["PAYLOAD_TOO_LARGE"]
+        else:
+            stored_payload = {"_non_object_value": raw_payload, "json_type": type(raw_payload).__name__}
+            validation_errors = ["NON_OBJECT_RECORD"]
+
+        record, is_new = await repo.get_or_create_import_record(
+            conn, batch_id=batch_id, external_record_id=external_record_id,
+            raw_payload=stored_payload, payload_sha256=payload_sha256,
+        )
+        if is_new:
+            await repo.update_import_record(
+                conn, record["id"], status="MALFORMED", validation_errors=validation_errors,
+            )
+        return ImportRecordOutcome(
+            import_record_id=record["id"], external_record_id=external_record_id,
+            status="MALFORMED", is_new=is_new, validation_errors=validation_errors,
+        )
+
     async def _recompute_batch_status_after_import(self, conn: asyncpg.Connection, batch_id: UUID) -> None:
         counts = await conn.fetchrow(
             """
@@ -335,67 +413,16 @@ class CatalogIngestionService:
     async def _validate_one_record(
         self, conn: asyncpg.Connection, record: Dict[str, Any],
     ) -> ImportRecordOutcome:
-        normalized = record["normalized_payload"]
-        review_reason_codes: List[str] = []
-
-        market = (normalized.get("market_or_region") or "").strip()
-        if not market:
-            review_reason_codes.append("INVALID_MARKET")
-
-        if normalized["source_type"] == _UNVERIFIED_SOURCE_TYPE and normalized["ingredient_list_complete"]:
-            review_reason_codes.append("SOURCE_INSUFFICIENT")
-
-        unresolved_names: List[str] = []
-        for ingredient in normalized["ingredients"]:
-            resolved = await resolve_ingredient(conn, ingredient["raw_name"])
-            if resolved is None:
-                unresolved_names.append(ingredient["raw_name"])
-        if unresolved_names:
-            review_reason_codes.append("UNKNOWN_INGREDIENT")
-
-        if normalized["ingredient_list_complete"] and not normalized["ingredients"]:
-            review_reason_codes.append("INGREDIENT_LIST_INCOMPLETE")
-
-        brand_id = await conn.fetchval(
-            "SELECT id FROM brands WHERE normalized_name = $1",
-            " ".join(normalized["brand_name"].split()).lower(),
-        )
-        existing_product_id = None
-        if brand_id is not None:
-            existing_product_id = await conn.fetchval(
-                "SELECT id FROM products WHERE brand_id = $1 AND normalized_name = $2",
-                brand_id, " ".join(normalized["product_name"].split()).lower(),
-            )
-        sku_values = [s["sku"] for s in normalized["skus"]]
-        conflicts = await repo.find_conflicting_skus(
-            conn, sku_values, exclude_product_id=existing_product_id,
-        )
-        if conflicts:
-            review_reason_codes.append("SKU_CONFLICT")
-        upc_values = [s["upc_or_ean"] for s in normalized["skus"] if s.get("upc_or_ean")]
-        if upc_values:
-            upc_conflicts = await conn.fetch(
-                "SELECT * FROM product_skus WHERE upc_or_ean = ANY($1::varchar[])"
-                + (" AND product_id <> $2" if existing_product_id is not None else ""),
-                *([upc_values, existing_product_id] if existing_product_id is not None else [upc_values]),
-            )
-            if upc_conflicts:
-                review_reason_codes.append("UPC_CONFLICT")
-
-        if review_reason_codes:
-            for reason_code in review_reason_codes:
-                await repo.create_review_item(conn, import_record_id=record["id"], reason_code=reason_code)
-            await repo.update_import_record(
-                conn, record["id"], status="NEEDS_REVIEW", review_reason_codes=review_reason_codes,
-            )
-            return ImportRecordOutcome(
-                import_record_id=record["id"], external_record_id=record["external_record_id"],
-                status="NEEDS_REVIEW", review_reason_codes=review_reason_codes,
-            )
-
-        await repo.update_import_record(conn, record["id"], status="VALIDATED")
+        """Delegates entirely to app/domain/catalog_validation.py's
+        canonical `reconcile_review_state` -- the exact same function
+        `CatalogReviewService` calls after a review resolution, so
+        there is exactly one place that decides "is this record
+        actually fine right now" (Blocker 3 of the independent review
+        that found the original two-copies-of-validation design)."""
+        result = await reconcile_review_state(conn, record)
         return ImportRecordOutcome(
-            import_record_id=record["id"], external_record_id=record["external_record_id"], status="VALIDATED",
+            import_record_id=record["id"], external_record_id=record["external_record_id"],
+            status=result["status"], review_reason_codes=result["review_reason_codes"],
         )
 
     async def _recompute_batch_status_after_validate(self, conn: asyncpg.Connection, batch_id: UUID) -> None:

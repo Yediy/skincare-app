@@ -10,7 +10,7 @@ import uuid
 import pytest
 
 from app.domain.catalog_ingestion_service import CatalogIngestionService
-from app.domain.catalog_publication_service import CatalogPublicationService, PublicationError
+from app.domain.catalog_publication_service import CatalogPublicationService, PublicationError, PublicationOutcome
 
 
 def _record(external_id, **overrides):
@@ -388,3 +388,114 @@ async def test_two_concurrent_publications_same_product_market_preserve_unique_c
     # reran after the other), the database-level invariant must hold:
     # never more than one is_current row for this product/market.
     assert len(current_rows) == 1
+
+
+async def test_ten_concurrent_publications_of_the_same_record_are_idempotent(
+    publisher, source_id, catalog_admin_db_pool,
+):
+    """Blocker 4 (independent review): the SAME import_record_id
+    published by many concurrent callers must resolve to exactly one
+    logical publication -- never a duplicate formulation/provenance/
+    audit event, and never a low-level uniqueness exception leaking
+    out as normal concurrency behavior. `get_import_record_for_update`'s
+    `FOR UPDATE` lock is what makes this possible: only one caller ever
+    actually walks the create-formulation path; every other caller
+    blocks until that transaction commits, then takes the idempotent
+    already-PUBLISHED branch."""
+    import_record_id = await _import_and_validate(catalog_admin_db_pool, source_id, _record("race-same"))
+
+    async def _publish():
+        service = CatalogPublicationService(catalog_admin_db_pool)
+        return await service.publish(import_record_id, actor="tester")
+
+    outcomes = await asyncio.gather(*[_publish() for _ in range(10)])
+
+    formulation_ids = {o.formulation_id for o in outcomes}
+    assert len(formulation_ids) == 1
+    formulation_id = formulation_ids.pop()
+
+    formulation_count = await catalog_admin_db_pool.fetchval(
+        "SELECT count(*) FROM product_formulations WHERE id = $1", formulation_id,
+    )
+    assert formulation_count == 1
+
+    provenance_count = await catalog_admin_db_pool.fetchval(
+        "SELECT count(*) FROM catalog_formulation_provenance WHERE formulation_id = $1", formulation_id,
+    )
+    assert provenance_count == 1
+
+    publish_audit_count = await catalog_admin_db_pool.fetchval(
+        "SELECT count(*) FROM catalog_audit_log WHERE entity_id = $1 AND action = 'PUBLISH'", formulation_id,
+    )
+    assert publish_audit_count == 1
+
+    record_row = await catalog_admin_db_pool.fetchrow(
+        "SELECT status, formulation_id FROM catalog_import_records WHERE id = $1", import_record_id,
+    )
+    assert record_row["status"] == "PUBLISHED"
+    assert record_row["formulation_id"] == formulation_id
+
+
+async def test_two_new_records_racing_to_introduce_the_same_brand_and_product(
+    publisher, source_id, catalog_admin_db_pool,
+):
+    """Blocker 4 (independent review): two DIFFERENT, valid import
+    records concurrently introducing the same previously-unseen
+    normalized brand/product must converge on one logical brand and
+    one logical product identity -- never a duplicate, never an
+    uncaught uniqueness failure. Each record uses its own distinct SKU
+    and category so this test isolates the brand/product identity race
+    specifically, not the same-product reformulation path."""
+    # Different formulation_version (and SKU) on each so this isolates
+    # the brand/product IDENTITY race specifically -- distinct from
+    # test_two_concurrent_publications_same_product_market_preserve_
+    # unique_current's own already-covered version-conflict/
+    # reformulation race for the SAME version.
+    record_a_id = await _import_and_validate(
+        catalog_admin_db_pool, source_id,
+        _record(
+            "identity-race-a", brand_name="Shared New Brand", product_name="Shared New Product",
+            category="moisturizer", formulation_version="1", skus=[{"sku": "IDRACE-A"}],
+        ),
+    )
+    record_b_id = await _import_and_validate(
+        catalog_admin_db_pool, source_id,
+        _record(
+            "identity-race-b", brand_name="Shared New Brand", product_name="Shared New Product",
+            category="moisturizer", formulation_version="2", skus=[{"sku": "IDRACE-B"}],
+        ),
+    )
+
+    async def _publish(record_id):
+        service = CatalogPublicationService(catalog_admin_db_pool)
+        try:
+            return await service.publish(record_id, actor="tester")
+        except PublicationError as e:
+            return e
+
+    # asyncio.gather (no return_exceptions) re-raises anything that
+    # isn't a PublicationError the _publish() helper already caught --
+    # a race producing a raw asyncpg UniqueViolationError would fail
+    # this test right here, exactly as required ("never an uncaught
+    # uniqueness failure").
+    results = await asyncio.gather(_publish(record_a_id), _publish(record_b_id))
+
+    brand_count = await catalog_admin_db_pool.fetchval(
+        "SELECT count(*) FROM brands WHERE normalized_name = 'shared new brand'"
+    )
+    assert brand_count == 1
+    product_count = await catalog_admin_db_pool.fetchval(
+        "SELECT count(*) FROM products WHERE normalized_name = 'shared new product'"
+    )
+    assert product_count == 1
+
+    # Different formulation_version each, so both legitimately succeed
+    # (one becomes the reformulation-supersession of the other) --
+    # both reference the SAME product_id, same logical identity,
+    # regardless of which call happened to create the row.
+    successful = [r for r in results if isinstance(r, PublicationOutcome)]
+    assert len(successful) == 2
+    product_ids = {r.product_id for r in successful}
+    assert len(product_ids) == 1
+    brand_ids = {r.brand_id for r in successful}
+    assert len(brand_ids) == 1

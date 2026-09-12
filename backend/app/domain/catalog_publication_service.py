@@ -173,7 +173,12 @@ class CatalogPublicationService:
     async def _publish_within_transaction(
         self, conn: asyncpg.Connection, import_record_id: UUID, *, actor: str,
     ) -> PublicationOutcome:
-        record = await repo.get_import_record(conn, import_record_id)
+        # Locked FIRST, before any status/idempotency decision (Blocker
+        # 4, independent review) -- see get_import_record_for_update's
+        # own docstring for why a plain unlocked SELECT here let two
+        # concurrent publish() calls for the same import_record_id both
+        # observe VALIDATED and both proceed.
+        record = await repo.get_import_record_for_update(conn, import_record_id)
         if record is None:
             raise PublicationError("import record not found", code="IMPORT_RECORD_NOT_FOUND")
 
@@ -204,15 +209,15 @@ class CatalogPublicationService:
 
         # Step 2/3: resolve/create brand and product deterministically
         # (Section 10 -- exact normalized match only, never fuzzy).
+        # Both concurrency-safe against two DIFFERENT import records
+        # racing to introduce the same previously-unseen brand/product
+        # (Blocker 4, independent review) -- see resolve_or_create_
+        # brand/resolve_or_create_product's own docstrings.
         brand_id, _ = await repo.resolve_or_create_brand(conn, normalized["brand_name"])
-        existing_product = await repo.find_product_by_brand_and_name(conn, brand_id, normalized["product_name"])
-        if existing_product is not None:
-            product_id = existing_product["id"]
-        else:
-            product_id = await repo.create_product(
-                conn, brand_id=brand_id, name=normalized["product_name"], category=normalized["category"],
-                description=normalized.get("description"),
-            )
+        product_id, _ = await repo.resolve_or_create_product(
+            conn, brand_id=brand_id, name=normalized["product_name"], category=normalized["category"],
+            description=normalized.get("description"),
+        )
 
         # Ingredient resolution, re-verified fresh at publish time
         # (never trusted stale from an earlier validate pass -- the

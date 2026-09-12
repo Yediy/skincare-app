@@ -100,6 +100,96 @@ async def test_one_malformed_record_shape_does_not_abort_the_batch(service, sour
     assert statuses["bad1"] == "MALFORMED"
 
 
+@pytest.mark.parametrize("scalar", ["a plain string", 42, True, None, []], ids=["string", "integer", "boolean", "null", "array"])
+async def test_non_object_json_array_element_does_not_abort_the_batch(service, source_id, scalar):
+    """Blocker 1 (independent review): a syntactically valid JSON value
+    that isn't an object must become its own MALFORMED record, never
+    an unhandled exception that rolls back the whole batch."""
+    body = json.dumps([_record("good1"), scalar, _record("good2")]).encode("utf-8")
+    outcome = await service.import_file(source_id=source_id, file_bytes=body, file_format="json")
+
+    assert outcome.records_total == 3
+    assert len(outcome.records) == 3
+    statuses = [r.status for r in outcome.records]
+    assert statuses[0] == "NORMALIZED"
+    assert statuses[1] == "MALFORMED"
+    assert statuses[2] == "NORMALIZED"
+    assert outcome.records[1].validation_errors == ["NON_OBJECT_RECORD"]
+
+
+@pytest.mark.parametrize("scalar", ["a plain string", 42, True, None, []], ids=["string", "integer", "boolean", "null", "array"])
+async def test_non_object_jsonl_line_does_not_abort_the_batch(service, source_id, scalar):
+    lines = [json.dumps(_record("good1")), json.dumps(scalar), json.dumps(_record("good2"))]
+    body = "\n".join(lines).encode("utf-8")
+    outcome = await service.import_file(source_id=source_id, file_bytes=body, file_format="jsonl")
+
+    assert outcome.records_total == 3
+    statuses = [r.status for r in outcome.records]
+    assert statuses == ["NORMALIZED", "MALFORMED", "NORMALIZED"]
+    assert outcome.records[1].validation_errors == ["NON_OBJECT_RECORD"]
+
+
+async def test_non_object_record_persists_bounded_evidence(service, source_id, catalog_admin_db_pool):
+    body = json.dumps([{"just": "a plain object with no required fields is still a dict, not this case"}, "a scalar"]).encode("utf-8")
+    outcome = await service.import_file(source_id=source_id, file_bytes=body, file_format="json")
+    non_object_outcome = outcome.records[1]
+    assert non_object_outcome.status == "MALFORMED"
+
+    row = await catalog_admin_db_pool.fetchrow(
+        "SELECT raw_payload FROM catalog_import_records WHERE id = $1", non_object_outcome.import_record_id,
+    )
+    stored = row["raw_payload"]
+    stored = json.loads(stored) if isinstance(stored, str) else stored
+    assert stored["_non_object_value"] == "a scalar"
+
+
+async def test_oversized_non_object_record_never_stores_the_actual_content(service, source_id, catalog_admin_db_pool):
+    """An enormous nested value at record position must not evade the
+    same size bound an oversized object record is already held to."""
+    huge_array = ["x" * 1000] * 3000  # well over MAX_RECORD_BYTES once serialized
+    body = json.dumps([huge_array]).encode("utf-8")
+    outcome = await service.import_file(source_id=source_id, file_bytes=body, file_format="json")
+    assert outcome.records[0].status == "MALFORMED"
+    assert outcome.records[0].validation_errors == ["PAYLOAD_TOO_LARGE"]
+
+    row = await catalog_admin_db_pool.fetchrow(
+        "SELECT raw_payload FROM catalog_import_records WHERE id = $1", outcome.records[0].import_record_id,
+    )
+    stored = row["raw_payload"]
+    stored = json.loads(stored) if isinstance(stored, str) else stored
+    assert stored.get("_rejected") == "PAYLOAD_TOO_LARGE"
+    assert "_non_object_value" not in stored
+
+
+async def test_non_object_record_dry_run_is_handled_safely(service, source_id):
+    body = json.dumps([_record("good1"), "a scalar", None]).encode("utf-8")
+    outcome = await service.import_file(source_id=source_id, file_bytes=body, file_format="json", dry_run=True)
+    assert outcome.dry_run is True
+    statuses = [r.status for r in outcome.records]
+    assert statuses == ["NORMALIZED", "MALFORMED", "MALFORMED"]
+    assert all(r.validation_errors == ["NON_OBJECT_RECORD"] for r in outcome.records[1:])
+
+
+async def test_import_rejects_inactive_source(service, catalog_admin_db_pool, clean_catalog_ingestion):
+    source_id = await catalog_admin_db_pool.fetchval(
+        "INSERT INTO catalog_sources (name, normalized_name, source_type, active) "
+        "VALUES ('Inactive Source', 'inactive source', 'curated_dataset', false) RETURNING id"
+    )
+    body = json.dumps([_record("x1")]).encode("utf-8")
+    with pytest.raises(ImportRejectedError) as exc_info:
+        await service.import_file(source_id=source_id, file_bytes=body, file_format="json")
+    assert exc_info.value.code == "SOURCE_INACTIVE"
+
+    batch_count = await catalog_admin_db_pool.fetchval("SELECT count(*) FROM catalog_import_batches")
+    assert batch_count == 0
+
+
+async def test_import_rejects_unknown_source(service, clean_catalog_ingestion):
+    with pytest.raises(ImportRejectedError) as exc_info:
+        await service.import_file(source_id=uuid.uuid4(), file_bytes=json.dumps([_record("x1")]).encode(), file_format="json")
+    assert exc_info.value.code == "SOURCE_NOT_FOUND"
+
+
 async def test_oversized_file_is_rejected(service, source_id):
     huge = json.dumps([_record("x")]).encode("utf-8") + b" " * (50 * 1024 * 1024 + 1)
     with pytest.raises(ImportRejectedError) as exc_info:

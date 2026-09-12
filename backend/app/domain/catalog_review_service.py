@@ -19,6 +19,7 @@ import asyncpg
 
 from app.db import catalog_admin_repository as repo
 from app.db.catalog_repository import resolve_ingredient
+from app.domain.catalog_validation import reconcile_review_state
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +101,7 @@ class CatalogReviewService:
                     conn, review_item_id, status="RESOLVED", resolution="MAPPED_TO_EXISTING_INGREDIENT",
                     reviewed_by=actor,
                 )
-                await self._revalidate_if_no_open_items_remain(conn, review_item["import_record_id"])
+                await self._revalidate(conn, review_item["import_record_id"])
                 return resolved
 
     async def create_ingredient(
@@ -149,7 +150,7 @@ class CatalogReviewService:
                     conn, review_item_id, status="RESOLVED", resolution="CREATED_NEW_INGREDIENT",
                     reviewed_by=actor,
                 )
-                await self._revalidate_if_no_open_items_remain(conn, review_item["import_record_id"])
+                await self._revalidate(conn, review_item["import_record_id"])
                 return resolved
 
     async def reject_import_record(
@@ -197,7 +198,7 @@ class CatalogReviewService:
                         actor=actor, reason=notes,
                     )
                 else:
-                    await self._revalidate_if_no_open_items_remain(conn, review_item["import_record_id"])
+                    await self._revalidate(conn, review_item["import_record_id"])
                     await repo.write_audit(
                         conn, action="APPROVE", entity_type="catalog_review_item", entity_id=review_item_id,
                         import_record_id=review_item["import_record_id"], actor=actor,
@@ -219,10 +220,23 @@ class CatalogReviewService:
             )
         return review_item
 
-    async def _revalidate_if_no_open_items_remain(self, conn: asyncpg.Connection, import_record_id: UUID) -> None:
-        remaining = await conn.fetchval(
-            "SELECT count(*) FROM catalog_review_items WHERE import_record_id = $1 AND status = 'OPEN'",
-            import_record_id,
-        )
-        if remaining == 0:
-            await repo.update_import_record(conn, import_record_id, status="VALIDATED")
+    async def _revalidate(self, conn: asyncpg.Connection, import_record_id: UUID) -> None:
+        """Blocker 3 (independent review): never infers `VALIDATED`
+        merely from `count(open review items) == 0` -- that was wrong
+        the moment a record had more than one independent problem of
+        the same reason code (e.g. two unresolved ingredients),
+        because resolving just one already brought that count to zero
+        while the other remained genuinely unresolved. Delegates to
+        the exact same canonical validation
+        (app/domain/catalog_validation.py::reconcile_review_state)
+        `CatalogIngestionService.validate_batch()` itself uses -- one
+        rule set, never two copies that could drift apart. This
+        re-runs the full check fresh (not just "are there still open
+        rows") and creates a review item for the FIRST time it ever
+        sees a still-unresolved problem (never re-opening or
+        duplicating one a human already resolved -- see
+        `reconcile_review_state`'s own docstring)."""
+        import_record = await repo.get_import_record(conn, import_record_id)
+        if import_record is None or import_record.get("normalized_payload") is None:
+            return
+        await reconcile_review_state(conn, import_record)

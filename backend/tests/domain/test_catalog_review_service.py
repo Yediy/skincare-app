@@ -322,6 +322,189 @@ async def test_resolving_one_of_two_open_items_does_not_revalidate_yet(
     assert record_row["status"] == "NEEDS_REVIEW"
 
 
+async def test_two_unknown_ingredients_each_get_their_own_review_item(
+    review_service, source_id, catalog_admin_db_pool,
+):
+    """Blocker 3 (independent review): a record with TWO independent
+    unresolved ingredients must not collapse into a single aggregate
+    UNKNOWN_INGREDIENT review item -- resolving one must never look
+    like "the" ingredient problem is solved."""
+    import_record, _ = await _needs_review_record(
+        catalog_admin_db_pool, source_id,
+        ingredients=[{"raw_name": "Unknown A", "position": 1}, {"raw_name": "Unknown B", "position": 2}],
+    )
+    review_items = await catalog_admin_db_pool.fetch(
+        "SELECT * FROM catalog_review_items WHERE import_record_id = $1 AND reason_code = 'UNKNOWN_INGREDIENT'",
+        import_record["id"],
+    )
+    assert len(review_items) == 2
+    identity_keys = {r["identity_key"] for r in review_items}
+    assert identity_keys == {"unknown a", "unknown b"}
+    assert all(r["status"] == "OPEN" for r in review_items)
+
+
+async def test_resolving_one_of_two_unknown_ingredients_leaves_record_needs_review(
+    review_service, source_id, catalog_admin_db_pool,
+):
+    ingredient_a = await catalog_admin_db_pool.fetchval(
+        "INSERT INTO ingredients (canonical_name, normalized_name) VALUES ('Canonical A', 'canonical a') RETURNING id"
+    )
+    import_record, _ = await _needs_review_record(
+        catalog_admin_db_pool, source_id,
+        ingredients=[{"raw_name": "Unknown A", "position": 1}, {"raw_name": "Unknown B", "position": 2}],
+    )
+    review_items = await catalog_admin_db_pool.fetch(
+        "SELECT * FROM catalog_review_items WHERE import_record_id = $1 AND reason_code = 'UNKNOWN_INGREDIENT'",
+        import_record["id"],
+    )
+    item_a = next(r for r in review_items if r["identity_key"] == "unknown a")
+    item_b = next(r for r in review_items if r["identity_key"] == "unknown b")
+
+    await review_service.map_ingredient(
+        item_a["id"], raw_name="Unknown A", ingredient_id=ingredient_a, actor="reviewer1",
+    )
+
+    record_row = await catalog_admin_db_pool.fetchrow(
+        "SELECT status FROM catalog_import_records WHERE id = $1", import_record["id"],
+    )
+    assert record_row["status"] == "NEEDS_REVIEW"
+
+    # Unknown B's own item is untouched and still surfaced for review.
+    item_b_row = await catalog_admin_db_pool.fetchrow(
+        "SELECT status FROM catalog_review_items WHERE id = $1", item_b["id"],
+    )
+    assert item_b_row["status"] == "OPEN"
+    open_items = await review_service.list_open()
+    assert any(i["id"] == item_b["id"] for i in open_items)
+
+    # And the record genuinely cannot publish yet.
+    from app.domain.catalog_publication_service import CatalogPublicationService, PublicationError
+    with pytest.raises(PublicationError) as exc_info:
+        await CatalogPublicationService(catalog_admin_db_pool).publish(import_record["id"], actor="tester")
+    assert exc_info.value.code == "NOT_PUBLISHABLE_STATUS"
+
+
+async def test_resolving_both_unknown_ingredients_permits_validated(
+    review_service, source_id, catalog_admin_db_pool,
+):
+    ingredient_a = await catalog_admin_db_pool.fetchval(
+        "INSERT INTO ingredients (canonical_name, normalized_name) VALUES ('Canonical A', 'canonical a') RETURNING id"
+    )
+    ingredient_b = await catalog_admin_db_pool.fetchval(
+        "INSERT INTO ingredients (canonical_name, normalized_name) VALUES ('Canonical B', 'canonical b') RETURNING id"
+    )
+    import_record, _ = await _needs_review_record(
+        catalog_admin_db_pool, source_id,
+        ingredients=[{"raw_name": "Unknown A", "position": 1}, {"raw_name": "Unknown B", "position": 2}],
+    )
+    review_items = await catalog_admin_db_pool.fetch(
+        "SELECT * FROM catalog_review_items WHERE import_record_id = $1 AND reason_code = 'UNKNOWN_INGREDIENT'",
+        import_record["id"],
+    )
+    item_a = next(r for r in review_items if r["identity_key"] == "unknown a")
+    item_b = next(r for r in review_items if r["identity_key"] == "unknown b")
+
+    await review_service.map_ingredient(item_a["id"], raw_name="Unknown A", ingredient_id=ingredient_a, actor="r1")
+    await review_service.map_ingredient(item_b["id"], raw_name="Unknown B", ingredient_id=ingredient_b, actor="r1")
+
+    record_row = await catalog_admin_db_pool.fetchrow(
+        "SELECT status FROM catalog_import_records WHERE id = $1", import_record["id"],
+    )
+    assert record_row["status"] == "VALIDATED"
+
+
+async def test_revalidation_never_duplicates_review_items_on_repeated_resolution(
+    review_service, source_id, catalog_admin_db_pool,
+):
+    """Repeated revalidation passes (one per resolution action) must
+    never explode into duplicate review items for the same unresolved
+    problem."""
+    ingredient_a = await catalog_admin_db_pool.fetchval(
+        "INSERT INTO ingredients (canonical_name, normalized_name) VALUES ('Canonical A', 'canonical a') RETURNING id"
+    )
+    import_record, _ = await _needs_review_record(
+        catalog_admin_db_pool, source_id,
+        ingredients=[{"raw_name": "Unknown A", "position": 1}, {"raw_name": "Unknown B", "position": 2}],
+    )
+    review_items = await catalog_admin_db_pool.fetch(
+        "SELECT * FROM catalog_review_items WHERE import_record_id = $1 AND reason_code = 'UNKNOWN_INGREDIENT'",
+        import_record["id"],
+    )
+    item_a = next(r for r in review_items if r["identity_key"] == "unknown a")
+    await review_service.map_ingredient(item_a["id"], raw_name="Unknown A", ingredient_id=ingredient_a, actor="r1")
+
+    total_items = await catalog_admin_db_pool.fetchval(
+        "SELECT count(*) FROM catalog_review_items WHERE import_record_id = $1", import_record["id"],
+    )
+    assert total_items == 2  # still exactly A + B, no duplicate created for B on revalidation
+
+
+async def test_unknown_ingredient_and_sku_conflict_resolve_independently(
+    review_service, source_id, catalog_admin_db_pool,
+):
+    """Resolving one reason code must never accidentally clear a
+    different, unrelated open review item."""
+    other_brand = await catalog_admin_db_pool.fetchval(
+        "INSERT INTO brands (name, normalized_name) VALUES ('IndepBrand', 'indepbrand') RETURNING id"
+    )
+    other_product = await catalog_admin_db_pool.fetchval(
+        "INSERT INTO products (brand_id, name, normalized_name, category) "
+        "VALUES ($1, 'IndepProduct', 'indepproduct', 'moisturizer') RETURNING id",
+        other_brand,
+    )
+    other_formulation = await catalog_admin_db_pool.fetchval(
+        "INSERT INTO product_formulations (product_id, version, source_type) "
+        "VALUES ($1, '1', 'manufacturer_disclosure') RETURNING id",
+        other_product,
+    )
+    await catalog_admin_db_pool.execute(
+        "INSERT INTO product_skus (product_id, formulation_id, sku) VALUES ($1, $2, 'INDEP-SKU')",
+        other_product, other_formulation,
+    )
+    ingredient_id = await catalog_admin_db_pool.fetchval(
+        "INSERT INTO ingredients (canonical_name, normalized_name) VALUES ('Indep Ingredient', 'indep ingredient') RETURNING id"
+    )
+    import_record, _ = await _needs_review_record(
+        catalog_admin_db_pool, source_id, skus=[{"sku": "INDEP-SKU"}],
+    )
+    review_items = await catalog_admin_db_pool.fetch(
+        "SELECT * FROM catalog_review_items WHERE import_record_id = $1", import_record["id"],
+    )
+    assert {r["reason_code"] for r in review_items} == {"UNKNOWN_INGREDIENT", "SKU_CONFLICT"}
+    unknown_item = next(r for r in review_items if r["reason_code"] == "UNKNOWN_INGREDIENT")
+
+    # Resolve only the ingredient -- the SKU conflict must remain open.
+    await review_service.map_ingredient(
+        unknown_item["id"], raw_name="Mystery Compound", ingredient_id=ingredient_id, actor="r1",
+    )
+    record_row = await catalog_admin_db_pool.fetchrow(
+        "SELECT status FROM catalog_import_records WHERE id = $1", import_record["id"],
+    )
+    assert record_row["status"] == "NEEDS_REVIEW"
+    sku_item_row = await catalog_admin_db_pool.fetchrow(
+        "SELECT status FROM catalog_review_items WHERE import_record_id = $1 AND reason_code = 'SKU_CONFLICT'",
+        import_record["id"],
+    )
+    assert sku_item_row["status"] == "OPEN"
+
+    # Now resolve the SKU conflict too -- the ingredient resolution
+    # from before must not have been undone/duplicated.
+    sku_item = await catalog_admin_db_pool.fetchrow(
+        "SELECT * FROM catalog_review_items WHERE import_record_id = $1 AND reason_code = 'SKU_CONFLICT'",
+        import_record["id"],
+    )
+    await review_service.dismiss(sku_item["id"], resolution="IDENTITY_CONFIRMED", actor="r1")
+    record_row = await catalog_admin_db_pool.fetchrow(
+        "SELECT status FROM catalog_import_records WHERE id = $1", import_record["id"],
+    )
+    assert record_row["status"] == "VALIDATED"
+    unknown_item_count = await catalog_admin_db_pool.fetchval(
+        "SELECT count(*) FROM catalog_review_items WHERE import_record_id = $1 AND reason_code = 'UNKNOWN_INGREDIENT'",
+        import_record["id"],
+    )
+    assert unknown_item_count == 1
+
+
 async def test_resolving_already_resolved_item_fails(review_service, source_id, catalog_admin_db_pool):
     _, review_item = await _needs_review_record(catalog_admin_db_pool, source_id)
     await review_service.reject_import_record(review_item["id"], reason="x", actor="reviewer1")

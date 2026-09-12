@@ -169,6 +169,27 @@ async def get_import_record(pool: asyncpg.Pool, import_record_id: UUID) -> Optio
     return _decode_import_record(row) if row is not None else None
 
 
+async def get_import_record_for_update(
+    conn: asyncpg.Connection, import_record_id: UUID,
+) -> Optional[Dict[str, Any]]:
+    """`FOR UPDATE` -- must be the very first thing
+    CatalogPublicationService.publish() does with this row (Blocker 4,
+    independent review): two concurrent publish() calls for the SAME
+    import_record_id both reading a plain, unlocked SELECT could both
+    observe `status = 'VALIDATED'` and both proceed into catalog
+    creation. Locking here serializes them -- the second caller blocks
+    until the first's transaction commits (or rolls back), then reads
+    whatever the first one left behind (typically `PUBLISHED`) and
+    takes the idempotent-no-op branch instead of duplicating anything.
+    Same pattern as get_current_formulation_for_update()'s own
+    pre-existing lock on the *destination* row -- this is the missing
+    lock on the *source* (staging) row."""
+    row = await conn.fetchrow(
+        "SELECT * FROM catalog_import_records WHERE id = $1 FOR UPDATE", import_record_id,
+    )
+    return _decode_import_record(row) if row is not None else None
+
+
 async def list_import_records_for_batch(
     pool: asyncpg.Pool, batch_id: UUID, *, status: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
@@ -226,16 +247,48 @@ async def update_import_record(
 
 async def create_review_item(
     conn: asyncpg.Connection, *, import_record_id: UUID, reason_code: str,
+    identity_key: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """`identity_key` distinguishes multiple independent instances of
+    the same reason_code on the same record (today, only
+    UNKNOWN_INGREDIENT needs this -- each unresolved raw ingredient
+    name gets its own row). NULL for every single-instance reason
+    code. See migration 154080b29153 and
+    app/domain/catalog_validation.py."""
     row = await conn.fetchrow(
         """
-        INSERT INTO catalog_review_items (import_record_id, reason_code)
-        VALUES ($1, $2)
+        INSERT INTO catalog_review_items (import_record_id, reason_code, identity_key)
+        VALUES ($1, $2, $3)
         RETURNING *
         """,
-        import_record_id, reason_code,
+        import_record_id, reason_code, identity_key,
     )
     return dict(row)
+
+
+async def find_review_item(
+    conn: asyncpg.Connection, import_record_id: UUID, reason_code: str, identity_key: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Regardless of status -- an existing RESOLVED row for this exact
+    (reason_code, identity_key) must never be recreated (that would
+    silently re-open a problem a human already explicitly resolved).
+    `IS NOT DISTINCT FROM` (not `=`) so two NULL identity_keys compare
+    equal, matching ordinary SQL NULL semantics being wrong here."""
+    row = await conn.fetchrow(
+        """
+        SELECT * FROM catalog_review_items
+        WHERE import_record_id = $1 AND reason_code = $2 AND identity_key IS NOT DISTINCT FROM $3
+        """,
+        import_record_id, reason_code, identity_key,
+    )
+    return dict(row) if row is not None else None
+
+
+async def count_open_review_items(conn: asyncpg.Connection, import_record_id: UUID) -> int:
+    return await conn.fetchval(
+        "SELECT count(*) FROM catalog_review_items WHERE import_record_id = $1 AND status = 'OPEN'",
+        import_record_id,
+    )
 
 
 async def get_review_item(pool: asyncpg.Pool, review_item_id: UUID) -> Optional[Dict[str, Any]]:
@@ -357,44 +410,65 @@ async def list_audit_for_entity(pool: asyncpg.Pool, entity_type: str, entity_id:
 
 async def resolve_or_create_brand(conn: asyncpg.Connection, name: str) -> tuple[UUID, bool]:
     """Deterministic identity resolution (Section 10): normalized exact
-    match only, never fuzzy. Returns (brand_id, created)."""
+    match only, never fuzzy. Returns (brand_id, created).
+
+    Concurrency-safe (Blocker 4, independent review): the original
+    plain SELECT-then-INSERT had a real race -- two concurrent
+    publications introducing the same previously-unseen brand could
+    both see no existing row and both attempt the INSERT, one of them
+    raising a raw `UniqueViolationError` on `brands.normalized_name`
+    instead of resolving to the single logical brand. `INSERT ...
+    ON CONFLICT (normalized_name) DO NOTHING` never raises on that
+    race -- Postgres's own speculative-insertion protocol makes a
+    concurrent conflicting insert wait for the other transaction to
+    finish rather than error, so the loser simply gets no row back
+    here and the reselect below finds whichever row actually won."""
     normalized = normalize_name(name)
-    existing = await conn.fetchval("SELECT id FROM brands WHERE normalized_name = $1", normalized)
-    if existing is not None:
-        return existing, False
-    brand_id = await conn.fetchval(
-        "INSERT INTO brands (name, normalized_name) VALUES ($1, $2) RETURNING id", name, normalized,
-    )
-    return brand_id, True
-
-
-async def find_product_by_brand_and_name(
-    conn: asyncpg.Connection, brand_id: UUID, name: str,
-) -> Optional[Dict[str, Any]]:
-    """brands(brand_id, normalized_name) is UNIQUE (migration
-    d70e5fc90775) so this can only ever find zero or one row -- product
-    identity ambiguity (PRODUCT_IDENTITY_AMBIGUOUS) arises from a
-    *different* signal this pass's exact-match path structurally cannot
-    produce (e.g. a future fuzzy-suggestion admin tool), never from
-    this query itself returning more than one row."""
     row = await conn.fetchrow(
-        "SELECT * FROM products WHERE brand_id = $1 AND normalized_name = $2",
-        brand_id, normalize_name(name),
+        "INSERT INTO brands (name, normalized_name) VALUES ($1, $2) "
+        "ON CONFLICT (normalized_name) DO NOTHING RETURNING id",
+        name, normalized,
     )
-    return dict(row) if row is not None else None
+    if row is not None:
+        return row["id"], True
+    existing = await conn.fetchval("SELECT id FROM brands WHERE normalized_name = $1", normalized)
+    return existing, False
 
 
-async def create_product(
+async def resolve_or_create_product(
     conn: asyncpg.Connection, *, brand_id: UUID, name: str, category: str, description: Optional[str] = None,
-) -> UUID:
-    return await conn.fetchval(
+) -> tuple[UUID, bool]:
+    """Deterministic identity resolution, same concurrency-safe
+    ON-CONFLICT-then-reselect pattern as resolve_or_create_brand()
+    above, against `products`' own `UNIQUE (brand_id, normalized_name)`
+    constraint (migration d70e5fc90775). `brand_id`+`normalized_name`
+    being unique also means this can only ever resolve to zero or one
+    row -- product identity ambiguity (PRODUCT_IDENTITY_AMBIGUOUS)
+    arises from a *different* signal this pass's exact-match path
+    structurally cannot produce (e.g. a future fuzzy-suggestion admin
+    tool), never from this query itself. Returns (product_id,
+    created); `category`/`description` are only used on the creating
+    call -- an existing product's own values are never overwritten by
+    a later import that happens to describe it slightly differently
+    (that is a deliberate, separate decision this pass does not make
+    casually, matching resolve_or_create_brand's own "identity
+    resolution only, never a silent data overwrite" posture)."""
+    normalized = normalize_name(name)
+    row = await conn.fetchrow(
         """
         INSERT INTO products (brand_id, name, normalized_name, category, description)
         VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (brand_id, normalized_name) DO NOTHING
         RETURNING id
         """,
-        brand_id, name, normalize_name(name), category, description,
+        brand_id, name, normalized, category, description,
     )
+    if row is not None:
+        return row["id"], True
+    existing = await conn.fetchval(
+        "SELECT id FROM products WHERE brand_id = $1 AND normalized_name = $2", brand_id, normalized,
+    )
+    return existing, False
 
 
 async def get_current_formulation_for_update(
