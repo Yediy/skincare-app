@@ -8,7 +8,7 @@ import json
 import pytest
 
 from app.domain.catalog_ingestion_service import CatalogIngestionService
-from app.domain.catalog_review_service import AliasConflictError, CatalogReviewService, ReviewError
+from app.domain.catalog_review_service import CatalogReviewService, ReviewError
 
 
 def _record(external_id, **overrides):
@@ -76,7 +76,7 @@ async def test_map_to_existing_ingredient_creates_alias_and_resolves_review(
     import_record, review_item = await _needs_review_record(catalog_admin_db_pool, source_id)
 
     result = await review_service.map_ingredient(
-        review_item["id"], raw_name="Mystery Compound", ingredient_id=ingredient_id, actor="reviewer1",
+        review_item["id"], ingredient_id=ingredient_id, actor="reviewer1",
     )
     assert result["status"] == "RESOLVED"
     assert result["resolution"] == "MAPPED_TO_EXISTING_INGREDIENT"
@@ -99,78 +99,114 @@ async def test_map_to_existing_ingredient_creates_alias_and_resolves_review(
     assert len(audit) == 1
 
 
-async def test_map_ingredient_fails_closed_on_conflicting_alias(review_service, source_id, catalog_admin_db_pool):
-    """Section 17: the raw string already means a DIFFERENT ingredient
-    -- must fail closed, never silently overwrite. Uses a genuinely
-    unresolved ingredient ("Mystery Compound") to produce the review
-    item -- "Water" here is deliberately just the raw_name a reviewer
-    is (mistakenly) attempting to map, independent of what actually
-    triggered this review item, to isolate the alias-conflict check
-    itself."""
-    existing_ingredient = await catalog_admin_db_pool.fetchval(
-        "INSERT INTO ingredients (canonical_name, normalized_name) VALUES ('Water', 'water') RETURNING id"
-    )
+async def test_map_ingredient_fails_closed_when_target_resolved_out_of_band_via_canonical(
+    review_service, source_id, catalog_admin_db_pool,
+):
+    """Identity binding (hotfix): `_resolve_target_raw_name` requires
+    the review item's own target raw string to still be genuinely
+    unresolved. If, between the review item being opened and a
+    resolution attempt, some other process makes that exact raw
+    string resolve on its own (e.g. a canonical ingredient of the
+    same name gets added out-of-band -- simulated here by inserting
+    it directly, standing in for a genuine two-connection race),
+    acting on stale state must be refused rather than silently
+    treated as a no-op or silently re-pointed at whatever ingredient
+    this caller happened to pass."""
     other_ingredient = await catalog_admin_db_pool.fetchval(
         "INSERT INTO ingredients (canonical_name, normalized_name) VALUES ('Glycerin', 'glycerin') RETURNING id"
     )
-    _, review_item = await _needs_review_record(catalog_admin_db_pool, source_id)
-    # "Water" is already a canonical ingredient name -- mapping it to a
-    # DIFFERENT ingredient must fail closed.
-    with pytest.raises(AliasConflictError):
+    _, review_item = await _needs_review_record(
+        catalog_admin_db_pool, source_id, ingredients=[{"raw_name": "Water", "position": 1}],
+    )
+    # Out-of-band: "Water" becomes a real canonical ingredient AFTER
+    # the review item was already opened for it.
+    existing_ingredient = await catalog_admin_db_pool.fetchval(
+        "INSERT INTO ingredients (canonical_name, normalized_name) VALUES ('Water', 'water') RETURNING id"
+    )
+    with pytest.raises(ReviewError) as exc_info:
         await review_service.map_ingredient(
-            review_item["id"], raw_name="Water", ingredient_id=other_ingredient, actor="reviewer1",
+            review_item["id"], ingredient_id=other_ingredient, actor="reviewer1",
         )
+    assert exc_info.value.code == "ALREADY_RESOLVED"
 
     unchanged = await catalog_admin_db_pool.fetchrow(
         "SELECT normalized_name FROM ingredients WHERE id = $1", existing_ingredient,
     )
     assert unchanged["normalized_name"] == "water"
+    alias_count = await catalog_admin_db_pool.fetchval("SELECT count(*) FROM ingredient_aliases")
+    assert alias_count == 0
+    review_row = await catalog_admin_db_pool.fetchrow(
+        "SELECT status FROM catalog_review_items WHERE id = $1", review_item["id"],
+    )
+    assert review_row["status"] == "OPEN"
+    record_row = await catalog_admin_db_pool.fetchrow(
+        "SELECT status FROM catalog_import_records WHERE id = $1", review_item["import_record_id"],
+    )
+    assert record_row["status"] == "NEEDS_REVIEW"
+
+
+async def test_map_ingredient_fails_closed_when_target_resolved_out_of_band_via_alias(
+    review_service, source_id, catalog_admin_db_pool,
+):
+    real_ingredient = await catalog_admin_db_pool.fetchval(
+        "INSERT INTO ingredients (canonical_name, normalized_name) VALUES ('Retinol', 'retinol') RETURNING id"
+    )
+    wrong_ingredient = await catalog_admin_db_pool.fetchval(
+        "INSERT INTO ingredients (canonical_name, normalized_name) VALUES ('Niacinamide', 'niacinamide') RETURNING id"
+    )
+    _, review_item = await _needs_review_record(
+        catalog_admin_db_pool, source_id, ingredients=[{"raw_name": "Vitamin A1", "position": 1}],
+    )
+    # Out-of-band: "Vitamin A1" becomes a resolvable alias AFTER the
+    # review item was already opened for it.
+    await catalog_admin_db_pool.execute(
+        "INSERT INTO ingredient_aliases (ingredient_id, alias, normalized_alias) VALUES ($1, 'Vitamin A1', 'vitamin a1')",
+        real_ingredient,
+    )
+    with pytest.raises(ReviewError) as exc_info:
+        await review_service.map_ingredient(
+            review_item["id"], ingredient_id=wrong_ingredient, actor="reviewer1",
+        )
+    assert exc_info.value.code == "ALREADY_RESOLVED"
     review_row = await catalog_admin_db_pool.fetchrow(
         "SELECT status FROM catalog_review_items WHERE id = $1", review_item["id"],
     )
     assert review_row["status"] == "OPEN"
 
 
-async def test_map_ingredient_conflicting_with_existing_alias_fails_closed(
+async def test_map_ingredient_fails_closed_even_when_out_of_band_alias_already_matches_requested_target(
     review_service, source_id, catalog_admin_db_pool,
 ):
-    real_ingredient = await catalog_admin_db_pool.fetchval(
-        "INSERT INTO ingredients (canonical_name, normalized_name) VALUES ('Retinol', 'retinol') RETURNING id"
-    )
-    await catalog_admin_db_pool.execute(
-        "INSERT INTO ingredient_aliases (ingredient_id, alias, normalized_alias) VALUES ($1, 'Vitamin A1', 'vitamin a1')",
-        real_ingredient,
-    )
-    wrong_ingredient = await catalog_admin_db_pool.fetchval(
-        "INSERT INTO ingredients (canonical_name, normalized_name) VALUES ('Niacinamide', 'niacinamide') RETURNING id"
-    )
-    _, review_item = await _needs_review_record(catalog_admin_db_pool, source_id)
-    with pytest.raises(AliasConflictError) as exc_info:
-        await review_service.map_ingredient(
-            review_item["id"], raw_name="Vitamin A1", ingredient_id=wrong_ingredient, actor="reviewer1",
-        )
-    assert exc_info.value.conflict["conflict_type"] == "IS_EXISTING_ALIAS"
-
-
-async def test_map_ingredient_idempotent_when_alias_already_points_at_same_ingredient(
-    review_service, source_id, catalog_admin_db_pool,
-):
+    """Even the "harmless-looking" case -- the out-of-band alias
+    already points at the very ingredient this caller is about to
+    request -- must still fail closed rather than silently succeed as
+    a no-op. Acting on stale state is refused unconditionally; the
+    reviewer must re-check the item (it's effectively already
+    resolved) rather than this method quietly agreeing with
+    whatever happened out from under it."""
     ingredient_id = await catalog_admin_db_pool.fetchval(
         "INSERT INTO ingredients (canonical_name, normalized_name) VALUES ('Retinol', 'retinol') RETURNING id"
+    )
+    _, review_item = await _needs_review_record(
+        catalog_admin_db_pool, source_id, ingredients=[{"raw_name": "Vitamin A1", "position": 1}],
     )
     await catalog_admin_db_pool.execute(
         "INSERT INTO ingredient_aliases (ingredient_id, alias, normalized_alias) VALUES ($1, 'Vitamin A1', 'vitamin a1')",
         ingredient_id,
     )
-    _, review_item = await _needs_review_record(catalog_admin_db_pool, source_id)
-    result = await review_service.map_ingredient(
-        review_item["id"], raw_name="Vitamin A1", ingredient_id=ingredient_id, actor="reviewer1",
-    )
-    assert result["status"] == "RESOLVED"
+    with pytest.raises(ReviewError) as exc_info:
+        await review_service.map_ingredient(
+            review_item["id"], ingredient_id=ingredient_id, actor="reviewer1",
+        )
+    assert exc_info.value.code == "ALREADY_RESOLVED"
     alias_count = await catalog_admin_db_pool.fetchval(
         "SELECT count(*) FROM ingredient_aliases WHERE normalized_alias = 'vitamin a1'"
     )
     assert alias_count == 1
+    review_row = await catalog_admin_db_pool.fetchrow(
+        "SELECT status FROM catalog_review_items WHERE id = $1", review_item["id"],
+    )
+    assert review_row["status"] == "OPEN"
 
 
 async def test_create_new_ingredient_and_resolve(review_service, source_id, catalog_admin_db_pool):
@@ -178,7 +214,7 @@ async def test_create_new_ingredient_and_resolve(review_service, source_id, cata
         catalog_admin_db_pool, source_id, ingredients=[{"raw_name": "Brand New Peptide Complex", "position": 1}],
     )
     result = await review_service.create_ingredient(
-        review_item["id"], raw_name="Brand New Peptide Complex", canonical_name="Peptide Complex XJ-9",
+        review_item["id"], canonical_name="Peptide Complex XJ-9",
         ingredient_type="active", actor="reviewer1",
     )
     assert result["resolution"] == "CREATED_NEW_INGREDIENT"
@@ -206,7 +242,7 @@ async def test_create_new_ingredient_no_alias_needed_when_raw_name_matches_canon
         catalog_admin_db_pool, source_id, ingredients=[{"raw_name": "Squalane", "position": 1}],
     )
     await review_service.create_ingredient(
-        review_item["id"], raw_name="Squalane", canonical_name="Squalane", actor="reviewer1",
+        review_item["id"], canonical_name="Squalane", actor="reviewer1",
     )
     alias_count = await catalog_admin_db_pool.fetchval("SELECT count(*) FROM ingredient_aliases")
     assert alias_count == 0
@@ -221,7 +257,7 @@ async def test_create_ingredient_rejects_when_canonical_already_resolves(
     _, review_item = await _needs_review_record(catalog_admin_db_pool, source_id)
     with pytest.raises(ReviewError) as exc_info:
         await review_service.create_ingredient(
-            review_item["id"], raw_name="Mystery Compound", canonical_name="Water", actor="reviewer1",
+            review_item["id"], canonical_name="Water", actor="reviewer1",
         )
     assert exc_info.value.code == "INGREDIENT_ALREADY_EXISTS"
 
@@ -361,7 +397,7 @@ async def test_resolving_one_of_two_unknown_ingredients_leaves_record_needs_revi
     item_b = next(r for r in review_items if r["identity_key"] == "unknown b")
 
     await review_service.map_ingredient(
-        item_a["id"], raw_name="Unknown A", ingredient_id=ingredient_a, actor="reviewer1",
+        item_a["id"], ingredient_id=ingredient_a, actor="reviewer1",
     )
 
     record_row = await catalog_admin_db_pool.fetchrow(
@@ -404,13 +440,23 @@ async def test_resolving_both_unknown_ingredients_permits_validated(
     item_a = next(r for r in review_items if r["identity_key"] == "unknown a")
     item_b = next(r for r in review_items if r["identity_key"] == "unknown b")
 
-    await review_service.map_ingredient(item_a["id"], raw_name="Unknown A", ingredient_id=ingredient_a, actor="r1")
-    await review_service.map_ingredient(item_b["id"], raw_name="Unknown B", ingredient_id=ingredient_b, actor="r1")
+    await review_service.map_ingredient(item_a["id"], ingredient_id=ingredient_a, actor="r1")
+    await review_service.map_ingredient(item_b["id"], ingredient_id=ingredient_b, actor="r1")
 
     record_row = await catalog_admin_db_pool.fetchrow(
         "SELECT status FROM catalog_import_records WHERE id = $1", import_record["id"],
     )
     assert record_row["status"] == "VALIDATED"
+
+    # Publication must behave normally once both identities are
+    # genuinely (not falsely) resolved.
+    from app.domain.catalog_publication_service import CatalogPublicationService
+    outcome = await CatalogPublicationService(catalog_admin_db_pool).publish(import_record["id"], actor="tester")
+    assert outcome.formulation_id is not None
+    published_record = await catalog_admin_db_pool.fetchrow(
+        "SELECT status FROM catalog_import_records WHERE id = $1", import_record["id"],
+    )
+    assert published_record["status"] == "PUBLISHED"
 
 
 async def test_revalidation_never_duplicates_review_items_on_repeated_resolution(
@@ -431,7 +477,7 @@ async def test_revalidation_never_duplicates_review_items_on_repeated_resolution
         import_record["id"],
     )
     item_a = next(r for r in review_items if r["identity_key"] == "unknown a")
-    await review_service.map_ingredient(item_a["id"], raw_name="Unknown A", ingredient_id=ingredient_a, actor="r1")
+    await review_service.map_ingredient(item_a["id"], ingredient_id=ingredient_a, actor="r1")
 
     total_items = await catalog_admin_db_pool.fetchval(
         "SELECT count(*) FROM catalog_review_items WHERE import_record_id = $1", import_record["id"],
@@ -475,7 +521,7 @@ async def test_unknown_ingredient_and_sku_conflict_resolve_independently(
 
     # Resolve only the ingredient -- the SKU conflict must remain open.
     await review_service.map_ingredient(
-        unknown_item["id"], raw_name="Mystery Compound", ingredient_id=ingredient_id, actor="r1",
+        unknown_item["id"], ingredient_id=ingredient_id, actor="r1",
     )
     record_row = await catalog_admin_db_pool.fetchrow(
         "SELECT status FROM catalog_import_records WHERE id = $1", import_record["id"],
@@ -510,3 +556,180 @@ async def test_resolving_already_resolved_item_fails(review_service, source_id, 
     await review_service.reject_import_record(review_item["id"], reason="x", actor="reviewer1")
     with pytest.raises(ReviewError):
         await review_service.reject_import_record(review_item["id"], reason="y", actor="reviewer1")
+
+
+# ---------------------------------------------------------------------------
+# Identity binding hotfix (independent review): map_ingredient()/
+# create_ingredient() must never trust a caller-supplied raw_name --
+# the raw string is always derived from the review item's OWN
+# identity_key, cross-referenced against the import record's current
+# normalized_payload (see CatalogReviewService._resolve_target_raw_name).
+# Before this fix, an operator (or a scripting mistake) could resolve
+# item A's row while creating an alias for a completely unrelated
+# string B, leaving A's real problem silently marked RESOLVED without
+# ever actually being fixed.
+# ---------------------------------------------------------------------------
+
+
+async def test_map_ingredient_rejects_a_caller_supplied_raw_name_outright(
+    review_service, source_id, catalog_admin_db_pool,
+):
+    """The exploit this hotfix closes required raw_name to be an
+    accepted, trusted argument in the first place. It no longer is --
+    proven here directly: passing one at all is a hard TypeError, not
+    a value that merely gets ignored or silently validated away."""
+    ingredient_id = await catalog_admin_db_pool.fetchval(
+        "INSERT INTO ingredients (canonical_name, normalized_name) VALUES ('Canonical A', 'canonical a') RETURNING id"
+    )
+    import_record, _ = await _needs_review_record(
+        catalog_admin_db_pool, source_id,
+        ingredients=[{"raw_name": "Unknown A", "position": 1}, {"raw_name": "Unknown B", "position": 2}],
+    )
+    review_items = await catalog_admin_db_pool.fetch(
+        "SELECT * FROM catalog_review_items WHERE import_record_id = $1 AND reason_code = 'UNKNOWN_INGREDIENT'",
+        import_record["id"],
+    )
+    item_a = next(r for r in review_items if r["identity_key"] == "unknown a")
+    item_b = next(r for r in review_items if r["identity_key"] == "unknown b")
+
+    # The old exploit: resolve item A's row while actually supplying
+    # item B's raw string. Now impossible to even attempt -- raw_name
+    # isn't a parameter of map_ingredient() at all.
+    with pytest.raises(TypeError):
+        await review_service.map_ingredient(
+            item_a["id"], raw_name="Unknown B", ingredient_id=ingredient_id, actor="attacker",
+        )
+
+    for item in (item_a, item_b):
+        row = await catalog_admin_db_pool.fetchrow(
+            "SELECT status FROM catalog_review_items WHERE id = $1", item["id"],
+        )
+        assert row["status"] == "OPEN"
+    alias_count = await catalog_admin_db_pool.fetchval("SELECT count(*) FROM ingredient_aliases")
+    assert alias_count == 0
+    record_row = await catalog_admin_db_pool.fetchrow(
+        "SELECT status FROM catalog_import_records WHERE id = $1", import_record["id"],
+    )
+    assert record_row["status"] == "NEEDS_REVIEW"
+
+
+async def test_create_ingredient_rejects_a_caller_supplied_raw_name_outright(
+    review_service, source_id, catalog_admin_db_pool,
+):
+    """Same exploit, same fix, via create_ingredient()."""
+    import_record, _ = await _needs_review_record(
+        catalog_admin_db_pool, source_id,
+        ingredients=[{"raw_name": "Unknown A", "position": 1}, {"raw_name": "Unknown B", "position": 2}],
+    )
+    review_items = await catalog_admin_db_pool.fetch(
+        "SELECT * FROM catalog_review_items WHERE import_record_id = $1 AND reason_code = 'UNKNOWN_INGREDIENT'",
+        import_record["id"],
+    )
+    item_a = next(r for r in review_items if r["identity_key"] == "unknown a")
+    item_b = next(r for r in review_items if r["identity_key"] == "unknown b")
+
+    with pytest.raises(TypeError):
+        await review_service.create_ingredient(
+            item_a["id"], raw_name="Unknown B", canonical_name="Some New Canonical", actor="attacker",
+        )
+
+    for item in (item_a, item_b):
+        row = await catalog_admin_db_pool.fetchrow(
+            "SELECT status FROM catalog_review_items WHERE id = $1", item["id"],
+        )
+        assert row["status"] == "OPEN"
+    ingredient_count = await catalog_admin_db_pool.fetchval(
+        "SELECT count(*) FROM ingredients WHERE normalized_name = 'some new canonical'"
+    )
+    assert ingredient_count == 0
+    record_row = await catalog_admin_db_pool.fetchrow(
+        "SELECT status FROM catalog_import_records WHERE id = $1", import_record["id"],
+    )
+    assert record_row["status"] == "NEEDS_REVIEW"
+
+
+async def test_map_ingredient_rejects_identity_key_that_no_longer_matches_the_payload(
+    review_service, source_id, catalog_admin_db_pool,
+):
+    """Defense in depth: even if a review item's identity_key were to
+    end up not matching anything in its import record's current
+    normalized_payload (e.g. data tampering, or a future bug), that
+    must be refused with a specific classified error rather than
+    silently doing nothing useful or picking an arbitrary ingredient.
+    Simulated directly since normalize_record()'s own duplicate-raw-
+    name validator makes this state unreachable through the ordinary
+    ingestion/validation path."""
+    ingredient_id = await catalog_admin_db_pool.fetchval(
+        "INSERT INTO ingredients (canonical_name, normalized_name) VALUES ('Canonical A', 'canonical a') RETURNING id"
+    )
+    _, review_item = await _needs_review_record(
+        catalog_admin_db_pool, source_id, ingredients=[{"raw_name": "Unknown A", "position": 1}],
+    )
+    await catalog_admin_db_pool.execute(
+        "UPDATE catalog_review_items SET identity_key = 'totally unrelated string' WHERE id = $1",
+        review_item["id"],
+    )
+    with pytest.raises(ReviewError) as exc_info:
+        await review_service.map_ingredient(review_item["id"], ingredient_id=ingredient_id, actor="reviewer1")
+    assert exc_info.value.code == "IDENTITY_KEY_NOT_FOUND"
+
+    row = await catalog_admin_db_pool.fetchrow(
+        "SELECT status FROM catalog_review_items WHERE id = $1", review_item["id"],
+    )
+    assert row["status"] == "OPEN"
+    alias_count = await catalog_admin_db_pool.fetchval("SELECT count(*) FROM ingredient_aliases")
+    assert alias_count == 0
+
+
+async def test_create_ingredient_rejects_identity_key_that_no_longer_matches_the_payload(
+    review_service, source_id, catalog_admin_db_pool,
+):
+    _, review_item = await _needs_review_record(
+        catalog_admin_db_pool, source_id, ingredients=[{"raw_name": "Unknown A", "position": 1}],
+    )
+    await catalog_admin_db_pool.execute(
+        "UPDATE catalog_review_items SET identity_key = 'totally unrelated string' WHERE id = $1",
+        review_item["id"],
+    )
+    with pytest.raises(ReviewError) as exc_info:
+        await review_service.create_ingredient(
+            review_item["id"], canonical_name="Some New Canonical", actor="reviewer1",
+        )
+    assert exc_info.value.code == "IDENTITY_KEY_NOT_FOUND"
+
+    row = await catalog_admin_db_pool.fetchrow(
+        "SELECT status FROM catalog_review_items WHERE id = $1", review_item["id"],
+    )
+    assert row["status"] == "OPEN"
+    ingredient_count = await catalog_admin_db_pool.fetchval(
+        "SELECT count(*) FROM ingredients WHERE normalized_name = 'some new canonical'"
+    )
+    assert ingredient_count == 0
+
+
+async def test_dismiss_rejects_unknown_ingredient_review_items_generically(
+    review_service, source_id, catalog_admin_db_pool,
+):
+    """Generic dismiss() must never be a backdoor around identity
+    binding -- an UNKNOWN_INGREDIENT item can only be closed via
+    map_ingredient(), create_ingredient(), or reject_import_record().
+    In particular, MANUAL_OVERRIDE must never be able to silently
+    convert an unresolved ingredient identity into VALIDATED state
+    with no ingredient/alias ever actually created."""
+    import_record, review_item = await _needs_review_record(catalog_admin_db_pool, source_id)
+    assert review_item["reason_code"] == "UNKNOWN_INGREDIENT"
+
+    with pytest.raises(ReviewError) as exc_info:
+        await review_service.dismiss(
+            review_item["id"], resolution="MANUAL_OVERRIDE", actor="reviewer1", notes="skip it",
+        )
+    assert exc_info.value.code == "INGREDIENT_REVIEW_REQUIRES_EXPLICIT_RESOLUTION"
+
+    row = await catalog_admin_db_pool.fetchrow(
+        "SELECT status FROM catalog_review_items WHERE id = $1", review_item["id"],
+    )
+    assert row["status"] == "OPEN"
+    record_row = await catalog_admin_db_pool.fetchrow(
+        "SELECT status FROM catalog_import_records WHERE id = $1", import_record["id"],
+    )
+    assert record_row["status"] == "NEEDS_REVIEW"

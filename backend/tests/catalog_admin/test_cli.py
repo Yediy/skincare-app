@@ -134,7 +134,7 @@ async def test_review_list_show_and_resolve_ingredient(catalog_admin_db_pool, so
     assert detail["context"]["unresolved_ingredient_names"] == ["Mystery Thing"]
 
     code, out, err = await _run(catalog_admin_db_pool, [
-        "resolve-ingredient", review_item_id, "--raw-name", "Mystery Thing",
+        "resolve-ingredient", review_item_id,
         "--create-canonical", "Mystery Thing Extract", "--actor", "cli-reviewer",
     ])
     assert code == 0, err
@@ -156,7 +156,7 @@ async def test_resolve_ingredient_map_to_existing(catalog_admin_db_pool, source_
     review_item_id = json.loads(out)[0]["id"]
 
     code, out, err = await _run(catalog_admin_db_pool, [
-        "resolve-ingredient", review_item_id, "--raw-name", "Vitamin B3", "--map-to", str(ingredient_id),
+        "resolve-ingredient", review_item_id, "--map-to", str(ingredient_id),
     ])
     assert code == 0, err
     assert json.loads(out)["resolution"] == "MAPPED_TO_EXISTING_INGREDIENT"

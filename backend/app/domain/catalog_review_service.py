@@ -9,17 +9,31 @@ automatic path; a human explicitly choosing "map this raw string to
 ingredient X" is not fuzzy matching, it's an audited human decision
 that HAPPENS to then be recorded as a durable, exact alias so future
 imports resolve it automatically (Section 6).
+
+Identity binding (hotfix, independent review): `map_ingredient()`/
+`create_ingredient()` used to accept a caller-supplied `raw_name` and
+trust it outright -- nothing checked that it actually matched the
+`UNKNOWN_INGREDIENT` review item being resolved. An operator (or a
+scripting mistake) could resolve item A's review row while creating an
+alias for a completely unrelated string B, leaving A's own real
+problem silently marked RESOLVED without ever actually being fixed.
+`_resolve_target_raw_name()` below is now the ONLY way either method
+learns what raw string it's operating on: derived from the review
+item's own `identity_key` cross-referenced against the import record's
+current `normalized_payload`, never from an argument a caller could
+get wrong. `raw_name` is no longer a parameter of either method at
+all -- see that function's own docstring for the exact binding rule.
 """
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID
 
 import asyncpg
 
 from app.db import catalog_admin_repository as repo
 from app.db.catalog_repository import resolve_ingredient
-from app.domain.catalog_validation import reconcile_review_state
+from app.domain.catalog_validation import normalize_identity, reconcile_review_state
 
 logger = logging.getLogger(__name__)
 
@@ -73,15 +87,18 @@ class CatalogReviewService:
         return ReviewItemDetail(review_item=review_item, import_record=import_record, context=context)
 
     async def map_ingredient(
-        self, review_item_id: UUID, *, raw_name: str, ingredient_id: UUID, actor: str,
+        self, review_item_id: UUID, *, ingredient_id: UUID, actor: str,
     ) -> Dict[str, Any]:
         """Section 6/17: maps an unresolved raw string to an EXISTING
         canonical ingredient by creating a durable alias. Fails closed
         (AliasConflictError) if that normalized string already means
-        something else -- never overwrites an existing mapping."""
+        something else -- never overwrites an existing mapping. The
+        raw string itself is never caller-supplied -- see
+        `_resolve_target_raw_name`'s own docstring."""
         async with self._pool.acquire() as conn:
             async with conn.transaction():
-                review_item = await self._require_open_review_item(conn, review_item_id, "UNKNOWN_INGREDIENT")
+                review_item = await self._require_open_review_item(conn, review_item_id)
+                _, raw_name = await self._resolve_target_raw_name(conn, review_item)
 
                 conflict = await repo.find_alias_conflict(conn, raw_name)
                 if conflict is not None and conflict["ingredient_id"] != ingredient_id:
@@ -105,17 +122,20 @@ class CatalogReviewService:
                 return resolved
 
     async def create_ingredient(
-        self, review_item_id: UUID, *, raw_name: str, canonical_name: str, actor: str,
+        self, review_item_id: UUID, *, canonical_name: str, actor: str,
         ingredient_type: Optional[str] = None, inci_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Section 6: the raw string represents a genuinely new
         canonical ingredient this catalog has never seen. Creates it,
         then -- only if the raw source string differs from the new
         canonical name -- also creates an alias so this exact raw
-        string resolves automatically on any future import."""
+        string resolves automatically on any future import. The raw
+        string itself is never caller-supplied -- see
+        `_resolve_target_raw_name`'s own docstring."""
         async with self._pool.acquire() as conn:
             async with conn.transaction():
-                review_item = await self._require_open_review_item(conn, review_item_id, "UNKNOWN_INGREDIENT")
+                review_item = await self._require_open_review_item(conn, review_item_id)
+                _, raw_name = await self._resolve_target_raw_name(conn, review_item)
 
                 if await resolve_ingredient(conn, canonical_name) is not None:
                     raise ReviewError(
@@ -186,6 +206,21 @@ class CatalogReviewService:
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 review_item = await self._require_open_review_item(conn, review_item_id)
+                if review_item["reason_code"] == "UNKNOWN_INGREDIENT":
+                    # Hotfix (independent review): ingredient identity
+                    # must always go through map_ingredient()/
+                    # create_ingredient() (or reject_import_record() to
+                    # kill the whole record outright) -- never a
+                    # generic dismissal, which has no notion of the
+                    # review item's own identity_key and could
+                    # otherwise let MANUAL_OVERRIDE silently convert an
+                    # unresolved ingredient into VALIDATED state with
+                    # no ingredient/alias ever actually created.
+                    raise ReviewError(
+                        "UNKNOWN_INGREDIENT review items must be resolved via map_ingredient(), "
+                        "create_ingredient(), or reject_import_record() -- never a generic dismissal",
+                        code="INGREDIENT_REVIEW_REQUIRES_EXPLICIT_RESOLUTION",
+                    )
                 resolved = await repo.resolve_review_item(
                     conn, review_item_id, status="RESOLVED", resolution=resolution,
                     reviewed_by=actor, resolution_notes=notes,
@@ -207,18 +242,75 @@ class CatalogReviewService:
                 return resolved
 
     async def _require_open_review_item(
-        self, conn: asyncpg.Connection, review_item_id: UUID, expected_reason_code: Optional[str] = None,
+        self, conn: asyncpg.Connection, review_item_id: UUID,
     ) -> Dict[str, Any]:
         row = await conn.fetchrow("SELECT * FROM catalog_review_items WHERE id = $1 AND status = 'OPEN'", review_item_id)
         if row is None:
             raise ReviewError("review item not found or already resolved", code="REVIEW_ITEM_NOT_OPEN")
-        review_item = dict(row)
-        if expected_reason_code is not None and review_item["reason_code"] != expected_reason_code:
+        return dict(row)
+
+    async def _resolve_target_raw_name(
+        self, conn: asyncpg.Connection, review_item: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], str]:
+        """The ONLY place map_ingredient()/create_ingredient() learn
+        which raw source string they're operating on -- derived from
+        the review item's own `identity_key`, cross-referenced against
+        the import record's current `normalized_payload`, never from a
+        caller-supplied argument (Hotfix, independent review: an
+        operator could previously pass any `raw_name` at all, resolving
+        review item A's row while creating an alias for a completely
+        unrelated string B, leaving A's actual problem silently marked
+        RESOLVED without ever being fixed).
+
+        `normalize_record()`'s own duplicate-raw-name validator
+        (app/domain/catalog_normalization.py) already guarantees no two
+        ingredients in one record share a normalized raw_name, so
+        "exactly one match" is the normal case by construction -- the
+        explicit count check here is defense in depth against that
+        invariant somehow not holding (e.g. a future normalization
+        change), never trusted to hold silently.
+
+        Also requires the target to still be genuinely unresolved --
+        acting on stale state (e.g. a concurrent alias already created
+        for it) is refused rather than silently no-op'd."""
+        if review_item["reason_code"] != "UNKNOWN_INGREDIENT":
             raise ReviewError(
-                f"review item reason_code is {review_item['reason_code']!r}, expected {expected_reason_code!r}",
+                f"review item reason_code is {review_item['reason_code']!r}, expected 'UNKNOWN_INGREDIENT'",
                 code="WRONG_REASON_CODE",
             )
-        return review_item
+        identity_key = review_item.get("identity_key")
+        if not identity_key:
+            raise ReviewError(
+                "UNKNOWN_INGREDIENT review item has no identity_key -- cannot determine which "
+                "ingredient it represents",
+                code="MISSING_IDENTITY_KEY",
+            )
+
+        import_record = await repo.get_import_record(conn, review_item["import_record_id"])
+        if import_record is None or not import_record.get("normalized_payload"):
+            raise ReviewError(
+                "import record or its normalized payload is missing", code="IMPORT_RECORD_NOT_FOUND",
+            )
+
+        matches = [
+            ingredient for ingredient in import_record["normalized_payload"]["ingredients"]
+            if normalize_identity(ingredient["raw_name"]) == identity_key
+        ]
+        if len(matches) != 1:
+            raise ReviewError(
+                f"expected exactly one ingredient in the record matching identity_key {identity_key!r}, "
+                f"found {len(matches)}",
+                code="IDENTITY_KEY_AMBIGUOUS" if len(matches) > 1 else "IDENTITY_KEY_NOT_FOUND",
+            )
+        raw_name = matches[0]["raw_name"]
+
+        if await resolve_ingredient(conn, raw_name) is not None:
+            raise ReviewError(
+                f"{raw_name!r} already resolves to an existing ingredient -- nothing to resolve",
+                code="ALREADY_RESOLVED",
+            )
+
+        return import_record, raw_name
 
     async def _revalidate(self, conn: asyncpg.Connection, import_record_id: UUID) -> None:
         """Blocker 3 (independent review): never infers `VALIDATED`
