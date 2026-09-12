@@ -71,7 +71,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("resolve-ingredient", help="Resolve an UNKNOWN_INGREDIENT review item")
     p.add_argument("review_item_id")
-    p.add_argument("--raw-name", required=True, help="The exact raw source string that failed to resolve")
+    # Deliberately no --raw-name: the target raw string is derived from
+    # the review item's own identity_key (see CatalogReviewService.
+    # _resolve_target_raw_name), never a caller-supplied argument --
+    # run `review-show <review_item_id>` first to see which raw string
+    # this item represents (`context.unresolved_ingredient_names`).
     group = p.add_mutually_exclusive_group(required=True)
     group.add_argument("--map-to", metavar="INGREDIENT_ID", help="Map to an existing canonical ingredient")
     group.add_argument("--create-canonical", metavar="CANONICAL_NAME", help="Create a new canonical ingredient")
@@ -145,12 +149,11 @@ async def run(argv: List[str], pool: asyncpg.Pool, *, out=sys.stdout, err=sys.st
             service = CatalogReviewService(pool)
             if args.map_to:
                 result = await service.map_ingredient(
-                    UUID(args.review_item_id), raw_name=args.raw_name,
-                    ingredient_id=UUID(args.map_to), actor=actor,
+                    UUID(args.review_item_id), ingredient_id=UUID(args.map_to), actor=actor,
                 )
             else:
                 result = await service.create_ingredient(
-                    UUID(args.review_item_id), raw_name=args.raw_name, canonical_name=args.create_canonical,
+                    UUID(args.review_item_id), canonical_name=args.create_canonical,
                     ingredient_type=args.ingredient_type, inci_name=args.inci_name, actor=actor,
                 )
             _print(result, out=out)
