@@ -150,7 +150,16 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Build image
-        run: docker build -t skincare-app-backend:${{ github.sha }} .
+        # --pull/--no-cache: this build feeds a security gate (the
+        # Trivy scan right below) -- reusing a stale cached layer for
+        # the base image or its own `apt-get install` step would let
+        # that gate silently pass on packages that were vulnerable
+        # when the layer was first cached but have since been patched
+        # upstream, observed directly on this PR (a runner reused a
+        # cached layer with a pre-patch perl-base while a separate,
+        # cache-free run of the same Dockerfile against the same
+        # source pulled the already-patched package).
+        run: docker build --pull --no-cache -t skincare-app-backend:${{ github.sha }} .
 
       # Gating scan: fails the build on any HIGH/CRITICAL finding that
       # has an available fix. This is the actual release gate.
