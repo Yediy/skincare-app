@@ -556,6 +556,10 @@ class ProfileUpdateRequest(BaseModel):
     is_nursing: bool = False
     allergies: List[str] = []
     avoid_ingredients: List[str] = []
+    # Mobile V1 foundation (migration fd8df981ea49): self-reported
+    # subset of app.domain.priorities.PRIORITIES. Purely informational
+    # for now -- not yet read by PlanService/SafetyEngine.
+    skin_goals: List[str] = []
 
 
 @app.get("/profile")
@@ -605,3 +609,31 @@ async def withdraw_consent_route(request: ConsentWithdrawRequest, user_id: str =
     if not withdrew:
         raise HTTPException(status_code=404, detail="No active consent of this type to withdraw")
     return {"detail": "Consent withdrawn"}
+
+
+@app.get("/consent")
+async def get_consent_status(user_id: str = Depends(rate_limit_by_user(GENERAL_POLICY))):
+    """Mobile V1 foundation: no client can correctly decide "does this
+    user need to (re-)consent" from a locally-cached boolean -- that
+    boolean would go stale the moment the backend's own
+    REQUIRED_POLICY_VERSION changes (a required re-consent), and
+    `consent_events` was, until now, write-only from the API's
+    perspective (POST /consent, POST /consent/withdraw existed; no GET).
+    This is a read-only, additive addition -- it changes no existing
+    route's behavior and introduces no new persistence, only a way to
+    read what record_consent()/has_valid_consent() already establish as
+    backend truth (app/db/consent_repository.py)."""
+    from app.db.connection import get_db_pool
+    from app.db.consent_repository import (
+        REQUIRED_CONSENT_TYPE,
+        REQUIRED_POLICY_VERSION,
+        has_valid_consent,
+    )
+    valid = await has_valid_consent(
+        get_db_pool(), uuid.UUID(user_id), REQUIRED_CONSENT_TYPE, REQUIRED_POLICY_VERSION,
+    )
+    return {
+        "consent_type": REQUIRED_CONSENT_TYPE,
+        "required_policy_version": REQUIRED_POLICY_VERSION,
+        "has_valid_consent": valid,
+    }

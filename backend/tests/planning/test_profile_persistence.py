@@ -28,13 +28,46 @@ async def test_put_profile_persists_and_get_reflects_it(client):
         "is_nursing": False,
         "allergies": ["fragrance", "nuts"],
         "avoid_ingredients": ["sulfates"],
+        "skin_goals": ["EVENNESS_TONE", "REDNESS_CONTROL"],
     }
     put_resp = await client.put("/profile", json=update, headers=headers)
     assert put_resp.status_code == 200
 
     get_resp = await client.get("/profile", headers=headers)
     assert get_resp.status_code == 200
-    assert get_resp.json() == update
+    assert get_resp.json() == {**update, "profile_set": True}
+
+
+async def test_get_profile_distinguishes_never_set_from_explicit_defaults(client):
+    """Mobile V1 foundation: the onboarding bootstrap decision
+    ("authenticated + required profile incomplete -> onboarding
+    profile") needs to tell "never saved a profile" apart from "saved
+    a profile that happens to equal the defaults" -- both must not
+    look identical to a client relying on backend truth."""
+    token = await _signup_and_login(client, email="profiletest4@test.com")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    unset_resp = await client.get("/profile", headers=headers)
+    assert unset_resp.json()["profile_set"] is False
+
+    put_resp = await client.put(
+        "/profile",
+        json={
+            "has_sensitive_skin": False,
+            "experience_level": "beginner",
+            "max_routine_steps": 10,
+            "is_pregnant": False,
+            "is_nursing": False,
+            "allergies": [],
+            "avoid_ingredients": [],
+            "skin_goals": [],
+        },
+        headers=headers,
+    )
+    assert put_resp.status_code == 200
+
+    set_resp = await client.get("/profile", headers=headers)
+    assert set_resp.json()["profile_set"] is True
 
 
 async def test_analyze_route_fetches_real_profile_via_get_profile(client, db_pool):
