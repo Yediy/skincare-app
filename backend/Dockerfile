@@ -34,7 +34,22 @@ RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 # below, not assumed).
 FROM python:3.11-slim@sha256:9534e5a8e315485d4061ed659af0fd78a284c015f9b73661b41d6bab25604534 AS runtime
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# `apt-get upgrade` here is deliberate, not a contradiction of the
+# digest pin above: the pin freezes *this build's inputs*
+# (reproducibility -- a build today and next month use the same base
+# layers), but it also freezes whatever OS packages happened to be
+# baked into that digest, including ones with since-published
+# security patches Debian's own package mirror already has (observed
+# directly: this pinned digest's perl-base/perl-Archive-Tar/sqlite3
+# packages carry CVE-2026-13221 and others that Trivy's gating scan
+# correctly flags as CRITICAL/HIGH with a fix already available).
+# Upgrading against the live mirror at build time is the standard way
+# to have both: a reproducible base plus current security patches,
+# without waiting on upstream to republish python:3.11-slim under a
+# new digest (this pass checked: as of this build, `python:3.11-slim`
+# still resolves to the exact digest already pinned here -- no newer
+# base image exists yet to bump to).
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/* \
