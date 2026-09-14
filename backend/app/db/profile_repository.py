@@ -36,6 +36,19 @@ from app.db.user_constraint_repository import ALLERGY, AVOID, replace_constraint
 # user has never set a profile, /analyze must use these named defaults
 # rather than silently pretending every user has no constraints for
 # some other, unstated reason.
+#
+# `profile_set` (mobile V1 foundation) is NOT a stored column -- it's
+# derived here from whether a user_profiles row exists at all, purely
+# so a caller (the mobile onboarding bootstrap decision, in
+# particular) can tell "this user has never saved a profile" apart
+# from "this user explicitly chose every default value." Without it,
+# GET /profile is indistinguishable in both cases, which makes
+# "authenticated + required profile incomplete -> onboarding profile"
+# impossible to decide from backend truth alone.
+#
+# `skin_goals` (migration fd8df981ea49) is the user's self-reported
+# subset of app.domain.priorities.PRIORITIES -- purely informational
+# metadata for now; nothing in PlanService/SafetyEngine reads it yet.
 DEFAULT_PROFILE: Dict[str, Any] = {
     "has_sensitive_skin": False,
     "experience_level": "beginner",
@@ -44,6 +57,8 @@ DEFAULT_PROFILE: Dict[str, Any] = {
     "is_nursing": False,
     "allergies": [],
     "avoid_ingredients": [],
+    "skin_goals": [],
+    "profile_set": False,
 }
 
 
@@ -54,7 +69,7 @@ async def get_profile(pool: asyncpg.Pool, user_id: UUID) -> Dict[str, Any]:
             row = await conn.fetchrow(
                 """
                 SELECT has_sensitive_skin, experience_level, max_routine_steps,
-                       is_pregnant, is_nursing, allergies, avoid_ingredients
+                       is_pregnant, is_nursing, allergies, avoid_ingredients, skin_goals
                 FROM user_profiles WHERE user_id = $1
                 """,
                 user_id,
@@ -69,6 +84,8 @@ async def get_profile(pool: asyncpg.Pool, user_id: UUID) -> Dict[str, Any]:
         "is_nursing": row["is_nursing"],
         "allergies": list(row["allergies"]),
         "avoid_ingredients": list(row["avoid_ingredients"]),
+        "skin_goals": list(row["skin_goals"]),
+        "profile_set": True,
     }
 
 
@@ -80,9 +97,9 @@ async def upsert_profile(pool: asyncpg.Pool, user_id: UUID, profile: Dict[str, A
                 """
                 INSERT INTO user_profiles (
                     user_id, has_sensitive_skin, experience_level, max_routine_steps,
-                    is_pregnant, is_nursing, allergies, avoid_ingredients, updated_at
+                    is_pregnant, is_nursing, allergies, avoid_ingredients, skin_goals, updated_at
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
                 ON CONFLICT (user_id) DO UPDATE SET
                     has_sensitive_skin = EXCLUDED.has_sensitive_skin,
                     experience_level = EXCLUDED.experience_level,
@@ -91,6 +108,7 @@ async def upsert_profile(pool: asyncpg.Pool, user_id: UUID, profile: Dict[str, A
                     is_nursing = EXCLUDED.is_nursing,
                     allergies = EXCLUDED.allergies,
                     avoid_ingredients = EXCLUDED.avoid_ingredients,
+                    skin_goals = EXCLUDED.skin_goals,
                     updated_at = now()
                 """,
                 user_id,
@@ -101,6 +119,7 @@ async def upsert_profile(pool: asyncpg.Pool, user_id: UUID, profile: Dict[str, A
                 profile["is_nursing"],
                 profile["allergies"],
                 profile["avoid_ingredients"],
+                profile.get("skin_goals", []),
             )
 
     # Dual-write (see module docstring): keeps user_ingredient_constraints

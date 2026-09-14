@@ -5,7 +5,7 @@ tests is whether the consent gate lets the request through to the CV
 pipeline (a 422 from bad image bytes) rather than blocking it upfront
 with a 403, not whether a full analysis succeeds.
 """
-from app.db.consent_repository import REQUIRED_POLICY_VERSION
+from app.db.consent_repository import REQUIRED_CONSENT_TYPE, REQUIRED_POLICY_VERSION
 
 
 async def _signup_and_login(client, email):
@@ -75,6 +75,38 @@ async def test_withdrawn_consent_denies_analyze(client):
 
     denied = await client.post("/analyze", json={"image_base64": "aGVsbG8="}, headers=headers)
     assert denied.status_code == 403
+
+
+async def test_get_consent_status_reflects_backend_truth_not_a_local_boolean(client):
+    """Mobile V1 foundation: GET /consent (new, additive, read-only)
+    is the only way a client can know current consent state without
+    caching its own boolean -- proven here across the full grant ->
+    valid -> withdraw -> invalid lifecycle."""
+    token = await _signup_and_login(client, "getconsent@test.com")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    initial = await client.get("/consent", headers=headers)
+    assert initial.status_code == 200
+    body = initial.json()
+    assert body["has_valid_consent"] is False
+    assert body["consent_type"] == REQUIRED_CONSENT_TYPE
+    assert body["required_policy_version"] == REQUIRED_POLICY_VERSION
+
+    await client.post(
+        "/consent", json={"policy_version": REQUIRED_POLICY_VERSION, "purpose": "facial skin analysis"},
+        headers=headers,
+    )
+    granted = await client.get("/consent", headers=headers)
+    assert granted.json()["has_valid_consent"] is True
+
+    await client.post("/consent/withdraw", json={}, headers=headers)
+    withdrawn = await client.get("/consent", headers=headers)
+    assert withdrawn.json()["has_valid_consent"] is False
+
+
+async def test_get_consent_status_requires_authentication(client):
+    resp = await client.get("/consent")
+    assert resp.status_code == 401
 
 
 async def test_consent_history_is_append_only(client, db_pool):

@@ -125,6 +125,39 @@ jobs:
         continue-on-error: true
         run: pip-audit -r requirements-dev.txt --ignore-vuln PYSEC-2026-1805
 
+  mobile-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: mobile/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test -- --ci
+      # Production dependency security gate -- fails on any HIGH/CRITICAL
+      # finding in a non-dev dependency. Moderate-only findings (the
+      # current, fully documented state -- see
+      # MOBILE_DEPENDENCY_SECURITY_STATUS.md) do not fail this gate: every
+      # one of them is either build-time-only tooling never bundled into
+      # the shipped app, or has no compatible fix available without a
+      # major Expo SDK downgrade. Never `npm audit fix --force` here --
+      # see that document for why.
+      - name: npm audit (production dependencies -- release gate)
+        run: npm audit --omit=dev --audit-level=high
+      # Full audit (including dev/test-only dependencies) -- informational
+      # only, never gates the build. Keeps every finding visible in CI
+      # logs, including ones the gate above doesn't fail on.
+      - name: npm audit (full, including dev -- informational, not a release gate)
+        continue-on-error: true
+        run: npm audit --json
+
   docker-build-and-scan:
     runs-on: ubuntu-latest
     defaults:
@@ -133,7 +166,16 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Build image
-        run: docker build -t skincare-app-backend:${{ github.sha }} .
+        # --pull/--no-cache: this build feeds a security gate (the
+        # Trivy scan right below) -- reusing a stale cached layer for
+        # the base image or its own `apt-get install` step would let
+        # that gate silently pass on packages that were vulnerable
+        # when the layer was first cached but have since been patched
+        # upstream, observed directly on this PR (a runner reused a
+        # cached layer with a pre-patch perl-base while a separate,
+        # cache-free run of the same Dockerfile against the same
+        # source pulled the already-patched package).
+        run: docker build --pull --no-cache -t skincare-app-backend:${{ github.sha }} .
 
       # Gating scan: fails the build on any HIGH/CRITICAL finding that
       # has an available fix. This is the actual release gate.

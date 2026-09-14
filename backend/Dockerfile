@@ -34,7 +34,41 @@ RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 # below, not assumed).
 FROM python:3.11-slim@sha256:9534e5a8e315485d4061ed659af0fd78a284c015f9b73661b41d6bab25604534 AS runtime
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# `apt-get upgrade` here is a deliberate, honest tradeoff, NOT a
+# reproducible build -- correcting an earlier version of this comment
+# that claimed both at once, which isn't possible:
+#
+#   - The digest pin above fixes the base image's own bytes: a build
+#     today and a build next month start `FROM` the exact same layers.
+#   - This `apt-get upgrade` step then resolves whatever OS package
+#     versions the live Debian package mirror currently serves --
+#     that mirror's contents change over time (new security patches
+#     land on it continuously), so THIS step is not pinned to
+#     anything, and two builds of this exact Dockerfile on two
+#     different days can end up with different OS package versions
+#     baked into the final image.
+#   - So: base image bytes are pinned; OS package patch level is
+#     resolved from the live Debian repository at build time; the
+#     final image is therefore NOT bit-reproducible across builds.
+#     That's an intentional choice, not an oversight -- CI prefers
+#     shipping current security fixes (this pinned digest's
+#     perl-base/perl-Archive-Tar/sqlite3 packages carry CVE-2026-13221
+#     and others that Trivy's gating scan correctly flags as
+#     CRITICAL/HIGH with a fix already available) over waiting for
+#     upstream to republish `python:3.11-slim` under a new digest that
+#     would let a fully pinned build carry the same patches (this pass
+#     checked: as of this build, `python:3.11-slim` still resolves to
+#     the exact digest already pinned here -- no newer base image
+#     exists yet to bump to).
+#
+# A future architecture that gets both properties -- reproducibility
+# AND current patches, without this live-mirror variability -- would
+# have CI build once, security-scan that one build, and push its
+# resulting image digest immutably to a registry; every deployment
+# then promotes that already-scanned digest rather than rebuilding.
+# That registry/promotion pipeline does not exist yet and is not part
+# of this change -- documented here as the direction, not built now.
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/* \

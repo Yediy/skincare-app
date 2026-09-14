@@ -8,11 +8,12 @@ from typing import List, Literal
 from asyncpg.exceptions import UniqueViolationError
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
 from app.api.v2.analyses import router as analyses_v2_router
 from app.api.v2.webhooks import router as webhooks_v2_router
 from app.config import settings
+from app.domain.priorities import PRIORITIES
 from app.cv.pipeline import FacialAnalysisPipeline, NoFaceDetectedError, CaptureQualityFailedError
 from app.domain.entitlement import (
     AnalysisAlreadyCompletedError,
@@ -548,6 +549,15 @@ async def delete_account(user_id: str = Depends(rate_limit_by_user(GENERAL_POLIC
     return {"detail": "Account deleted"}
 
 
+_MAX_SKIN_GOALS = len(PRIORITIES)
+# Generous relative to any real PRIORITIES key (the longest today is
+# well under 30 characters) -- this bound exists only to keep a
+# malformed/adversarial entry from ever reaching the membership-check
+# error message below, not because a legitimate id could plausibly be
+# this long.
+_MAX_SKIN_GOAL_LENGTH = 100
+
+
 class ProfileUpdateRequest(BaseModel):
     has_sensitive_skin: bool = False
     experience_level: Literal["beginner", "intermediate", "advanced"] = "beginner"
@@ -556,6 +566,29 @@ class ProfileUpdateRequest(BaseModel):
     is_nursing: bool = False
     allergies: List[str] = []
     avoid_ingredients: List[str] = []
+    # Mobile V1 foundation (migration fd8df981ea49): self-reported
+    # subset of app.domain.priorities.PRIORITIES. Purely informational
+    # for now -- not yet read by PlanService/SafetyEngine. Enforced
+    # below, not just documented -- the mobile client's own
+    # SKIN_GOAL_OPTIONS restricting *its* UI is not a substitute for
+    # server-side validation, since the HTTP API remains authoritative
+    # over what actually gets persisted.
+    skin_goals: List[str] = Field(default=[], max_length=_MAX_SKIN_GOALS)
+
+    @field_validator("skin_goals")
+    @classmethod
+    def _validate_skin_goals(cls, value: List[str]) -> List[str]:
+        for goal in value:
+            if len(goal) > _MAX_SKIN_GOAL_LENGTH:
+                raise ValueError(f"skin_goals entries must be at most {_MAX_SKIN_GOAL_LENGTH} characters")
+        if len(value) != len(set(value)):
+            raise ValueError("skin_goals must not contain duplicate entries")
+        unknown = sorted(set(goal for goal in value if goal not in PRIORITIES))
+        if unknown:
+            raise ValueError(
+                f"Unknown skin_goals: {unknown}. Must be a subset of {sorted(PRIORITIES)}"
+            )
+        return value
 
 
 @app.get("/profile")
@@ -605,3 +638,31 @@ async def withdraw_consent_route(request: ConsentWithdrawRequest, user_id: str =
     if not withdrew:
         raise HTTPException(status_code=404, detail="No active consent of this type to withdraw")
     return {"detail": "Consent withdrawn"}
+
+
+@app.get("/consent")
+async def get_consent_status(user_id: str = Depends(rate_limit_by_user(GENERAL_POLICY))):
+    """Mobile V1 foundation: no client can correctly decide "does this
+    user need to (re-)consent" from a locally-cached boolean -- that
+    boolean would go stale the moment the backend's own
+    REQUIRED_POLICY_VERSION changes (a required re-consent), and
+    `consent_events` was, until now, write-only from the API's
+    perspective (POST /consent, POST /consent/withdraw existed; no GET).
+    This is a read-only, additive addition -- it changes no existing
+    route's behavior and introduces no new persistence, only a way to
+    read what record_consent()/has_valid_consent() already establish as
+    backend truth (app/db/consent_repository.py)."""
+    from app.db.connection import get_db_pool
+    from app.db.consent_repository import (
+        REQUIRED_CONSENT_TYPE,
+        REQUIRED_POLICY_VERSION,
+        has_valid_consent,
+    )
+    valid = await has_valid_consent(
+        get_db_pool(), uuid.UUID(user_id), REQUIRED_CONSENT_TYPE, REQUIRED_POLICY_VERSION,
+    )
+    return {
+        "consent_type": REQUIRED_CONSENT_TYPE,
+        "required_policy_version": REQUIRED_POLICY_VERSION,
+        "has_valid_consent": valid,
+    }
