@@ -1,5 +1,5 @@
 import { request, type RequestOptions } from "@/api/client";
-import { ApiError } from "@/api/errors";
+import { ApiError, genericMessageFor } from "@/api/errors";
 import type { AuthTokens } from "@/types/domain";
 import { logger } from "@/utils/logger";
 
@@ -49,13 +49,10 @@ export function createRefreshCoordinator(deps: RefreshCoordinatorDeps) {
           retryable: false,
         });
       }
+
+      let tokens: AuthTokens;
       try {
-        const tokens = await deps.refreshTokens(refreshToken);
-        // Access + refresh replaced together before this resolves --
-        // every waiter reads the new access token only after both are
-        // durably stored.
-        await deps.tokenStorage.setTokens(tokens.access_token, tokens.refresh_token);
-        return tokens.access_token;
+        tokens = await deps.refreshTokens(refreshToken);
       } catch (err) {
         // A network outage, timeout, or backend 5xx while calling
         // /refresh proves NOTHING about the refresh token itself --
@@ -76,6 +73,42 @@ export function createRefreshCoordinator(deps: RefreshCoordinatorDeps) {
         }
         throw err;
       }
+
+      // The server has ALREADY consumed the old refresh token and
+      // minted the new pair by this point -- there is no going back to
+      // the old one. A failure to durably persist the new pair must
+      // therefore never be treated as "retry with the old token" (it's
+      // already dead server-side) -- fail closed: best-effort clear
+      // whatever local state might be inconsistent, end the session,
+      // and require normal re-authentication. Deliberately a SEPARATE
+      // try/catch from the one above -- this failure must never be
+      // reclassified by that block's transient-vs-definite-auth-failure
+      // logic (which doesn't apply here at all; this isn't a rejection
+      // by the backend, it's a local storage failure after success).
+      try {
+        await deps.tokenStorage.setTokenPair(tokens);
+      } catch (storageErr) {
+        logger.error(
+          "failed to persist the rotated token pair after a successful refresh; the old refresh token is " +
+            "already consumed server-side and will not be retried -- ending the session",
+          storageErr,
+        );
+        await deps.tokenStorage.clear().catch(() => {
+          // Best-effort: the thing that just failed was a SecureStore
+          // write, so a subsequent SecureStore delete may fail too --
+          // onSessionInvalid()/SIGNED_OUT below is what actually makes
+          // the app stop trusting any stale in-memory state regardless.
+        });
+        await deps.onSessionInvalid();
+        throw new ApiError({
+          status: null,
+          code: "TOKEN_STORAGE_ERROR",
+          message: genericMessageFor("TOKEN_STORAGE_ERROR"),
+          retryable: false,
+        });
+      }
+
+      return tokens.access_token;
     })();
 
     try {

@@ -19,6 +19,7 @@ export type ApiErrorCode =
   | "RATE_LIMITED"
   | "SERVER_ERROR"
   | "MALFORMED_RESPONSE"
+  | "TOKEN_STORAGE_ERROR"
   | "UNKNOWN";
 
 export type ApiErrorInit = {
@@ -59,6 +60,7 @@ const GENERIC_MESSAGES: Record<ApiErrorCode, string> = {
   RATE_LIMITED: "Too many attempts. Please wait a moment and try again.",
   SERVER_ERROR: "Something went wrong on our end. Please try again shortly.",
   MALFORMED_RESPONSE: "We received an unexpected response. Please try again.",
+  TOKEN_STORAGE_ERROR: "We couldn't securely save your session. Please sign in again.",
   UNKNOWN: "Something went wrong. Please try again.",
 };
 

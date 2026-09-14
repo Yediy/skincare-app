@@ -51,13 +51,13 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
       state,
       async signIn(email, password) {
         const tokens = await login({ email, password });
-        await tokenStorage.setTokens(tokens.access_token, tokens.refresh_token);
+        await tokenStorage.setTokenPair(tokens);
         setState({ status: "AUTHENTICATED" });
       },
       async signUp(email, password) {
         await signup({ email, password });
         const tokens = await login({ email, password });
-        await tokenStorage.setTokens(tokens.access_token, tokens.refresh_token);
+        await tokenStorage.setTokenPair(tokens);
         setState({ status: "AUTHENTICATED" });
       },
       async signOut() {
