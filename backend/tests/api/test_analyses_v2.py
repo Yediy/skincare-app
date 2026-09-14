@@ -181,3 +181,47 @@ async def test_home_region_and_cell_id_are_snapshotted_onto_the_request(client, 
     )
     assert row["home_region"] == settings.launch_home_region
     assert row["cell_id"] == settings.launch_cell_id
+
+
+async def test_get_completed_analysis_includes_metric_results(client, db_pool, app_db_pool):
+    """Mobile V1 Phase B: GET must expose the per-metric VALID/
+    BORDERLINE/ABSTAINED breakdown (analysis_measurements), not just
+    the aggregate `scores` blob -- an ABSTAINED metric's `value` must
+    round-trip as null, never a fabricated number."""
+    from app.db import analysis_repository, usage_repository
+
+    headers = await _signup_login_consent(client, "v2-metric-results@test.com")
+    user_row = await db_pool.fetchrow("SELECT id FROM users WHERE email = $1", "v2-metric-results@test.com")
+    user_id = user_row["id"]
+
+    req = await analysis_repository.create_request(app_db_pool, user_id, str(uuid.uuid4()))
+    reservation = await usage_repository.reserve(app_db_pool, user_id, str(uuid.uuid4()), "2026-09", allowance=5)
+    await analysis_repository.commit_analysis_result(
+        app_db_pool, user_id, req["id"],
+        capture_assessment={"quality_status": "PASS"},
+        scores={"skin_health_score": 0.8},
+        plan={"top_priorities": []},
+        eligible_for_longitudinal_comparison=True,
+        pipeline_version="test-1.0",
+        metric_results={
+            "evenness_score": {"value": 0.72, "confidence": 0.9, "status": "VALID", "uncertainty_reasons": []},
+            "redness_score": {
+                "value": None, "confidence": 0.1, "status": "ABSTAINED",
+                "uncertainty_reasons": ["excessive_blur"],
+            },
+        },
+        product_recommendations=[],
+        usage_reservation_id=reservation.id,
+    )
+
+    resp = await client.get(f"/api/v2/analyses/{req['id']}", headers=headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "COMPLETED"
+
+    metrics = {m["metric_name"]: m for m in body["metric_results"]}
+    assert metrics["evenness_score"]["status"] == "VALID"
+    assert metrics["evenness_score"]["value"] == pytest.approx(0.72)
+    assert metrics["redness_score"]["status"] == "ABSTAINED"
+    assert metrics["redness_score"]["value"] is None
+    assert metrics["redness_score"]["uncertainty_reasons"] == ["excessive_blur"]

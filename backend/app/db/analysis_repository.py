@@ -214,6 +214,34 @@ async def get_product_recommendations(pool: asyncpg.Pool, user_id: UUID, analysi
     return results
 
 
+async def get_measurements(pool: asyncpg.Pool, user_id: UUID, analysis_request_id: UUID) -> List[Dict[str, Any]]:
+    """Mobile V1 Phase B: per-metric detail (value/confidence/status/
+    uncertainty_reasons) was persisted by commit_analysis_result() from
+    day one, but nothing previously read it back out -- GET
+    /api/v2/analyses/{id} exposed only the aggregate `scores` blob,
+    never the per-metric VALID/BORDERLINE/ABSTAINED breakdown a client
+    needs to render abstention/uncertainty honestly (never a fabricated
+    numeric value for an ABSTAINED metric). Additive-only: a new field
+    on the existing response, nothing removed or reshaped."""
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.current_user_id', $1, true)", str(user_id))
+            rows = await conn.fetch(
+                "SELECT * FROM analysis_measurements WHERE analysis_request_id = $1 ORDER BY metric_name",
+                analysis_request_id,
+            )
+    results = []
+    for r in rows:
+        m = dict(r)
+        if isinstance(m["uncertainty_reasons"], str):
+            m["uncertainty_reasons"] = json.loads(m["uncertainty_reasons"])
+        if m["value"] is not None:
+            m["value"] = float(m["value"])
+        m["confidence"] = float(m["confidence"])
+        results.append(m)
+    return results
+
+
 async def find_overdue_ephemeral_images(pool: asyncpg.Pool, *, batch_limit: int = 100) -> List[Dict[str, Any]]:
     """Cross-user by design -- the safety-net cleanup sweeper (Part IV,
     Phase 22) needs to find overdue images regardless of which user

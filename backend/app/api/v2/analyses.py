@@ -142,6 +142,10 @@ class AnalysisStatusResponse(BaseModel):
     error_code: Optional[str] = None
     result: Optional[Dict[str, Any]] = None
     product_recommendations: Optional[List[Dict[str, Any]]] = None
+    # Mobile V1 Phase B addition: per-metric VALID/BORDERLINE/ABSTAINED
+    # detail (see app/db/analysis_repository.py::get_measurements) --
+    # additive only, every existing field/behavior above is unchanged.
+    metric_results: Optional[List[Dict[str, Any]]] = None
 
 
 # Safe, client-facing error classifications only -- never the raw
@@ -189,6 +193,7 @@ async def get_analysis(
         response.product_recommendations = await analysis_repository.get_product_recommendations(
             pool, user_uuid, analysis_uuid,
         )
+        response.metric_results = await analysis_repository.get_measurements(pool, user_uuid, analysis_uuid)
     elif req["status"] == "FAILED":
         raw_code = req.get("error_code")
         response.error_code = raw_code if raw_code in _SAFE_ERROR_CODES else "ANALYSIS_FAILED"
