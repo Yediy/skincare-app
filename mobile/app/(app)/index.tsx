@@ -35,8 +35,9 @@ export default function AppHome() {
       <Card>
         <Text style={[theme.typography.subtitle, { color: theme.colors.foreground }]}>Skin analysis</Text>
         <Text style={[theme.typography.body, { color: theme.colors.muted }]}>
-          Skin analysis arrives in the next build phase.
+          Get an image-derived estimate of your skin&apos;s appearance in a few minutes.
         </Text>
+        <Button label="Start skin analysis" onPress={() => router.push("/(app)/analysis")} />
       </Card>
 
       <Card>
