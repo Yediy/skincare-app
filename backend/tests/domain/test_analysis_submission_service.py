@@ -2,8 +2,11 @@
 async submission failure-saga hardening (create_request failure
 releases quota; an R2-upload-then-DB-enqueue failure compensates
 rather than orphaning the object/reservation), concurrent idempotent
-submit semantics (real DB uniqueness, no process-local lock), and
-strict base64 validation.
+submit semantics (real DB uniqueness, no process-local lock), strict
+base64 validation, and (Mobile Phase B post-merge audit repair pass,
+section 7) the server-side image-size/dimension limits that make this
+endpoint independent of whatever the mobile client claims to have
+resized.
 
 Runs against the real restricted skincare_app role (app_db_pool) and a
 real PostgresJobQueue -- nothing here mocks Postgres concurrency,
@@ -13,15 +16,23 @@ failure-window tests, a deliberately-broken create_request/enqueue.
 """
 import asyncio
 import base64
+import io
 import uuid
+from pathlib import Path
 
 import pytest
+from PIL import Image as PILImage
 
 from app.db import analysis_repository
 from app.domain.analysis_submission_service import (
+    MAX_ANALYSIS_BASE64_CHARS,
+    MAX_ANALYSIS_DECODED_BYTES,
+    MAX_ANALYSIS_IMAGE_LONG_EDGE,
+    MAX_ANALYSIS_IMAGE_PIXELS,
     AnalysisSubmissionService,
     AsyncImageStorageDisabledError,
     ConsentRequiredError,
+    ImagePayloadTooLargeError,
     InvalidImageError,
 )
 from app.domain.entitlement import FreeTierEntitlementService, QuotaExceededError, UsagePolicyService
@@ -30,8 +41,25 @@ from app.queue.postgres_queue import PostgresJobQueue
 from app.storage.base import ObjectNotFoundError, ObjectStorage, ObjectStorageUnavailableError
 from app.storage.ephemeral_image_store import EphemeralAnalysisImageStore
 
-VALID_IMAGE_B64 = base64.b64encode(b"fake-jpeg-bytes-not-really-an-image").decode()
+GRACE_HOPPER_JPG = Path(__file__).resolve().parent.parent / "fixtures" / "grace_hopper.jpg"
+# A real, decodable 512x600 JPEG -- unlike the old fixture below, this
+# must survive the section-7 Pillow header check, since every
+# successful-submission test in this file uses it.
+VALID_IMAGE_B64 = base64.b64encode(GRACE_HOPPER_JPG.read_bytes()).decode()
+# Valid base64 (decodes cleanly) but not any recognizable image format
+# at all -- exercises the base64-is-fine/content-is-not path,
+# distinctly from INVALID_IMAGE_B64 (bad base64 syntax) below.
+NOT_AN_IMAGE_B64 = base64.b64encode(b"fake-jpeg-bytes-not-really-an-image").decode()
 INVALID_IMAGE_B64 = "!!!not-valid-base64$$$"
+
+
+def _jpeg_b64(width: int, height: int) -> str:
+    """A real, minimal JPEG of exactly the given dimensions -- for
+    exercising the section-7C dimension/pixel-count bound without
+    needing a checked-in oversized fixture file."""
+    buf = io.BytesIO()
+    PILImage.new("RGB", (width, height), color=(128, 128, 128)).save(buf, format="JPEG")
+    return base64.b64encode(buf.getvalue()).decode()
 
 
 class FakeObjectStorage(ObjectStorage):
@@ -323,3 +351,109 @@ async def test_concurrent_first_submissions_same_request_id_resolve_to_one_analy
     assert usage_count == 1
     job_count = await db_pool.fetchval("SELECT COUNT(*) FROM jobs WHERE request_id = $1", request_id)
     assert job_count == 1
+
+
+# Section 7: server-side image input limits. "The mobile client is not
+# a security boundary" -- these exercise the service independently of
+# any HTTP layer, mirroring the failure-mode style of the base64-
+# validation tests above.
+
+async def test_oversized_encoded_payload_is_rejected_before_decoding_and_releases_quota(db_pool, app_db_pool):
+    user_id = await _create_user_with_consent(db_pool, "sub-b64toolong@test.com")
+    service = _service(app_db_pool)
+    request_id = str(uuid.uuid4())
+    oversized_b64 = "A" * (MAX_ANALYSIS_BASE64_CHARS + 1)
+
+    with pytest.raises(ImagePayloadTooLargeError):
+        await service.submit(user_id, request_id, oversized_b64)
+
+    usage = await db_pool.fetchrow("SELECT status FROM analysis_usage WHERE request_id = $1", request_id)
+    assert usage["status"] == "RELEASED"
+    req = await analysis_repository.get_request_by_request_id(app_db_pool, user_id, request_id)
+    assert req is None  # create_request() must never have been reached
+
+
+async def test_oversized_decoded_payload_is_rejected_and_releases_quota(db_pool, app_db_pool):
+    """A payload whose DECODED byte count exceeds
+    MAX_ANALYSIS_DECODED_BYTES must be rejected as too large. Given
+    these particular constants (MAX_ANALYSIS_BASE64_CHARS == exactly
+    4/3 * MAX_ANALYSIS_DECODED_BYTES), any such payload's *encoded*
+    length also exceeds MAX_ANALYSIS_BASE64_CHARS -- base64 can never
+    decode to more bytes than 3/4 of its own encoded length -- so this
+    is in practice caught by the encoded-length pre-filter before the
+    dedicated post-decode byte-count check ever runs. Both are real,
+    independently-implemented layers (defense in depth: the pre-filter
+    is a cheap string-length check with no decode step, the post-decode
+    check is the authoritative one against the actual bytes); this test
+    asserts the resulting behavior -- rejected as too large, quota
+    released -- which holds regardless of which layer fires first."""
+    user_id = await _create_user_with_consent(db_pool, "sub-decodedtoolong@test.com")
+    service = _service(app_db_pool)
+    request_id = str(uuid.uuid4())
+    oversized_decoded_b64 = base64.b64encode(b"\x00" * (MAX_ANALYSIS_DECODED_BYTES + 1)).decode()
+
+    with pytest.raises(ImagePayloadTooLargeError):
+        await service.submit(user_id, request_id, oversized_decoded_b64)
+
+    usage = await db_pool.fetchrow("SELECT status FROM analysis_usage WHERE request_id = $1", request_id)
+    assert usage["status"] == "RELEASED"
+
+
+async def test_excessive_dimensions_are_rejected_and_release_quota(db_pool, app_db_pool):
+    user_id = await _create_user_with_consent(db_pool, "sub-toowide@test.com")
+    service = _service(app_db_pool)
+    request_id = str(uuid.uuid4())
+    too_wide_b64 = _jpeg_b64(MAX_ANALYSIS_IMAGE_LONG_EDGE + 1, 100)
+
+    with pytest.raises(InvalidImageError):
+        await service.submit(user_id, request_id, too_wide_b64)
+
+    usage = await db_pool.fetchrow("SELECT status FROM analysis_usage WHERE request_id = $1", request_id)
+    assert usage["status"] == "RELEASED"
+
+
+async def test_pixel_count_at_exactly_the_bound_is_accepted_not_rejected(db_pool, app_db_pool):
+    """A square image exactly at both MAX_ANALYSIS_IMAGE_LONG_EDGE and
+    MAX_ANALYSIS_IMAGE_PIXELS (2048x2048 == 4,194,304px, by
+    construction of these two constants) must be accepted -- the
+    pixel-count check is a real, independently-evaluated bound (not
+    merely a by-product of the dimension check), and its boundary is
+    "greater than", never "greater than or equal to"."""
+    assert MAX_ANALYSIS_IMAGE_LONG_EDGE * MAX_ANALYSIS_IMAGE_LONG_EDGE == MAX_ANALYSIS_IMAGE_PIXELS
+    user_id = await _create_user_with_consent(db_pool, "sub-exactlimit@test.com")
+    service = _service(app_db_pool)
+    request_id = str(uuid.uuid4())
+    at_limit_b64 = _jpeg_b64(MAX_ANALYSIS_IMAGE_LONG_EDGE, MAX_ANALYSIS_IMAGE_LONG_EDGE)
+
+    result = await service.submit(user_id, request_id, at_limit_b64)
+
+    assert result.status == "QUEUED"
+
+
+async def test_malformed_image_bytes_that_are_valid_base64_are_rejected(db_pool, app_db_pool):
+    """Distinct from INVALID_IMAGE_B64 (bad base64 syntax): this base64
+    decodes cleanly, but the resulting bytes are not any recognizable
+    image format at all."""
+    user_id = await _create_user_with_consent(db_pool, "sub-notanimage@test.com")
+    service = _service(app_db_pool)
+    request_id = str(uuid.uuid4())
+
+    with pytest.raises(InvalidImageError):
+        await service.submit(user_id, request_id, NOT_AN_IMAGE_B64)
+
+    usage = await db_pool.fetchrow("SELECT status FROM analysis_usage WHERE request_id = $1", request_id)
+    assert usage["status"] == "RELEASED"
+
+
+async def test_ordinary_1600px_jpeg_is_accepted(db_pool, app_db_pool):
+    """The official mobile client's own resize bound -- comfortably
+    inside every section-7 server-side limit -- must never be
+    rejected."""
+    user_id = await _create_user_with_consent(db_pool, "sub-1600ok@test.com")
+    service = _service(app_db_pool)
+    request_id = str(uuid.uuid4())
+    normal_b64 = _jpeg_b64(1600, 1200)
+
+    result = await service.submit(user_id, request_id, normal_b64)
+
+    assert result.status == "QUEUED"

@@ -30,7 +30,7 @@
       [
         "expo-camera",
         {
-          "cameraPermission": "Camera access is used only to capture a photo of your face for skin analysis. Photos are processed temporarily and are not saved to your device.",
+          "cameraPermission": "Camera access is used only to capture a photo of your face for skin analysis. Your photo is temporarily stored in this app's cache for analysis and is not added to your photo library.",
           "recordAudioAndroid": false
         }
       ]

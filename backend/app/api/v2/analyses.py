@@ -21,6 +21,7 @@ from app.domain.analysis_submission_service import (
     AnalysisSubmissionService,
     AsyncImageStorageDisabledError,
     ConsentRequiredError,
+    ImagePayloadTooLargeError,
     InvalidImageError,
 )
 from app.domain.entitlement import (
@@ -127,8 +128,12 @@ async def submit_analysis(
             status_code=409,
             detail="This request_id is already being processed. Wait for it to finish, or retry with a new request_id.",
         )
+    except ImagePayloadTooLargeError:
+        # Section 7F: a deliberate, safe 413 -- never the underlying
+        # byte-count numbers or any decoder detail.
+        raise HTTPException(status_code=413, detail="Image payload is too large.")
     except InvalidImageError:
-        raise HTTPException(status_code=422, detail="image_base64 is not valid base64")
+        raise HTTPException(status_code=422, detail="image_base64 is not a valid, supported image")
 
     return AnalysisSubmitResponse(
         analysis_id=str(result.analysis_request_id), request_id=request.request_id, status=result.status,
