@@ -5,7 +5,14 @@ import { Image, StyleSheet, Text, View } from "react-native";
 
 import { ApiError } from "@/api/errors";
 import { captureAttemptReducer, type CaptureAttempt, type CaptureAttemptAction } from "@/analysis/capture-attempt";
-import { CAMERA_INIT_FAILURE_MESSAGE, CAPTURE_FAILURE_MESSAGE, canStartCapture } from "@/analysis/camera-capture-policy";
+import {
+  CAMERA_INIT_FAILURE_MESSAGE,
+  CAPTURE_FAILURE_MESSAGE,
+  cameraReadinessReducer,
+  canStartCapture,
+  decideCaptureOwnership,
+  INITIAL_CAMERA_READINESS_STATE,
+} from "@/analysis/camera-capture-policy";
 import { useCameraPermissionState } from "@/analysis/camera-permission";
 import { deleteLocalCaptureFile } from "@/analysis/capture-file";
 import { useSubmitAnalysis } from "@/analysis/use-submit-analysis";
@@ -46,13 +53,32 @@ export default function CaptureScreen() {
   );
   const [consentDenied, setConsentDenied] = useState(false);
 
-  // Real-device camera readiness/concurrency state (section 4): the
-  // capture button is disabled until the camera itself reports ready,
-  // and capturePending blocks a second concurrent takePictureAsync()
-  // call from a rapid repeated tap.
-  const [cameraReady, setCameraReady] = useState(false);
+  // Real-device camera readiness/concurrency state (section 4, and
+  // post-merge audit repair items 1/2): the capture button is disabled
+  // until the CURRENTLY MOUNTED camera instance reports ready --
+  // cameraReadiness is invalidated on every path that leaves or
+  // returns to the live camera, so a stale "ready" from a previous
+  // CameraView instance can never leak into a newly mounted one (see
+  // camera-capture-policy.ts's cameraReadinessReducer) -- and
+  // capturePending blocks a second concurrent takePictureAsync() call
+  // from a rapid repeated tap.
+  const [cameraReadiness, dispatchCameraReadiness] = useReducer(cameraReadinessReducer, INITIAL_CAMERA_READINESS_STATE);
   const [capturePending, setCapturePending] = useState(false);
   const [captureError, setCaptureError] = useState<string | null>(null);
+
+  // Ownership of the in-flight capture lifecycle (item 2). A native
+  // takePictureAsync() promise can outlive this screen -- system Back,
+  // a gesture, a deep link, or any other navigation can unmount this
+  // component while the promise is still pending. When it resolves
+  // after that, the returned photo must be deleted, never adopted into
+  // `capture` state or dispatched anywhere -- see decideCaptureOwnership().
+  const stillOwnsCaptureLifecycleRef = useRef(true);
+  useEffect(() => {
+    stillOwnsCaptureLifecycleRef.current = true;
+    return () => {
+      stillOwnsCaptureLifecycleRef.current = false;
+    };
+  }, []);
 
   // Component-cleanup deletion (section 7): whenever `capture` changes
   // away from a given value -- including on unmount (back button, deep
@@ -69,45 +95,80 @@ export default function CaptureScreen() {
   }, [capture]);
 
   const handleCameraReady = useCallback(() => {
-    setCameraReady(true);
+    dispatchCameraReadiness({ type: "CAMERA_READY" });
   }, []);
 
   const handleCameraMountError = useCallback(() => {
-    setCameraReady(false);
+    dispatchCameraReadiness({ type: "CAMERA_INVALIDATED" });
     setCaptureError(CAMERA_INIT_FAILURE_MESSAGE);
   }, []);
 
   const handleCapture = useCallback(async () => {
     if (!cameraRef.current) return;
-    if (!canStartCapture({ cameraReady, capturePending })) return;
+    if (!canStartCapture({ cameraReady: cameraReadiness.cameraReady, capturePending })) return;
 
     setCapturePending(true);
+    let photo: { uri: string; width: number; height: number } | undefined;
     try {
-      const photo = await cameraRef.current.takePictureAsync({ quality: 1 });
-      if (photo) {
-        dispatchCapture({ type: "CAPTURED", uri: photo.uri, width: photo.width, height: photo.height });
-        setCaptureError(null);
-      }
+      photo = await cameraRef.current.takePictureAsync({ quality: 1 });
     } catch {
       // Never logs the underlying exception -- it could carry a file
       // URI. Safe, nontechnical copy only.
-      setCaptureError(CAPTURE_FAILURE_MESSAGE);
+      if (stillOwnsCaptureLifecycleRef.current) {
+        setCaptureError(CAPTURE_FAILURE_MESSAGE);
+      }
+      return;
     } finally {
-      setCapturePending(false);
+      // Only touch state if this screen still owns the capture
+      // lifecycle -- an update after unmount is unsafe/pointless.
+      if (stillOwnsCaptureLifecycleRef.current) {
+        setCapturePending(false);
+      }
     }
-  }, [cameraReady, capturePending]);
+    if (!photo) return;
+
+    if (decideCaptureOwnership(stillOwnsCaptureLifecycleRef.current) === "DISCARD") {
+      // takePictureAsync() resolved after this screen lost ownership
+      // of the capture lifecycle (unmount via Back/gesture/deep link
+      // while the native promise was still in flight). The photo was
+      // never entered into `capture` state, so the existing [capture]
+      // cleanup effect never learns it exists -- delete it directly,
+      // and never dispatch CAPTURED or touch React state. Never log
+      // the URI.
+      await deleteLocalCaptureFile(photo.uri);
+      return;
+    }
+
+    dispatchCapture({ type: "CAPTURED", uri: photo.uri, width: photo.width, height: photo.height });
+    // Invalidates readiness for the CameraView that just produced this
+    // photo (item 1) -- it's about to unmount in favor of the review
+    // screen, and the next CameraView (after Retake) must start NOT
+    // READY rather than inherit this one's stale `true`.
+    dispatchCameraReadiness({ type: "CAMERA_INVALIDATED" });
+    setCaptureError(null);
+  }, [cameraReadiness.cameraReady, capturePending]);
 
   const handleRetake = useCallback(async () => {
     if (capture) {
       await deleteLocalCaptureFile(capture.uri);
     }
     dispatchCapture({ type: "DISCARDED" });
+    // Defense in depth: the CameraView we're about to remount has
+    // never fired onCameraReady, so readiness must already be false by
+    // the time it renders (it already is, from the CAPTURED-time
+    // invalidation above, but this holds even if that invariant is
+    // ever weakened elsewhere).
+    dispatchCameraReadiness({ type: "CAMERA_INVALIDATED" });
     submission.reset();
   }, [capture, submission]);
 
   const handleCancelBeforeCapture = useCallback(() => {
+    // Never races an in-flight takePictureAsync() (item 2): if a
+    // capture is pending, this button is also disabled in the JSX
+    // below, but the handler guards independently too.
+    if (capturePending) return;
     router.replace("/(app)");
-  }, [router]);
+  }, [capturePending, router]);
 
   const handleCancelAfterCapture = useCallback(async () => {
     // Never races an active POST (section 5): this button is disabled
@@ -259,7 +320,7 @@ export default function CaptureScreen() {
         <Button
           label="Capture"
           onPress={handleCapture}
-          disabled={!canStartCapture({ cameraReady, capturePending })}
+          disabled={!canStartCapture({ cameraReady: cameraReadiness.cameraReady, capturePending })}
           loading={capturePending}
           accessibilityHint="Takes a photo for skin analysis"
         />
@@ -267,6 +328,7 @@ export default function CaptureScreen() {
           label="Cancel"
           variant="secondary"
           onPress={handleCancelBeforeCapture}
+          disabled={capturePending}
           accessibilityHint="Exits skin analysis without taking a photo"
         />
       </View>
