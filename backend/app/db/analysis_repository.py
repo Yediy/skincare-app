@@ -18,6 +18,7 @@ whole thing from scratch and this function's own idempotency makes
 that safe.
 """
 import json
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 from uuid import UUID
 
@@ -197,11 +198,49 @@ async def get_result(pool: asyncpg.Pool, user_id: UUID, analysis_request_id: UUI
 
 
 async def get_product_recommendations(pool: asyncpg.Pool, user_id: UUID, analysis_request_id: UUID) -> List[Dict[str, Any]]:
+    """Mobile V1 Phase C1: client-facing product-recommendation
+    projection, never `SELECT *` -- same reasoning as
+    get_measurements()'s own docstring. `id`/`user_id`/
+    `analysis_request_id`/`created_at` are internal bookkeeping with no
+    place in this response, RLS already scopes the row to its owner
+    regardless.
+
+    Display metadata (`brand`/`product_name`/`verification_date`)
+    prefers this row's own historical snapshot
+    (`brand_name_snapshot`/`product_name_snapshot`/
+    `verification_date_snapshot`, populated for every analysis
+    completed after migration 366861ec262d) and falls back to a
+    read-only join against the *current* catalog only when the
+    snapshot is NULL (older, pre-snapshot analyses) -- this is a
+    display convenience for historical rows, never a mutation of the
+    historical row itself, and it never fabricates a verification date
+    or a display name: a formulation/product/brand that can't be
+    resolved either way simply returns null, per this phase's own
+    "do not invent a label" requirement."""
     async with pool.acquire() as conn:
         async with conn.transaction():
             await conn.execute("SELECT set_config('app.current_user_id', $1, true)", str(user_id))
             rows = await conn.fetch(
-                "SELECT * FROM analysis_product_recommendations WHERE analysis_request_id = $1 ORDER BY plan_step_key",
+                """
+                SELECT
+                    apr.plan_step_key,
+                    apr.product_id,
+                    apr.formulation_id,
+                    apr.rank_position,
+                    apr.safety_status,
+                    apr.reason_codes,
+                    apr.restrictions,
+                    apr.rules_version,
+                    COALESCE(apr.brand_name_snapshot, b.name) AS brand,
+                    COALESCE(apr.product_name_snapshot, p.name) AS product_name,
+                    COALESCE(apr.verification_date_snapshot, pf.verified_at) AS verification_date
+                FROM analysis_product_recommendations apr
+                LEFT JOIN products p ON p.id = apr.product_id
+                LEFT JOIN brands b ON b.id = p.brand_id
+                LEFT JOIN product_formulations pf ON pf.id = apr.formulation_id
+                WHERE apr.analysis_request_id = $1
+                ORDER BY apr.plan_step_key
+                """,
                 analysis_request_id,
             )
     results = []
@@ -210,6 +249,10 @@ async def get_product_recommendations(pool: asyncpg.Pool, user_id: UUID, analysi
         for key in ("reason_codes", "restrictions"):
             if isinstance(rec[key], str):
                 rec[key] = json.loads(rec[key])
+        if rec["verification_date"] is not None:
+            rec["verification_date"] = rec["verification_date"].isoformat()
+        for key in ("product_id", "formulation_id"):
+            rec[key] = str(rec[key])
         results.append(rec)
     return results
 
@@ -323,17 +366,35 @@ async def commit_analysis_result(
                 )
 
             for rec in product_recommendations:
+                # Historical display snapshot (Mobile V1 Phase C1) --
+                # exactly the brand/product_name/verification_date
+                # StepProductRecommendation already carried at
+                # recommendation time, so a completed analysis never
+                # has to be re-resolved against mutable current catalog
+                # state to render what it actually recommended.
+                # rec["verification_date"] is an ISO-8601 string
+                # (StepProductRecommendation.to_dict()) or None --
+                # asyncpg binds a timestamptz parameter as a real
+                # datetime, never a string it parses itself server-side,
+                # so it's converted here rather than relying on a SQL
+                # ::timestamptz cast to do it.
+                verification_date_snapshot = rec.get("verification_date")
+                if isinstance(verification_date_snapshot, str):
+                    verification_date_snapshot = datetime.fromisoformat(verification_date_snapshot)
+
                 await conn.execute(
                     """
                     INSERT INTO analysis_product_recommendations
                         (analysis_request_id, user_id, plan_step_key, product_id, formulation_id,
-                         rank_position, safety_status, reason_codes, restrictions, rules_version)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10)
+                         rank_position, safety_status, reason_codes, restrictions, rules_version,
+                         brand_name_snapshot, product_name_snapshot, verification_date_snapshot)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10, $11, $12, $13)
                     ON CONFLICT (analysis_request_id, plan_step_key) DO NOTHING
                     """,
                     analysis_request_id, user_id, rec["plan_step_key"], rec["product_id"], rec["formulation_id"],
                     rec["rank_position"], rec["safety_status"], json.dumps(rec["reason_codes"]),
                     json.dumps(rec["restrictions"]), rec["rules_version"],
+                    rec.get("brand"), rec.get("product_name"), verification_date_snapshot,
                 )
 
             await conn.execute(

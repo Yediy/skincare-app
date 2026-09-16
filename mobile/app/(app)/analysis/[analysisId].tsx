@@ -12,13 +12,15 @@ import {
   isRetakeableError,
   prettifyMetricName,
 } from "@/analysis/analysis-presenter";
+import { getRecommendationForRoutineStep } from "@/analysis/recommendation-matching";
 import { useAnalysisPolling } from "@/analysis/use-analysis-polling";
 import { Button } from "@/components/button";
 import { ErrorState } from "@/components/error-state";
 import { LoadingState } from "@/components/loading-state";
+import { NoProductMatchNotice, ProductRecommendationCard } from "@/components/product-recommendation-card";
 import { Screen } from "@/components/screen";
 import { useTheme } from "@/theme/theme-provider";
-import type { MetricResult, RoutineStep } from "@/types/domain";
+import type { Daypart, MetricResult, ProductRecommendation, RoutineStep } from "@/types/domain";
 
 /**
  * Handles both "processing" and "result" display for one analysis
@@ -103,6 +105,11 @@ export default function AnalysisResultScreen() {
   // completed
   const result = polling.data?.result;
   const metrics = polling.data?.metric_results ?? [];
+  // Mobile V1 Phase C1: backend-approved concrete product matches, if
+  // any -- an empty/absent list alongside a non-empty routine is valid
+  // (Phase 11's documented fallback), never treated as a malformed
+  // response. Mobile never computes or substitutes its own match.
+  const productRecommendations = polling.data?.product_recommendations ?? [];
   if (!result) {
     return <LoadingState label="Loading results…" />;
   }
@@ -155,10 +162,22 @@ export default function AnalysisResultScreen() {
       ) : null}
 
       {result.plan.am_routine.length > 0 ? (
-        <RoutineCard title="Morning routine" steps={result.plan.am_routine} theme={theme} />
+        <RoutineCard
+          title="Morning routine"
+          daypart="AM"
+          steps={result.plan.am_routine}
+          recommendations={productRecommendations}
+          theme={theme}
+        />
       ) : null}
       {result.plan.pm_routine.length > 0 ? (
-        <RoutineCard title="Evening routine" steps={result.plan.pm_routine} theme={theme} />
+        <RoutineCard
+          title="Evening routine"
+          daypart="PM"
+          steps={result.plan.pm_routine}
+          recommendations={productRecommendations}
+          theme={theme}
+        />
       ) : null}
 
       {result.plan.disclaimers && result.plan.disclaimers.length > 0 ? (
@@ -214,19 +233,38 @@ function MetricRow({ metric, theme }: { metric: MetricResult; theme: ReturnType<
   );
 }
 
-function RoutineCard({ title, steps, theme }: { title: string; steps: RoutineStep[]; theme: ReturnType<typeof useTheme> }) {
+function RoutineCard({
+  title,
+  daypart,
+  steps,
+  recommendations,
+  theme,
+}: {
+  title: string;
+  daypart: Daypart;
+  steps: RoutineStep[];
+  recommendations: ProductRecommendation[];
+  theme: ReturnType<typeof useTheme>;
+}) {
   return (
     <Card theme={theme}>
       <Text style={[theme.typography.subtitle, { color: theme.colors.foreground }]}>{title}</Text>
-      {steps.map((step) => (
-        <View key={step.step_number} style={styles.priorityRow}>
-          <Text style={[theme.typography.body, { color: theme.colors.accent }]}>{step.step_number}.</Text>
-          <View style={{ flex: 1 }}>
-            <Text style={[theme.typography.body, { color: theme.colors.foreground }]}>{step.action}</Text>
-            <Text style={[theme.typography.caption, { color: theme.colors.muted }]}>{step.why}</Text>
+      {steps.map((step) => {
+        const match = getRecommendationForRoutineStep(daypart, step.step_number, recommendations);
+        return (
+          <View key={step.step_number} style={styles.priorityRow}>
+            <Text style={[theme.typography.body, { color: theme.colors.accent }]}>{step.step_number}.</Text>
+            <View style={{ flex: 1 }}>
+              <Text style={[theme.typography.body, { color: theme.colors.foreground }]}>{step.action}</Text>
+              <Text style={[theme.typography.caption, { color: theme.colors.muted }]}>{step.why}</Text>
+              <Text style={[theme.typography.caption, { color: theme.colors.muted, fontStyle: "italic" }]}>
+                Product category: {step.product_category}
+              </Text>
+              {match ? <ProductRecommendationCard recommendation={match} /> : <NoProductMatchNotice />}
+            </View>
           </View>
-        </View>
-      ))}
+        );
+      })}
     </Card>
   );
 }

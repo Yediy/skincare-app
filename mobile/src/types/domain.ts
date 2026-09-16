@@ -93,16 +93,50 @@ export type TopPriority = {
   effective_intensity: string;
 };
 
-/** One step of plan.am_routine/pm_routine (backend/app/services/plan_service.py).
- * `product_recommendations` exists on the backend shape but Phase B
- * deliberately renders only the read-only step text -- see item 18 of
- * this pass's brief (no product cards yet, that's Phase C). */
+/** One step of plan.am_routine/pm_routine (backend/app/services/plan_service.py). */
 export type RoutineStep = {
   step_number: number;
   product_category: string;
   action: string;
   why: string;
   priority: string;
+};
+
+/** "AM" or "PM" -- the daypart half of a plan_step_key ("AM:2"). */
+export type Daypart = "AM" | "PM";
+
+/** Mobile V1 Phase C1: a concrete product match for one routine step,
+ * exactly the client-facing projection app/api/v2/analyses.py's
+ * ProductRecommendationOut returns (never `SELECT *` --
+ * app/db/analysis_repository.py::get_product_recommendations()).
+ * `brand`/`product_name` are nullable: neither historical snapshot nor
+ * current-catalog fallback could always resolve them, and this app
+ * must never invent a display name when both are absent (see
+ * src/analysis/product-recommendation-presenter.ts).
+ *
+ * `safety_status` is deliberately typed `string`, not a `"SAFE" |
+ * "RESTRICTED"` union: the backend invariant is that an UNSAFE
+ * concrete recommendation can never reach this client, but this type
+ * must not assume that invariant holds forever -- an unexpected value
+ * here must be handled as "fail closed," not crash a strict union
+ * check. See getSafetyStatusPresentation().
+ *
+ * `rank_position` is provenance only (compatibility ordering, per
+ * ProductMatchingService's own explicit "commercial firewall"
+ * docstring) -- never render it as "#1 product"/"best product"/"top
+ * ranked product"; no clinical-efficacy ranking exists. */
+export type ProductRecommendation = {
+  plan_step_key: string;
+  product_id: string;
+  formulation_id: string;
+  brand: string | null;
+  product_name: string | null;
+  safety_status: string;
+  reason_codes: string[];
+  restrictions: Record<string, unknown>;
+  rules_version: string;
+  verification_date: string | null;
+  rank_position: number;
 };
 
 /** Deliberately loose/partial -- this app renders only the fields it
@@ -132,7 +166,7 @@ export type AnalysisStatusResponse = {
   status: AnalysisRequestStatus;
   error_code?: string | null;
   result?: AnalysisResultData | null;
-  product_recommendations?: unknown[] | null;
+  product_recommendations?: ProductRecommendation[] | null;
   metric_results?: MetricResult[] | null;
 };
 
