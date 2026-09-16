@@ -28,9 +28,22 @@ class JobQueueError(Exception):
 
 
 class JobNotFoundError(JobQueueError):
-    """Raised by `acknowledge`/`fail` when the job id doesn't exist,
-    or exists but isn't currently claimed by anyone (so acknowledging
-    or failing it would be acting on a job this caller never held)."""
+    """Raised by `acknowledge`/`fail`/`extend_visibility` when the job
+    id doesn't exist, or exists but isn't currently claimed by anyone
+    at all (so acting on it would be acting on a job this caller never
+    held, and no other worker holds it either)."""
+
+
+class JobLeaseLostError(JobQueueError):
+    """Raised by `acknowledge`/`fail`/`extend_visibility` when the job
+    IS currently claimed -- just not by the caller's `claim_token`.
+    This is the System Integrity Gate V1 case JobNotFoundError alone
+    could not distinguish: a stale worker whose lease already expired
+    and was legitimately reclaimed by a second worker is not calling
+    into a void (JobNotFoundError would suggest that), it is calling
+    into a job someone else now legitimately owns. Callers must treat
+    this as STALE ATTEMPT / ABANDON, never as a retryable processing
+    failure and never as proof the job itself is gone."""
 
 
 @dataclass(frozen=True)
@@ -41,6 +54,13 @@ class Job:
     request_id: Optional[str]
     status: str
     created_at: datetime
+    # None for a job that has never been claimed (still pending). Set
+    # to a fresh, randomly generated UUID by every successful claim or
+    # reclaim (see PostgresJobQueue.claim) -- the lease-fencing identity
+    # `acknowledge`/`fail`/`extend_visibility` require below, so job id
+    # + status='claimed' alone is never mistaken for proof of current
+    # ownership.
+    claim_token: Optional[UUID] = None
 
 
 class JobQueue(ABC):
@@ -76,14 +96,21 @@ class JobQueue(ABC):
         a job queue exists to provide."""
 
     @abstractmethod
-    async def acknowledge(self, job_id: UUID) -> None:
-        """Marks a claimed job completed. Raises JobNotFoundError if
-        the job doesn't exist or isn't currently claimed."""
+    async def acknowledge(self, job_id: UUID, claim_token: UUID) -> None:
+        """Marks a claimed job completed. `claim_token` must equal the
+        job's current active claim token (the one the most recent
+        successful claim/reclaim minted) -- raises JobLeaseLostError if
+        the job is still claimed but by a different (newer) token, or
+        JobNotFoundError if the job doesn't exist or isn't currently
+        claimed by anyone at all."""
 
     @abstractmethod
-    async def fail(self, job_id: UUID, error: str, *, retryable: bool = False) -> bool:
-        """Marks a claimed job failed. Raises JobNotFoundError if the
-        job doesn't exist or isn't currently claimed.
+    async def fail(self, job_id: UUID, claim_token: UUID, error: str, *, retryable: bool = False) -> bool:
+        """Marks a claimed job failed. `claim_token` must equal the
+        job's current active claim token -- raises JobLeaseLostError if
+        the job is still claimed but by a different (newer) token, or
+        JobNotFoundError if the job doesn't exist or isn't currently
+        claimed by anyone at all.
 
         retryable=False (default, and the only behavior that existed
         before Part VI, Phase 27): the job moves straight to the
@@ -107,10 +134,14 @@ class JobQueue(ABC):
         genuinely terminal outcome, never on a requeue."""
 
     @abstractmethod
-    async def extend_visibility(self, job_id: UUID, additional_seconds: int) -> None:
+    async def extend_visibility(self, job_id: UUID, claim_token: UUID, additional_seconds: int) -> None:
         """Heartbeat (Part VI, Phase 28): pushes claimed_until further
         into the future for a job this caller still holds and is still
         legitimately processing, so another worker doesn't reclaim it
         out from under a CV run that's simply taking longer than the
-        original visibility_timeout_seconds. Raises JobNotFoundError if
-        the job doesn't exist or isn't currently claimed by anyone."""
+        original visibility_timeout_seconds. `claim_token` must equal
+        the job's current active claim token -- raises
+        JobLeaseLostError if the job is still claimed but by a
+        different (newer) token (this caller's lease was already lost
+        to a reclaim), or JobNotFoundError if the job doesn't exist or
+        isn't currently claimed by anyone at all."""

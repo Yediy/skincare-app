@@ -1,5 +1,15 @@
 # AUDIT_STATUS.md — Skincare Priority Engine
 
+> **HISTORICAL / SUPERSEDED.** This document describes the repository as it
+> existed at commit `687cb40157aa05f80e1350a0e366b1498dd799d4` (2026-09-08,
+> immediately before `0a83a400a9494b3ec05363f2b7e3ec551cf0be3b` added this
+> file) — before the mobile app, RevenueCat billing, the product catalog,
+> the async analysis worker/queue, and every pass since existed. It is kept
+> as-is, not rewritten, because it is a real historical record of that
+> point in time; none of the findings below describe the current system.
+> For current engineering truth, see `ARCHITECTURE_CURRENT.md`,
+> `OPEN_ENGINEERING_ITEMS.md`, and `SYSTEM_INTEGRITY_GATE.md`.
+
 Classification of every P0 release blocker from `07_IMPLEMENTATION_MATRIX.json`
 / `08_MASTER_SINGLE_FILE.md`, against the real repository. Status values per
 the bundle's own required list: CONFIRMED, ALREADY_FIXED, NOT_APPLICABLE,

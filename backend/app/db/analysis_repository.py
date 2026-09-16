@@ -24,6 +24,20 @@ from uuid import UUID
 
 import asyncpg
 
+
+class AnalysisResultCommitFencedError(Exception):
+    """System Integrity Gate V1: raised by commit_analysis_result() when
+    `processing_claim_token` no longer matches analysis_requests.
+    processing_claim_token -- a newer worker already installed its own
+    token via mark_processing() before this caller's commit ran.
+    Nothing from this call is persisted (the whole transaction rolls
+    back). Callers (app/domain/analysis_execution_service.py's
+    execute()) translate this into AnalysisExecutionLeaseLostError --
+    this module deliberately raises its own, repository-level
+    exception rather than importing that one, to avoid a circular
+    import between the two."""
+
+
 RECEIVED = "RECEIVED"
 QUEUED = "QUEUED"
 PROCESSING = "PROCESSING"
@@ -161,24 +175,69 @@ async def record_ephemeral_image_reference(
             )
 
 
-async def mark_processing(pool: asyncpg.Pool, user_id: UUID, analysis_request_id: UUID) -> None:
+async def mark_processing(
+    pool: asyncpg.Pool, user_id: UUID, analysis_request_id: UUID, processing_claim_token: Optional[UUID] = None,
+) -> None:
+    """Installs `processing_claim_token` as this request's current
+    processing owner (System Integrity Gate V1, section 2) --
+    unconditionally, since calling mark_processing() IS the act of
+    becoming the current owner; there is nothing to fence against on
+    entry, only on the later exit paths (commit_analysis_result(),
+    mark_failed()) that require this exact token again. Restricted to
+    QUEUED/PROCESSING (also enforced independently at the database
+    level by migration 44a74f2a79a7's transition trigger for the
+    QUEUED->PROCESSING case; PROCESSING->PROCESSING doesn't change
+    `status` at all, so the trigger never even fires for a legitimate
+    re-entrant claim)."""
     async with pool.acquire() as conn:
         async with conn.transaction():
             await conn.execute("SELECT set_config('app.current_user_id', $1, true)", str(user_id))
             await conn.execute(
-                "UPDATE analysis_requests SET status = 'PROCESSING', started_at = now() WHERE id = $1",
-                analysis_request_id,
+                "UPDATE analysis_requests SET status = 'PROCESSING', started_at = now(), "
+                "processing_claim_token = $2 WHERE id = $1 AND status IN ('QUEUED', 'PROCESSING')",
+                analysis_request_id, processing_claim_token,
             )
 
 
-async def mark_failed(pool: asyncpg.Pool, user_id: UUID, analysis_request_id: UUID, error_code: str) -> None:
+async def mark_failed(
+    pool: asyncpg.Pool, user_id: UUID, analysis_request_id: UUID, error_code: str,
+    *, processing_claim_token: Optional[UUID] = None,
+) -> bool:
+    """Marks a non-terminal request FAILED. Returns True if this call
+    actually performed that transition, False if it was fenced out
+    (System Integrity Gate V1, section 2) -- the request either already
+    reached a terminal state, or its current `processing_claim_token`
+    belongs to a different (newer) worker than the one this caller
+    presented.
+
+    The fencing predicate is deliberately asymmetric: a NULL
+    `processing_claim_token` column (never entered processing at all --
+    e.g. failing at RECEIVED/QUEUED before any worker claimed it) is
+    fair game for ANY caller, including one that itself passes None
+    (a caller with no queue-level claim to present, e.g. most of this
+    codebase's own direct tests) -- but a caller that passes None
+    against a row some real worker DOES currently own (a non-NULL
+    column value) is correctly rejected: presenting no token is not
+    proof of ownership over a row something else legitimately claimed.
+    Callers (app/domain/analysis_execution_service.py's
+    mark_terminal_failure()) must check this return value BEFORE
+    performing any compensation (releasing quota, deleting the image)
+    -- never after, and never unconditionally."""
     async with pool.acquire() as conn:
         async with conn.transaction():
             await conn.execute("SELECT set_config('app.current_user_id', $1, true)", str(user_id))
-            await conn.execute(
-                "UPDATE analysis_requests SET status = 'FAILED', failed_at = now(), error_code = $2 WHERE id = $1",
-                analysis_request_id, error_code,
+            row = await conn.fetchrow(
+                """
+                UPDATE analysis_requests
+                SET status = 'FAILED', failed_at = now(), error_code = $2, processing_claim_token = NULL
+                WHERE id = $1
+                  AND status IN ('RECEIVED', 'QUEUED', 'PROCESSING')
+                  AND (processing_claim_token IS NULL OR processing_claim_token = $3)
+                RETURNING id
+                """,
+                analysis_request_id, error_code, processing_claim_token,
             )
+    return row is not None
 
 
 async def increment_attempt_count(pool: asyncpg.Pool, user_id: UUID, analysis_request_id: UUID) -> None:
@@ -365,11 +424,45 @@ async def commit_analysis_result(
     metric_results: Dict[str, Dict[str, Any]],
     product_recommendations: List[Dict[str, Any]],
     usage_reservation_id: UUID,
+    processing_claim_token: Optional[UUID] = None,
 ) -> None:
-    """Part VI, Phase 30's required atomic commit. See module docstring."""
+    """Part VI, Phase 30's required atomic commit. See module docstring.
+
+    System Integrity Gate V1, section 2: the whole transaction is
+    fenced on `processing_claim_token` still being this request's
+    current analysis_requests.processing_claim_token -- checked FIRST,
+    before any of the result/measurement/recommendation inserts below,
+    so a stale caller's attempt is rejected (AnalysisResultCommitFencedError,
+    the whole transaction rolled back, nothing persisted) rather than
+    landing partial writes a legitimate newer worker's own commit would
+    then have to coexist with. A newer worker's subsequent commit (using
+    its own, current token) is completely unaffected either way: every
+    insert below is idempotent (ON CONFLICT DO NOTHING keyed by
+    analysis_request_id), so whichever of two racing commits actually
+    lands first is irrelevant to which one succeeds -- only the token
+    check is."""
     async with pool.acquire() as conn:
         async with conn.transaction():
             await conn.execute("SELECT set_config('app.current_user_id', $1, true)", str(user_id))
+
+            # Same asymmetric predicate as mark_failed(): a NULL column
+            # (no token was ever installed for this request -- e.g. a
+            # direct call/test that never threads a claim_token through
+            # mark_processing()) is fair game for any caller, including
+            # one that itself passes None; a non-NULL column value must
+            # match the caller's token exactly.
+            fenced = await conn.fetchrow(
+                """
+                UPDATE analysis_requests
+                SET status = 'COMPLETED', completed_at = now(), processing_claim_token = NULL
+                WHERE id = $1 AND status = 'PROCESSING'
+                  AND (processing_claim_token IS NULL OR processing_claim_token = $2)
+                RETURNING id
+                """,
+                analysis_request_id, processing_claim_token,
+            )
+            if fenced is None:
+                raise AnalysisResultCommitFencedError(str(analysis_request_id))
 
             await conn.execute(
                 """
@@ -437,13 +530,10 @@ async def commit_analysis_result(
                     DISPLAY_SNAPSHOT_VERSION,
                 )
 
-            await conn.execute(
-                "UPDATE analysis_requests SET status = 'COMPLETED', completed_at = now() "
-                "WHERE id = $1 AND status != 'COMPLETED'",
-                analysis_request_id,
-            )
-
-            # Same transaction, same database -- consuming the usage
+            # analysis_requests itself was already fenced and moved to
+            # COMPLETED at the top of this function -- see the
+            # `fenced` UPDATE above. Same transaction, same database --
+            # consuming the usage
             # reservation here (rather than a separate call after
             # commit) is what actually makes "quota consumed exactly
             # once" atomic with "result persisted", not just

@@ -25,12 +25,14 @@ around compute.
 """
 import asyncio
 import logging
+import signal
 import time
 from datetime import datetime, timezone
-from typing import Tuple
+from typing import Optional, Tuple
 from uuid import UUID
 
 from app.domain.analysis_execution_service import (
+    AnalysisExecutionLeaseLostError,
     AnalysisExecutionService,
     AnalysisRequestInvalidStateError,
     AnalysisRequestNotFoundError,
@@ -38,7 +40,7 @@ from app.domain.analysis_execution_service import (
 )
 from app.cv.pipeline import CaptureQualityFailedError, NoFaceDetectedError
 from app.observability import events as observability_events
-from app.queue.base import Job, JobNotFoundError, JobQueue
+from app.queue.base import Job, JobLeaseLostError, JobNotFoundError, JobQueue
 from app.storage.base import ObjectNotFoundError
 
 logger = logging.getLogger(__name__)
@@ -97,7 +99,7 @@ def classify_failure(exc: Exception) -> Tuple[bool, str]:
     return True, "PROCESSING_FAILED"
 
 
-async def _heartbeat_loop(job_queue: JobQueue, job_id: UUID) -> None:
+async def _heartbeat_loop(job_queue: JobQueue, job_id: UUID, claim_token: UUID) -> None:
     """Runs alongside the CV pipeline call, periodically extending the
     claim's visibility so another worker doesn't reclaim a job that is
     simply taking longer than CLAIM_VISIBILITY_TIMEOUT_SECONDS to
@@ -108,25 +110,32 @@ async def _heartbeat_loop(job_queue: JobQueue, job_id: UUID) -> None:
     while True:
         await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
         try:
-            await job_queue.extend_visibility(job_id, HEARTBEAT_EXTENSION_SECONDS)
+            await job_queue.extend_visibility(job_id, claim_token, HEARTBEAT_EXTENSION_SECONDS)
         except JobNotFoundError:
             # No longer claimed by anyone -- already acknowledged/
             # failed by the main task, or (a real, if unlikely, race)
             # already reclaimed after this loop fell behind. Either
             # way, nothing more for the heartbeat to do.
             return
+        except JobLeaseLostError:
+            # System Integrity Gate V1: still claimed, but by a newer
+            # token -- this worker's lease is already gone. Stop
+            # heartbeating a job that isn't this worker's to hold
+            # visible anymore; _process_job's own fenced acknowledge/
+            # fail calls will discover the same thing independently.
+            return
 
 
 async def _process_job(job: Job, job_queue: JobQueue, execution_service: AnalysisExecutionService) -> None:
-    heartbeat_task = asyncio.create_task(_heartbeat_loop(job_queue, job.id))
+    heartbeat_task = asyncio.create_task(_heartbeat_loop(job_queue, job.id, job.claim_token))
     started_at = time.monotonic()
     try:
         analysis_request_id = UUID(job.payload["analysis_request_id"])
         user_id = UUID(job.payload["user_id"])
 
         try:
-            outcome = await execution_service.execute(user_id, analysis_request_id)
-            await job_queue.acknowledge(job.id)
+            outcome = await execution_service.execute(user_id, analysis_request_id, job.claim_token)
+            await job_queue.acknowledge(job.id, job.claim_token)
             logger.info(
                 "analysis_worker: job=%s analysis_request_id=%s completed already_completed=%s",
                 job.id, analysis_request_id, outcome.already_completed,
@@ -135,9 +144,40 @@ async def _process_job(job: Job, job_queue: JobQueue, execution_service: Analysi
                 job_id=str(job.id), analysis_id=str(analysis_request_id),
                 outcome="SUCCESS", duration_seconds=time.monotonic() - started_at,
             )
+        except (AnalysisExecutionLeaseLostError, JobLeaseLostError) as e:
+            # System Integrity Gate V1: this worker's lease -- queue-
+            # level, execution-level, or both -- was already lost to a
+            # newer worker by the time it got here. STALE ATTEMPT /
+            # ABANDON: never a retryable processing failure (it would
+            # requeue a job someone else already legitimately owns) and
+            # never a terminal failure (it would mark FAILED, release
+            # quota, or delete an image out from under whoever now
+            # legitimately owns this request). No compensation of any
+            # kind -- the newer worker owns this outcome.
+            logger.warning(
+                "analysis_worker: job=%s analysis_request_id=%s abandoned -- %s",
+                job.id, analysis_request_id, e.__class__.__name__,
+            )
+            observability_events.processing_result(
+                job_id=str(job.id), analysis_id=str(analysis_request_id),
+                outcome="ABANDONED", duration_seconds=time.monotonic() - started_at,
+            )
         except Exception as e:
             retryable, error_code = classify_failure(e)
-            is_terminal = await job_queue.fail(job.id, f"{e.__class__.__name__}: {error_code}", retryable=retryable)
+            try:
+                is_terminal = await job_queue.fail(
+                    job.id, job.claim_token, f"{e.__class__.__name__}: {error_code}", retryable=retryable,
+                )
+            except JobLeaseLostError:
+                logger.warning(
+                    "analysis_worker: job=%s analysis_request_id=%s abandoned -- lease lost while reporting failure",
+                    job.id, analysis_request_id,
+                )
+                observability_events.processing_result(
+                    job_id=str(job.id), analysis_id=str(analysis_request_id),
+                    outcome="ABANDONED", duration_seconds=time.monotonic() - started_at,
+                )
+                return
             logger.warning(
                 "analysis_worker: job=%s analysis_request_id=%s failed error_code=%s retryable=%s terminal=%s",
                 job.id, analysis_request_id, error_code, retryable, is_terminal,
@@ -151,8 +191,21 @@ async def _process_job(job: Job, job_queue: JobQueue, execution_service: Analysi
                 # Dead letter (Part VI, Phase 29): either this
                 # exception was never retryable, or retries are now
                 # exhausted. Release quota + mark the durable request
-                # FAILED exactly once, here.
-                await execution_service.mark_terminal_failure(user_id, analysis_request_id, error_code)
+                # FAILED exactly once, here -- unless this worker's
+                # execution-level lease was itself already lost (a
+                # newer worker installed its own processing_claim_token
+                # in the meantime), in which case abandon instead of
+                # compensating against a request that isn't this
+                # worker's anymore.
+                try:
+                    await execution_service.mark_terminal_failure(
+                        user_id, analysis_request_id, error_code, job.claim_token,
+                    )
+                except AnalysisExecutionLeaseLostError:
+                    logger.warning(
+                        "analysis_worker: job=%s analysis_request_id=%s terminal-failure compensation abandoned -- lease lost",
+                        job.id, analysis_request_id,
+                    )
     finally:
         heartbeat_task.cancel()
         try:
@@ -184,11 +237,38 @@ async def run_forever(
     execution_service: AnalysisExecutionService,
     *,
     poll_interval_seconds: float = EMPTY_QUEUE_POLL_INTERVAL_SECONDS,
+    stop_event: Optional[asyncio.Event] = None,
 ) -> None:
-    while True:
+    """`stop_event`, when given, is checked between cycles -- set it
+    (e.g. from a SIGTERM/SIGINT handler, see _main's
+    _install_graceful_shutdown) to let the current job finish and then
+    return, instead of claiming another one. None (the default)
+    preserves the original unconditional-loop behavior for any
+    existing caller (e.g. tests) that never passes one."""
+    while stop_event is None or not stop_event.is_set():
         claimed = await run_one_cycle(job_queue, execution_service)
         if not claimed:
             await asyncio.sleep(poll_interval_seconds)
+
+
+def _install_graceful_shutdown(stop_event: asyncio.Event) -> None:
+    """SIGTERM (the signal a container/process manager sends for an
+    ordinary graceful stop) and SIGINT (Ctrl-C during local dev) both
+    just set stop_event -- run_forever finishes whatever job it's
+    already processing, then returns, so _main's own `finally` gets a
+    chance to shut down the execution service's owned CV executor and
+    the database pool cleanly instead of having them vanish out from
+    under an in-flight request via a hard process kill."""
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except NotImplementedError:
+            # add_signal_handler is POSIX-only (no-op on e.g. Windows);
+            # graceful shutdown becomes best-effort there rather than a
+            # hard requirement for a platform this worker doesn't ship
+            # on.
+            pass
 
 
 async def _main() -> None:
@@ -205,6 +285,7 @@ async def _main() -> None:
     from app.storage.r2 import CloudflareR2ObjectStorage
 
     await init_db_pool()
+    execution_service: Optional[AnalysisExecutionService] = None
     try:
         pool = get_db_pool()
         safety_engine = SafetyEngine()
@@ -226,9 +307,20 @@ async def _main() -> None:
             image_store=EphemeralAnalysisImageStore(object_storage),
         )
         job_queue = PostgresJobQueue(pool)
+        stop_event = asyncio.Event()
+        _install_graceful_shutdown(stop_event)
         logger.info("analysis_worker: starting main loop")
-        await run_forever(job_queue, execution_service)
+        await run_forever(job_queue, execution_service, stop_event=stop_event)
+        logger.info("analysis_worker: graceful shutdown signal received, main loop exited")
     finally:
+        # Executor lifecycle (System Integrity Gate V1, section 5):
+        # this service owns the CV ThreadPoolExecutor it constructed
+        # for itself above (no cv_executor= was injected), so this
+        # process -- not the service's own __del__, and not implicit
+        # process teardown -- is what must shut it down, and it must
+        # happen before the database pool underneath it disappears.
+        if execution_service is not None:
+            execution_service.close()
         await close_db_pool()
 
 

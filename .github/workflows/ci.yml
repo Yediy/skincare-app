@@ -141,6 +141,16 @@ jobs:
       - run: npm run typecheck
       - run: npm run lint
       - run: npm test -- --ci
+      # System Integrity Gate V1: release/build-integrity gates, not
+      # informational steps -- neither has continue-on-error. expo-doctor
+      # catches SDK/dependency drift (e.g. a patch-version mismatch
+      # between `expo` and an installed expo-* package) before it ships;
+      # `expo export --platform web` proves the app's whole module graph
+      # actually bundles, not just typechecks/lints in isolation.
+      - name: expo-doctor (SDK/dependency compatibility gate)
+        run: npx expo-doctor
+      - name: expo export --platform web (build-integrity gate)
+        run: npx expo export --platform web
       # Production dependency security gate -- fails on any HIGH/CRITICAL
       # finding in a non-dev dependency. Moderate-only findings (the
       # current, fully documented state -- see

@@ -10,6 +10,8 @@ for the same "prove the boundary itself, not the caller's good
 behavior" standard. Every test below runs through the real restricted
 roles (app_db_pool/billing_db_pool), never the superuser.
 """
+import uuid
+
 import asyncpg
 import pytest
 
@@ -44,7 +46,7 @@ async def test_billing_role_can_acknowledge_a_revenuecat_webhook_job(billing_db_
     queue = PostgresJobQueue(billing_db_pool)
     await queue.enqueue(REVENUECAT_WEBHOOK_JOB_TYPE, {"webhook_event_id": "e3"})
     claimed = await queue.claim(REVENUECAT_WEBHOOK_JOB_TYPE)
-    await queue.acknowledge(claimed.id)
+    await queue.acknowledge(claimed.id, claimed.claim_token)
 
     row = await billing_db_pool.fetchrow("SELECT status FROM jobs WHERE id = $1", claimed.id)
     assert row["status"] == "completed"
@@ -54,7 +56,7 @@ async def test_billing_role_can_fail_a_revenuecat_webhook_job(billing_db_pool):
     queue = PostgresJobQueue(billing_db_pool)
     await queue.enqueue(REVENUECAT_WEBHOOK_JOB_TYPE, {"webhook_event_id": "e4"})
     claimed = await queue.claim(REVENUECAT_WEBHOOK_JOB_TYPE)
-    is_terminal = await queue.fail(claimed.id, "PROCESSING_ERROR", retryable=False)
+    is_terminal = await queue.fail(claimed.id, claimed.claim_token, "PROCESSING_ERROR", retryable=False)
     assert is_terminal is True
 
     row = await billing_db_pool.fetchrow("SELECT status FROM jobs WHERE id = $1", claimed.id)
@@ -109,17 +111,17 @@ async def test_billing_role_cannot_mark_an_analysis_job_complete(app_db_pool, bi
 
     billing_queue = PostgresJobQueue(billing_db_pool)
     with pytest.raises(JobNotFoundError):
-        await billing_queue.acknowledge(analysis_job.id)
+        await billing_queue.acknowledge(analysis_job.id, claimed.claim_token)
 
 
 async def test_billing_role_cannot_mark_an_analysis_job_failed(app_db_pool, billing_db_pool):
     app_queue = PostgresJobQueue(app_db_pool)
     analysis_job = await app_queue.enqueue(ANALYSIS_JOB_TYPE, {"analysis_request_id": "r5"})
-    await app_queue.claim(ANALYSIS_JOB_TYPE)
+    claimed = await app_queue.claim(ANALYSIS_JOB_TYPE)
 
     billing_queue = PostgresJobQueue(billing_db_pool)
     with pytest.raises(JobNotFoundError):
-        await billing_queue.fail(analysis_job.id, "SHOULD_NOT_BE_REACHABLE", retryable=False)
+        await billing_queue.fail(analysis_job.id, claimed.claim_token, "SHOULD_NOT_BE_REACHABLE", retryable=False)
 
 
 async def test_billing_role_cannot_insert_a_job_of_a_non_billing_type(billing_db_pool):
@@ -166,7 +168,7 @@ async def test_app_role_analysis_queue_lifecycle_unaffected(app_db_pool):
     job = await queue.enqueue(ANALYSIS_JOB_TYPE, {"analysis_request_id": "r7"})
     claimed = await queue.claim(ANALYSIS_JOB_TYPE)
     assert claimed.id == job.id
-    await queue.acknowledge(claimed.id)
+    await queue.acknowledge(claimed.id, claimed.claim_token)
 
     row = await app_db_pool.fetchrow("SELECT status FROM jobs WHERE id = $1", job.id)
     assert row["status"] == "completed"
