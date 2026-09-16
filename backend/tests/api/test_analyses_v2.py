@@ -15,7 +15,10 @@ import pytest
 
 import app.api.v2.analyses as analyses_module
 from app.config import settings
-from app.domain.analysis_submission_service import AnalysisSubmissionService
+from app.domain.analysis_submission_service import (
+    MAX_ANALYSIS_BASE64_CHARS,
+    AnalysisSubmissionService,
+)
 from app.domain.entitlement import FreeTierEntitlementService, UsagePolicyService
 from app.queue.postgres_queue import PostgresJobQueue
 from app.storage.base import ObjectNotFoundError, ObjectStorage, ObjectStorageUnavailableError
@@ -23,6 +26,7 @@ from app.storage.ephemeral_image_store import EphemeralAnalysisImageStore
 
 GRACE_HOPPER_JPG = Path(__file__).resolve().parent.parent / "fixtures" / "grace_hopper.jpg"
 IMAGE_B64 = base64.b64encode(GRACE_HOPPER_JPG.read_bytes()).decode()
+NOT_AN_IMAGE_B64 = base64.b64encode(b"definitely-not-a-real-image-just-bytes").decode()
 
 
 class FakeObjectStorage(ObjectStorage):
@@ -225,3 +229,110 @@ async def test_get_completed_analysis_includes_metric_results(client, db_pool, a
     assert metrics["redness_score"]["status"] == "ABSTAINED"
     assert metrics["redness_score"]["value"] is None
     assert metrics["redness_score"]["uncertainty_reasons"] == ["excessive_blur"]
+
+
+async def test_get_measurements_response_excludes_internal_columns(client, db_pool, app_db_pool):
+    """Section 9: the mobile/API contract is exactly metric_name/value/
+    confidence/status/uncertainty_reasons/metric_version/
+    calibration_version -- id/analysis_request_id/user_id/created_at
+    (internal database bookkeeping) must never appear in the response,
+    even though get_measurements() already scopes rows to their owner
+    via RLS regardless."""
+    from app.db import analysis_repository, usage_repository
+
+    headers = await _signup_login_consent(client, "v2-metric-shape@test.com")
+    user_row = await db_pool.fetchrow("SELECT id FROM users WHERE email = $1", "v2-metric-shape@test.com")
+    user_id = user_row["id"]
+
+    req = await analysis_repository.create_request(app_db_pool, user_id, str(uuid.uuid4()))
+    reservation = await usage_repository.reserve(app_db_pool, user_id, str(uuid.uuid4()), "2026-09", allowance=5)
+    await analysis_repository.commit_analysis_result(
+        app_db_pool, user_id, req["id"],
+        capture_assessment={"quality_status": "PASS"},
+        scores={"skin_health_score": 0.8},
+        plan={"top_priorities": []},
+        eligible_for_longitudinal_comparison=True,
+        pipeline_version="test-1.0",
+        metric_results={
+            "evenness_score": {"value": 0.72, "confidence": 0.9, "status": "VALID", "uncertainty_reasons": []},
+        },
+        product_recommendations=[],
+        usage_reservation_id=reservation.id,
+    )
+
+    resp = await client.get(f"/api/v2/analyses/{req['id']}", headers=headers)
+    assert resp.status_code == 200
+    metric = resp.json()["metric_results"][0]
+
+    assert set(metric.keys()) == {
+        "metric_name", "value", "confidence", "status", "uncertainty_reasons",
+        "metric_version", "calibration_version",
+    }
+    assert "id" not in metric
+    assert "analysis_request_id" not in metric
+    assert "user_id" not in metric
+    assert "created_at" not in metric
+
+
+# Section 7: server-side image input limits, exercised through the
+# real HTTP path -- the mobile client is not a security boundary.
+
+async def test_post_with_oversized_encoded_payload_is_rejected_with_413(client):
+    headers = await _signup_login_consent(client, "v2-oversized-b64@test.com")
+    oversized_b64 = "A" * (MAX_ANALYSIS_BASE64_CHARS + 1)
+
+    resp = await client.post(
+        "/api/v2/analyses",
+        json={"image_base64": oversized_b64, "request_id": str(uuid.uuid4())},
+        headers=headers,
+    )
+
+    assert resp.status_code == 413
+    # Never echoes the oversized payload or its length back to the
+    # client, and never leaks a decoder/library exception.
+    assert "AAAA" not in resp.text
+
+
+async def test_post_with_malformed_image_bytes_that_are_valid_base64_is_rejected_with_422(client):
+    headers = await _signup_login_consent(client, "v2-notanimage@test.com")
+
+    resp = await client.post(
+        "/api/v2/analyses",
+        json={"image_base64": NOT_AN_IMAGE_B64, "request_id": str(uuid.uuid4())},
+        headers=headers,
+    )
+
+    assert resp.status_code == 422
+    body = resp.json()
+    # Safe, generic detail only -- never a raw Pillow/decoder exception
+    # message, and never the submitted bytes themselves.
+    assert "definitely-not-a-real-image" not in resp.text
+    assert isinstance(body["detail"], str)
+
+
+async def test_post_rejection_releases_the_usage_reservation(client, db_pool):
+    """Section 7G: any rejection after quota reservation must release
+    that reservation -- a client whose oversized/malformed payload gets
+    rejected must not lose an analysis credit for the attempt."""
+    headers = await _signup_login_consent(client, "v2-reservation-released@test.com")
+    request_id = str(uuid.uuid4())
+
+    resp = await client.post(
+        "/api/v2/analyses",
+        json={"image_base64": NOT_AN_IMAGE_B64, "request_id": request_id},
+        headers=headers,
+    )
+    assert resp.status_code == 422
+
+    usage = await db_pool.fetchrow("SELECT status FROM analysis_usage WHERE request_id = $1", request_id)
+    assert usage["status"] == "RELEASED"
+
+    # The released reservation must not have consumed the user's
+    # allowance -- a normal, valid submission right after must still
+    # succeed.
+    retry = await client.post(
+        "/api/v2/analyses",
+        json={"image_base64": IMAGE_B64, "request_id": str(uuid.uuid4())},
+        headers=headers,
+    )
+    assert retry.status_code == 202

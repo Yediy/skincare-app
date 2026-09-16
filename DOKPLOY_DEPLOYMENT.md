@@ -30,6 +30,22 @@ Set every one of these as Dokploy environment variables / secrets, never baked i
 
 `8000` (the `EXPOSE 8000` / `uvicorn --port 8000` in `backend/Dockerfile`). Map Dokploy's ingress to this port.
 
+## Ingress request-body limit (mandatory)
+
+`backend/app/domain/analysis_submission_service.py`'s `MAX_ANALYSIS_BASE64_CHARS`/`MAX_ANALYSIS_DECODED_BYTES`/`MAX_ANALYSIS_IMAGE_LONG_EDGE`/`MAX_ANALYSIS_IMAGE_PIXELS` checks are **application-level validation that runs only after the full HTTP request body has already reached FastAPI** — uvicorn/Starlette read and buffer the entire request body (including base64 image data) into memory before that code ever runs a single check on it. They are not, and were never intended to be, a transport-layer defense against an oversized request body; the request must already have paid the full memory/bandwidth cost of being received before the application can reject it.
+
+**Production ingress (the Dokploy-managed reverse proxy in front of this container) must independently reject an oversized request body before forwarding it to the API container.** Configure a maximum request-body size of approximately **5 MB** for `POST /api/v2/analyses` (and any other route accepting this payload shape) — enough to leave safe headroom above `MAX_ANALYSIS_BASE64_CHARS = 4_000_000` (4,000,000 base64 characters ≈ 4MB of the request body by itself) for the surrounding JSON structure (field names, `request_id`, other request fields) without being so large that it defeats the point of an ingress-level limit.
+
+Where to configure this depends on which reverse proxy actually terminates the request in this deployment's topology:
+
+- **Dokploy's built-in Traefik ingress**: set `client_max_body_size`-equivalent via a Traefik middleware (`buffering.maxRequestBodyBytes`) attached to this service's router, or via a Dokploy-level "advanced" proxy config if exposed in the UI. Consult the Dokploy version actually deployed for where this setting lives — it has moved between Dokploy releases.
+- **Cloudflare in front of Dokploy** (if used): Cloudflare applies its own plan-level upload-size limit before traffic reaches the origin. Customers may configure a lower Maximum Upload Size at the Cloudflare zone/network level where supported. This provides an additional edge layer but does not replace the approximately 5 MB origin-level Traefik/Dokploy request-body limit required for the analysis endpoint.
+- **Any other reverse proxy** (nginx, Caddy, etc., if this topology is ever changed): the equivalent directive is nginx's `client_max_body_size` / Caddy's `request_body.max_size`.
+
+**Do not claim this protection is active in any document, status report, or audit response until the deployed ingress has actually been configured with this limit and verified** (e.g., a `curl` upload of a body just over the configured limit against the real production/staging ingress returns a `413`-class response from the proxy itself, before the request reaches this application's own logs). Until that verification has been done against the real deployed topology, the accurate statement is: the *application* independently bounds payload size once a request reaches it, and the *transport-layer* limit described here is a deployment requirement, not yet a verified fact about this deployment.
+
+Keep the existing `MAX_ANALYSIS_*` application-level limits unchanged — this ingress limit is a second, independent layer above them, not a replacement.
+
 ## Health / readiness endpoints
 
 - **Liveness**: `GET /health/live` — used by the Dockerfile's own `HEALTHCHECK` already; point Dokploy's liveness probe (if configured separately from Docker's native healthcheck) at the same path. Never gate a restart on `/health/ready` — a temporary Postgres/Redis blip would restart-loop an otherwise-healthy process (`PRODUCTION_ARCHITECTURE.md`, Phase 3's own rationale).

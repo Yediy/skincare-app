@@ -17,15 +17,22 @@ const MockFile = File as unknown as jest.Mock;
 describe("prepareCaptureForSubmission", () => {
   beforeEach(() => {
     mockManipulateAsync.mockReset();
+    MockFile.mockReset();
+    MockFile.mockImplementation(() => ({ exists: true, delete: jest.fn() }));
     (logger.warn as jest.Mock).mockReset();
   });
 
   it("resizes/compresses and returns the resulting base64, never logging it", async () => {
     mockManipulateAsync.mockResolvedValue({ uri: "file:///cache/resized.jpg", base64: "BASE64DATA", width: 1600, height: 1200 });
 
-    const result = await prepareCaptureForSubmission("file:///cache/original.jpg");
+    const result = await prepareCaptureForSubmission("file:///cache/original.jpg", 4000, 3000);
 
     expect(result).toEqual({ uri: "file:///cache/resized.jpg", base64: "BASE64DATA", width: 1600, height: 1200 });
+    expect(mockManipulateAsync).toHaveBeenCalledWith(
+      "file:///cache/original.jpg",
+      [{ resize: { width: 1600, height: 1200 } }],
+      { compress: 0.8, format: "jpeg", base64: true },
+    );
     expect(logger.warn).not.toHaveBeenCalled();
     expect(logger.debug).not.toHaveBeenCalled();
     // Never logs the source URI or the produced base64 string anywhere.
@@ -36,10 +43,27 @@ describe("prepareCaptureForSubmission", () => {
     expect(allLogCalls.join(" ")).not.toContain("BASE64DATA");
   });
 
-  it("throws rather than silently submitting no image data if base64 is missing", async () => {
+  it("issues no resize action for a source already within the long-edge bound (never upscales)", async () => {
+    mockManipulateAsync.mockResolvedValue({ uri: "file:///cache/resized.jpg", base64: "B64", width: 640, height: 480 });
+
+    await prepareCaptureForSubmission("file:///cache/original.jpg", 640, 480);
+
+    expect(mockManipulateAsync).toHaveBeenCalledWith(
+      "file:///cache/original.jpg",
+      [],
+      { compress: 0.8, format: "jpeg", base64: true },
+    );
+  });
+
+  it("throws rather than silently submitting no image data if base64 is missing, and best-effort-deletes the generated working file first", async () => {
+    const deleteFn = jest.fn();
+    MockFile.mockImplementation(() => ({ exists: true, delete: deleteFn }));
     mockManipulateAsync.mockResolvedValue({ uri: "file:///cache/resized.jpg", width: 1600, height: 1200 });
 
-    await expect(prepareCaptureForSubmission("file:///cache/original.jpg")).rejects.toThrow();
+    await expect(prepareCaptureForSubmission("file:///cache/original.jpg", 4000, 3000)).rejects.toThrow();
+
+    expect(MockFile).toHaveBeenCalledWith("file:///cache/resized.jpg");
+    expect(deleteFn).toHaveBeenCalledTimes(1);
   });
 });
 

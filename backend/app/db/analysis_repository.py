@@ -222,12 +222,27 @@ async def get_measurements(pool: asyncpg.Pool, user_id: UUID, analysis_request_i
     never the per-metric VALID/BORDERLINE/ABSTAINED breakdown a client
     needs to render abstention/uncertainty honestly (never a fabricated
     numeric value for an ABSTAINED metric). Additive-only: a new field
-    on the existing response, nothing removed or reshaped."""
+    on the existing response, nothing removed or reshaped.
+
+    Post-merge audit repair (section 9): projects only the columns the
+    mobile/API contract actually documents, never `SELECT *`. RLS
+    already scopes this row to its owner regardless -- this is a
+    separate, deliberate concern: `id`/`analysis_request_id`/`user_id`/
+    `created_at` are internal database identifiers/bookkeeping with no
+    place in a client-facing response, not secrets being protected from
+    another user. Adding a new internal column to this table must never
+    silently start appearing in this API response."""
     async with pool.acquire() as conn:
         async with conn.transaction():
             await conn.execute("SELECT set_config('app.current_user_id', $1, true)", str(user_id))
             rows = await conn.fetch(
-                "SELECT * FROM analysis_measurements WHERE analysis_request_id = $1 ORDER BY metric_name",
+                """
+                SELECT metric_name, value, confidence, status, uncertainty_reasons,
+                       metric_version, calibration_version
+                FROM analysis_measurements
+                WHERE analysis_request_id = $1
+                ORDER BY metric_name
+                """,
                 analysis_request_id,
             )
     results = []

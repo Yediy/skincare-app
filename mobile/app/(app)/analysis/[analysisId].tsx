@@ -12,7 +12,6 @@ import {
   isRetakeableError,
   prettifyMetricName,
 } from "@/analysis/analysis-presenter";
-import { useAnalysisSession } from "@/analysis/analysis-session";
 import { useAnalysisPolling } from "@/analysis/use-analysis-polling";
 import { Button } from "@/components/button";
 import { ErrorState } from "@/components/error-state";
@@ -35,11 +34,13 @@ export default function AnalysisResultScreen() {
   const theme = useTheme();
   const router = useRouter();
   const { analysisId } = useLocalSearchParams<{ analysisId: string }>();
-  const { startNewAttempt } = useAnalysisSession();
   const polling = useAnalysisPolling(analysisId ?? null);
 
+  // No global session state to reset -- request_id identity is bound
+  // to the next capture attempt itself (src/analysis/capture-
+  // attempt.ts), minted fresh the moment a new photo is taken, not
+  // here.
   const handleAnalyzeAgain = () => {
-    startNewAttempt();
     router.replace("/(app)/analysis");
   };
 
@@ -74,6 +75,27 @@ export default function AnalysisResultScreen() {
         ) : (
           <Button label="Start over" onPress={handleAnalyzeAgain} />
         )}
+      </Screen>
+    );
+  }
+
+  if (polling.phase === "unavailable") {
+    // A PERMANENT polling failure (404/403/other nonretryable status
+    // from GET /api/v2/analyses/{id}) -- section 8. Deliberately NOT
+    // the same copy as an actual backend-reported FAILED analysis:
+    // this client cannot reach/see this analysis at all anymore, so
+    // it never claims to know what happened to it, and never keeps
+    // rendering it as still in progress.
+    return (
+      <Screen>
+        <Text style={[theme.typography.title, { color: theme.colors.foreground }]}>
+          This analysis isn&apos;t available
+        </Text>
+        <Text style={[theme.typography.body, { color: theme.colors.muted }]}>
+          We couldn&apos;t load this analysis. It may no longer be available, or something changed with your
+          account access.
+        </Text>
+        <Button label="Start over" onPress={handleAnalyzeAgain} />
       </Screen>
     );
   }

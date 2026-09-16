@@ -47,16 +47,31 @@ own happy path did not previously cover, plus one concurrency gap.
     case and polls get_request_by_request_id() (real, DB-uniqueness-
     backed state -- no process-local lock of any kind) for a bounded
     window before giving up and re-raising.
+
+Server-side image input limits (Mobile Phase B post-merge audit repair
+pass, section 7): the mobile client's own <=1600px-long-edge resize
+(mobile/src/constants/capture.ts) is not a security boundary -- this
+service independently rejects an oversized encoded/decoded payload or
+an image whose header declares dimensions/pixel count beyond
+MAX_ANALYSIS_IMAGE_LONG_EDGE/_PIXELS, using a cheap Pillow header read
+(never a full pixel decompression) before the image is ever stored or
+enqueued for the worker's own cv2.imdecode(). This is application-level
+validation on top of, not a replacement for, a transport/edge
+request-body size limit -- see DOKPLOY_DEPLOYMENT.md for the
+production reverse-proxy requirement that rejects an oversized request
+body before it ever reaches this process's own JSON parsing.
 """
 import asyncio
 import base64
 import binascii
+import io
 import logging
 from dataclasses import dataclass
 from typing import Optional
 from uuid import UUID
 
 import asyncpg
+from PIL import Image as PILImage
 
 from app.db import analysis_repository
 from app.domain.entitlement import AnalysisInProgressError, UsagePolicyService
@@ -77,6 +92,29 @@ ANALYSIS_JOB_TYPE = "analysis"
 CONCURRENT_REPLAY_POLL_INTERVAL_SECONDS = 0.05
 CONCURRENT_REPLAY_POLL_TIMEOUT_SECONDS = 5.0
 
+# Server-side image input bounds (this pass's "the mobile client is
+# not a security boundary" fix -- section 7 of the Mobile Phase B
+# post-merge audit repair pass). The official mobile client resizes to
+# a <=1600px long edge before submission (mobile/src/constants/
+# capture.ts) -- these bounds intentionally leave tolerance above that
+# so a legitimately-behaving client is never rejected, without ever
+# trusting a client to have actually resized at all. Applied entirely
+# independently of, and in addition to, that client-side resize (never
+# a substitute for it, and never substituted BY it).
+#
+# Enforced in this exact order inside submit(), each one cheaper than
+# the next: encoded-length (a string length check, no decoding) ->
+# decoded-byte-count (after a strict base64 decode) -> image
+# header/dimensions (Pillow, which reads only the header -- never a
+# full pixel decompression, unlike the CV worker's own cv2.imdecode()
+# later in the pipeline). This is a validation GATE in front of the
+# existing single analysis pipeline, not a second pipeline or storage
+# path of its own.
+MAX_ANALYSIS_BASE64_CHARS = 4_000_000
+MAX_ANALYSIS_DECODED_BYTES = 3_000_000
+MAX_ANALYSIS_IMAGE_LONG_EDGE = 2048
+MAX_ANALYSIS_IMAGE_PIXELS = 4_194_304
+
 
 class AsyncImageStorageDisabledError(Exception):
     """Raised when settings.async_image_storage_enabled is False. The
@@ -92,10 +130,48 @@ class ConsentRequiredError(Exception):
 
 
 class InvalidImageError(Exception):
-    """Raised for a base64 payload that isn't valid base64 at all --
-    mirrors app.domain.analysis_service.InvalidImageError exactly, kept
-    as a separate class so this module has no import-time dependency on
-    the synchronous path."""
+    """Raised for a base64 payload that isn't valid base64 at all, that
+    decodes to bytes no supported image format recognizes, or whose
+    declared dimensions/pixel count exceed this module's own
+    server-side bound (MAX_ANALYSIS_IMAGE_LONG_EDGE/_PIXELS) -- mirrors
+    app.domain.analysis_service.InvalidImageError exactly, kept as a
+    separate class so this module has no import-time dependency on the
+    synchronous path. The v2 HTTP layer maps every case of this to 422.
+    Never carries the underlying decoder/Pillow exception text -- only
+    this class's own safe message ever reaches the client."""
+
+
+class ImagePayloadTooLargeError(Exception):
+    """Raised when the client's image payload (encoded or decoded)
+    exceeds a deliberate server-side bound -- MAX_ANALYSIS_BASE64_CHARS
+    or MAX_ANALYSIS_DECODED_BYTES. The mobile client's own resize is
+    not a security boundary (section 7): this endpoint independently
+    refuses an oversized payload regardless of what the client claims
+    to have sent. The v2 HTTP layer maps this to 413."""
+
+
+def _reject_oversized_dimensions(image_bytes: bytes) -> None:
+    """Cheap, header-only image validation (section 7C). `Image.open()`
+    reads only the header to populate `.size`/`.format` -- it never
+    decompresses pixel data, unlike the CV worker's own
+    `cv2.imdecode()` later in the pipeline (RAW_IMAGE_LIFECYCLE.md).
+    Running this at submission time, before the image is ever stored
+    or enqueued, means a malformed or oversized image is rejected
+    synchronously with a safe client response instead of failing
+    asynchronously inside a worker job. Never surfaces the underlying
+    Pillow/decoder exception text -- only this module's own
+    InvalidImageError message does."""
+    try:
+        with PILImage.open(io.BytesIO(image_bytes)) as img:
+            width, height = img.size
+            img.verify()
+    except Exception as e:
+        raise InvalidImageError("image_base64 does not decode to a supported image") from e
+
+    if width > MAX_ANALYSIS_IMAGE_LONG_EDGE or height > MAX_ANALYSIS_IMAGE_LONG_EDGE:
+        raise InvalidImageError("image dimensions exceed the maximum allowed size")
+    if width * height > MAX_ANALYSIS_IMAGE_PIXELS:
+        raise InvalidImageError("image pixel count exceeds the maximum allowed size")
 
 
 @dataclass(frozen=True)
@@ -171,6 +247,17 @@ class AnalysisSubmissionService:
         except AnalysisInProgressError as e:
             return await self._await_concurrent_replay(user_id, request_id, e)
 
+        # Section 7A: reject an oversized encoded payload before ever
+        # attempting to decode it -- a cheap string-length check, no
+        # decoding work wasted on something we're going to refuse
+        # anyway.
+        if len(image_base64) > MAX_ANALYSIS_BASE64_CHARS:
+            await self._usage_policy_service.release_reservation(user_id, reservation.id)
+            observability_events.analysis_submission(
+                request_id=request_id, user_id=str(user_id), outcome="IMAGE_TOO_LARGE",
+            )
+            raise ImagePayloadTooLargeError("image_base64 exceeds the maximum allowed encoded size")
+
         # Strict base64 (`validate=True`): rejects any non-alphabet
         # character outright rather than silently discarding it (the
         # default's permissive behavior), so a corrupted/truncated/
@@ -186,6 +273,29 @@ class AnalysisSubmissionService:
                 request_id=request_id, user_id=str(user_id), outcome="INVALID_IMAGE",
             )
             raise InvalidImageError("image_base64 is not valid base64") from e
+
+        # Section 7B/7C: reject an oversized decoded payload, then
+        # (only once we know it's small enough to be worth inspecting)
+        # reject one whose header is unrecognized or whose declared
+        # dimensions/pixel count exceed the deliberate server-side
+        # bound -- both independent of, and never a substitute for,
+        # the mobile client's own <=1600px-long-edge resize (section
+        # 7D: the client is not a security boundary).
+        if len(image_bytes) > MAX_ANALYSIS_DECODED_BYTES:
+            await self._usage_policy_service.release_reservation(user_id, reservation.id)
+            observability_events.analysis_submission(
+                request_id=request_id, user_id=str(user_id), outcome="IMAGE_TOO_LARGE",
+            )
+            raise ImagePayloadTooLargeError("decoded image exceeds the maximum allowed size")
+
+        try:
+            _reject_oversized_dimensions(image_bytes)
+        except InvalidImageError:
+            await self._usage_policy_service.release_reservation(user_id, reservation.id)
+            observability_events.analysis_submission(
+                request_id=request_id, user_id=str(user_id), outcome="INVALID_IMAGE",
+            )
+            raise
 
         try:
             req = await analysis_repository.create_request(
