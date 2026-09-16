@@ -15,6 +15,17 @@ import type { ProductRecommendation } from "@/types/domain";
  * C1 (no purchase/shopping links exist yet -- see this phase's own
  * scope boundary), so touch-target sizing does not apply.
  *
+ * Fail-closed requirement (this phase's own invariant, defense in
+ * depth on top of the backend's SAFE/RESTRICTED-only guarantee): only
+ * a KNOWN safety status (presentation.isKnownStatus, i.e. SAFE or
+ * RESTRICTED -- see isKnownSafetyStatus()) is ever rendered as a
+ * concrete "Recommended match." Any other value -- UNSAFE,
+ * INSUFFICIENT_DATA, or a status this app hasn't been taught about
+ * yet -- renders UnconfirmedProductMatchNotice instead, below. This
+ * app is not re-deciding safety by branching on the raw status
+ * string; it is refusing to *present* a product as recommended when
+ * it cannot confirm the status means that.
+ *
  * Accessibility: rendered as one accessibility element in reading
  * order (brand/product -> compatibility status -> considerations ->
  * verification), with the compatibility status always carried as
@@ -23,6 +34,10 @@ import type { ProductRecommendation } from "@/types/domain";
 export function ProductRecommendationCard({ recommendation }: { recommendation: ProductRecommendation }) {
   const theme = useTheme();
   const presentation = presentProductRecommendation(recommendation);
+
+  if (!presentation.isKnownStatus) {
+    return <UnconfirmedProductMatchNotice />;
+  }
 
   const statusColor =
     presentation.safetyStatus.tone === "neutral"
@@ -71,6 +86,34 @@ export function ProductRecommendationCard({ recommendation }: { recommendation: 
         </Text>
       ) : null}
     </View>
+  );
+}
+
+/**
+ * Mobile V1 Phase C1 fail-closed presentation path: rendered by
+ * ProductRecommendationCard instead of a normal card whenever
+ * presentation.isKnownStatus is false -- the backend returned a
+ * concrete product record, but with a safety_status this app doesn't
+ * recognize as SAFE or RESTRICTED. Deliberately does NOT render:
+ * brand/product identity, "Recommended match" (or any label implying
+ * this app is presenting it as a recommendation), verification
+ * provenance, or interpreted restrictions/reasons -- none of those can
+ * be shown honestly when the safety meaning of the status itself
+ * isn't confirmed. Only the generic notice below, so the routine step
+ * this card sits under still reads coherently. Never crashes: this is
+ * exactly the "any other status" catch-all, so it must handle
+ * anything.
+ */
+export function UnconfirmedProductMatchNotice() {
+  const theme = useTheme();
+  return (
+    <Text
+      style={[theme.typography.caption, { color: theme.colors.muted, fontStyle: "italic" }]}
+      accessibilityRole="text"
+    >
+      Specific product match unavailable. Compatibility for the product returned with this analysis could not be
+      confirmed.
+    </Text>
   );
 }
 

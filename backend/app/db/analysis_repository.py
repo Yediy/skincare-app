@@ -31,6 +31,16 @@ COMPLETED = "COMPLETED"
 FAILED = "FAILED"
 CANCELLED = "CANCELLED"
 
+# Bumped only if the shape of the display-snapshot contract itself
+# changes (see migration e421ed4cf053). commit_analysis_result() is
+# the sole production writer of analysis_product_recommendations, and
+# it always captures brand/product_name/verification_date at the
+# moment a recommendation is built -- so every row it inserts is
+# stamped with this version, independent of whether any individual
+# snapshot field happens to be NULL. A row with no version at all is
+# how a genuinely legacy (pre-e421ed4cf053) row is identified.
+DISPLAY_SNAPSHOT_VERSION = 1
+
 
 async def create_request(
     pool: asyncpg.Pool,
@@ -205,18 +215,36 @@ async def get_product_recommendations(pool: asyncpg.Pool, user_id: UUID, analysi
     place in this response, RLS already scopes the row to its owner
     regardless.
 
-    Display metadata (`brand`/`product_name`/`verification_date`)
-    prefers this row's own historical snapshot
-    (`brand_name_snapshot`/`product_name_snapshot`/
-    `verification_date_snapshot`, populated for every analysis
-    completed after migration 366861ec262d) and falls back to a
-    read-only join against the *current* catalog only when the
-    snapshot is NULL (older, pre-snapshot analyses) -- this is a
-    display convenience for historical rows, never a mutation of the
-    historical row itself, and it never fabricates a verification date
-    or a display name: a formulation/product/brand that can't be
-    resolved either way simply returns null, per this phase's own
-    "do not invent a label" requirement."""
+    Display metadata (`brand`/`product_name`/`verification_date`) is
+    governed by `display_snapshot_version` (migration e421ed4cf053),
+    not by per-field NULL-ness -- a NULL snapshot field on a
+    versioned row is itself authoritative (e.g. a formulation that
+    genuinely had no verification date at analysis time) and must
+    never be papered over with a later current-catalog value:
+
+      - `display_snapshot_version IS NOT NULL` -- this row went
+        through the display-snapshot contract at commit time.
+        `brand_name_snapshot`/`product_name_snapshot`/
+        `verification_date_snapshot` are authoritative as written,
+        NULL or not. No current-catalog fallback, field by field or
+        otherwise -- that would let a later catalog edit (a rename, a
+        formulation getting verified after the fact) leak into an
+        already-completed analysis's historical display.
+
+      - `display_snapshot_version IS NULL` -- genuinely legacy (older
+        than migration e421ed4cf053, or e421ed4cf053, or
+        366861ec262d before it). Falls back to a read-only join
+        against the *current* catalog -- a display convenience for
+        historical rows that predate snapshotting, never a mutation
+        of the historical row itself, and never a fabricated
+        verification date: a formulation/product/brand that can't be
+        resolved either way simply returns null.
+
+    The formulation join binds both `pf.id = apr.formulation_id AND
+    pf.product_id = apr.product_id` (rather than trusting the two
+    independent FKs alone to imply the ids belong together) so the
+    legacy-fallback projection stays internally consistent even under
+    corrupted/manually-edited historical data."""
     async with pool.acquire() as conn:
         async with conn.transaction():
             await conn.execute("SELECT set_config('app.current_user_id', $1, true)", str(user_id))
@@ -231,13 +259,17 @@ async def get_product_recommendations(pool: asyncpg.Pool, user_id: UUID, analysi
                     apr.reason_codes,
                     apr.restrictions,
                     apr.rules_version,
-                    COALESCE(apr.brand_name_snapshot, b.name) AS brand,
-                    COALESCE(apr.product_name_snapshot, p.name) AS product_name,
-                    COALESCE(apr.verification_date_snapshot, pf.verified_at) AS verification_date
+                    CASE WHEN apr.display_snapshot_version IS NOT NULL
+                         THEN apr.brand_name_snapshot ELSE b.name END AS brand,
+                    CASE WHEN apr.display_snapshot_version IS NOT NULL
+                         THEN apr.product_name_snapshot ELSE p.name END AS product_name,
+                    CASE WHEN apr.display_snapshot_version IS NOT NULL
+                         THEN apr.verification_date_snapshot ELSE pf.verified_at END AS verification_date
                 FROM analysis_product_recommendations apr
                 LEFT JOIN products p ON p.id = apr.product_id
                 LEFT JOIN brands b ON b.id = p.brand_id
-                LEFT JOIN product_formulations pf ON pf.id = apr.formulation_id
+                LEFT JOIN product_formulations pf
+                    ON pf.id = apr.formulation_id AND pf.product_id = apr.product_id
                 WHERE apr.analysis_request_id = $1
                 ORDER BY apr.plan_step_key
                 """,
@@ -372,6 +404,12 @@ async def commit_analysis_result(
                 # recommendation time, so a completed analysis never
                 # has to be re-resolved against mutable current catalog
                 # state to render what it actually recommended.
+                # DISPLAY_SNAPSHOT_VERSION is stamped on every row this
+                # function writes, marking it (vs. a genuinely legacy,
+                # pre-e421ed4cf053 row) as one where get_product_
+                # recommendations() must treat these snapshot columns
+                # as authoritative even when NULL -- see that
+                # function's own docstring.
                 # rec["verification_date"] is an ISO-8601 string
                 # (StepProductRecommendation.to_dict()) or None --
                 # asyncpg binds a timestamptz parameter as a real
@@ -387,14 +425,16 @@ async def commit_analysis_result(
                     INSERT INTO analysis_product_recommendations
                         (analysis_request_id, user_id, plan_step_key, product_id, formulation_id,
                          rank_position, safety_status, reason_codes, restrictions, rules_version,
-                         brand_name_snapshot, product_name_snapshot, verification_date_snapshot)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10, $11, $12, $13)
+                         brand_name_snapshot, product_name_snapshot, verification_date_snapshot,
+                         display_snapshot_version)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10, $11, $12, $13, $14)
                     ON CONFLICT (analysis_request_id, plan_step_key) DO NOTHING
                     """,
                     analysis_request_id, user_id, rec["plan_step_key"], rec["product_id"], rec["formulation_id"],
                     rec["rank_position"], rec["safety_status"], json.dumps(rec["reason_codes"]),
                     json.dumps(rec["restrictions"]), rec["rules_version"],
                     rec.get("brand"), rec.get("product_name"), verification_date_snapshot,
+                    DISPLAY_SNAPSHOT_VERSION,
                 )
 
             await conn.execute(

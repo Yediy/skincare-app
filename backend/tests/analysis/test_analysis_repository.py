@@ -261,31 +261,35 @@ async def test_get_product_recommendations_persists_and_prefers_display_snapshot
     assert snapshot_row["verification_date_snapshot"] == verified_at
 
 
-async def test_get_product_recommendations_falls_back_to_current_catalog_when_snapshot_is_null(db_pool, app_db_pool):
-    """A row with NULL snapshot columns (e.g. an analysis completed
-    before migration 366861ec262d, or any caller that omits
-    brand/product_name) resolves display metadata from the CURRENT
-    catalog via a read-only join -- and that read must never write the
-    resolved values back into the historical row itself. A
-    verification_date that cannot be resolved either way is null, never
-    fabricated."""
+async def test_get_product_recommendations_falls_back_to_current_catalog_when_legacy_marker_is_null(db_pool, app_db_pool):
+    """A GENUINELY legacy row -- display_snapshot_version IS NULL,
+    exactly what every row predating migration e421ed4cf053 (and
+    366861ec262d before it) actually looks like -- resolves display
+    metadata from the CURRENT catalog via a read-only join, and that
+    read must never write the resolved values back into the historical
+    row itself. A verification_date that cannot be resolved either way
+    is null, never fabricated.
+
+    Deliberately constructed with a direct INSERT (db_pool, bypassing
+    commit_analysis_result() entirely) rather than by omitting
+    brand/product_name from a commit_analysis_result() call --
+    commit_analysis_result() now always stamps
+    display_snapshot_version, so passing it omitted fields no longer
+    produces a row that looks like a real legacy one; only a genuinely
+    marker-null row exercises the legacy branch of the read
+    projection."""
     user_id = await _create_user(db_pool, "analysis-fallback@test.com")
     req = await analysis_repository.create_request(app_db_pool, user_id, str(uuid.uuid4()))
-    reservation = await _reserve(app_db_pool, user_id, request_id=str(uuid.uuid4()))
-
     product_id, formulation_id = await _seed_product(db_pool, brand_name="FallbackBrand", product_name="FallbackProduct")
 
-    # Deliberately omit brand/product_name/verification_date, simulating
-    # a pre-migration row.
-    await analysis_repository.commit_analysis_result(
-        app_db_pool, user_id, req["id"],
-        capture_assessment={"quality_status": "PASS"}, scores={"overall": 0.8}, plan={"am_routine": []},
-        eligible_for_longitudinal_comparison=True, pipeline_version="1.0", metric_results={},
-        product_recommendations=[{
-            "plan_step_key": "AM:1", "product_id": product_id, "formulation_id": formulation_id,
-            "rank_position": 1, "safety_status": "SAFE", "reason_codes": [], "restrictions": {}, "rules_version": "1.0",
-        }],
-        usage_reservation_id=reservation.id,
+    await db_pool.execute(
+        """
+        INSERT INTO analysis_product_recommendations
+            (analysis_request_id, user_id, plan_step_key, product_id, formulation_id,
+             rank_position, safety_status, reason_codes, restrictions, rules_version)
+        VALUES ($1, $2, 'AM:1', $3, $4, 1, 'SAFE', '[]'::jsonb, '{}'::jsonb, '1.0')
+        """,
+        req["id"], user_id, product_id, formulation_id,
     )
 
     recs = await analysis_repository.get_product_recommendations(app_db_pool, user_id, req["id"])
@@ -295,13 +299,67 @@ async def test_get_product_recommendations_falls_back_to_current_catalog_when_sn
     assert recs[0]["verification_date"] is None  # never fabricated
 
     snapshot_row = await db_pool.fetchrow(
-        "SELECT brand_name_snapshot, product_name_snapshot, verification_date_snapshot "
+        "SELECT brand_name_snapshot, product_name_snapshot, verification_date_snapshot, display_snapshot_version "
         "FROM analysis_product_recommendations WHERE analysis_request_id = $1",
         req["id"],
     )
     assert snapshot_row["brand_name_snapshot"] is None
     assert snapshot_row["product_name_snapshot"] is None
     assert snapshot_row["verification_date_snapshot"] is None
+    assert snapshot_row["display_snapshot_version"] is None
+
+
+async def test_get_product_recommendations_preserves_null_verification_date_on_versioned_row(db_pool, app_db_pool):
+    """The historical-provenance-drift bug: a versioned row
+    (display_snapshot_version = 1, written by commit_analysis_result())
+    whose verification_date_snapshot is genuinely NULL -- because the
+    formulation had no verification date at analysis time, a legitimate
+    state (StepProductRecommendation.verification_date: Optional) --
+    must keep reading back as NULL even after the CURRENT catalog
+    formulation is later verified. Per-field COALESCE would leak that
+    later timestamp into this already-completed analysis; the
+    display_snapshot_version marker must prevent it."""
+    user_id = await _create_user(db_pool, "analysis-null-snapshot@test.com")
+    req = await analysis_repository.create_request(app_db_pool, user_id, str(uuid.uuid4()))
+    reservation = await _reserve(app_db_pool, user_id, request_id=str(uuid.uuid4()))
+
+    # Unverified at analysis time.
+    product_id, formulation_id = await _seed_product(
+        db_pool, brand_name="UnverifiedBrand", product_name="UnverifiedProduct", verified_at=None,
+    )
+
+    await analysis_repository.commit_analysis_result(
+        app_db_pool, user_id, req["id"],
+        capture_assessment={"quality_status": "PASS"}, scores={"overall": 0.8}, plan={"am_routine": []},
+        eligible_for_longitudinal_comparison=True, pipeline_version="1.0", metric_results={},
+        product_recommendations=[{
+            "plan_step_key": "AM:1", "product_id": product_id, "formulation_id": formulation_id,
+            "rank_position": 1, "safety_status": "SAFE", "reason_codes": [], "restrictions": {},
+            "rules_version": "1.0", "brand": "UnverifiedBrand", "product_name": "UnverifiedProduct",
+            "verification_date": None,
+        }],
+        usage_reservation_id=reservation.id,
+    )
+
+    snapshot_row = await db_pool.fetchrow(
+        "SELECT verification_date_snapshot, display_snapshot_version "
+        "FROM analysis_product_recommendations WHERE analysis_request_id = $1",
+        req["id"],
+    )
+    assert snapshot_row["verification_date_snapshot"] is None
+    assert snapshot_row["display_snapshot_version"] == 1
+
+    # The catalog formulation is verified LATER, after the analysis
+    # already completed.
+    await db_pool.execute(
+        "UPDATE product_formulations SET verified_at = $1 WHERE id = $2",
+        datetime(2026, 6, 1, tzinfo=timezone.utc), formulation_id,
+    )
+
+    recs = await analysis_repository.get_product_recommendations(app_db_pool, user_id, req["id"])
+    assert len(recs) == 1
+    # Must NOT pick up the later catalog verification timestamp.
+    assert recs[0]["verification_date"] is None
 
 
 async def test_get_product_recommendations_denies_another_user(db_pool, app_db_pool):
