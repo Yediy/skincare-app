@@ -72,7 +72,7 @@ class _StubExecutionService:
         self.execute_calls = 0
         self.terminal_failure_calls = []
 
-    async def execute(self, user_id, analysis_request_id):
+    async def execute(self, user_id, analysis_request_id, claim_token=None, job_id=None):
         self.execute_calls += 1
         if self.delay_seconds:
             await asyncio.sleep(self.delay_seconds)
@@ -80,7 +80,7 @@ class _StubExecutionService:
             raise self.raise_exc
         return ExecutionOutcome(analysis_request_id=analysis_request_id, already_completed=False)
 
-    async def mark_terminal_failure(self, user_id, analysis_request_id, error_code):
+    async def mark_terminal_failure(self, user_id, analysis_request_id, error_code, claim_token=None):
         self.terminal_failure_calls.append((user_id, analysis_request_id, error_code))
 
 

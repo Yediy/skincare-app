@@ -33,6 +33,7 @@ execute() passes its own dedicated single-thread executor (see
 __init__ below) into compute_analysis() so the CV call runs off-loop;
 scoring/planning/DB work after it stays on the loop unchanged.
 """
+import uuid
 from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Optional
@@ -75,6 +76,30 @@ class ImageRetrievalError(Exception):
     retention window already expired) from
     ObjectStorageUnavailableError (retryable -- the backend was simply
     unreachable this attempt)."""
+
+
+class AnalysisExecutionLeaseLostError(Exception):
+    """System Integrity Gate V1: raised by commit_analysis_result() (via
+    execute()) or mark_terminal_failure() when this caller's
+    claim_token no longer matches analysis_requests.
+    processing_claim_token -- a newer worker has already installed its
+    own token (via mark_processing()), meaning it, not this caller, now
+    owns this request's execution outcome.
+
+    Queue-level lease fencing (app/queue/base.py's JobLeaseLostError)
+    alone cannot catch this: a worker can already be inside synchronous
+    CV compute when its queue claim expires and a second worker
+    legitimately reclaims the job -- by the time the first worker tries
+    to commit or fail, the *job* queue may already agree it's no longer
+    the owner, but that check happens too early to protect the
+    durable analysis_requests row itself, which is why this is its own
+    error at its own layer, not a re-raise of JobLeaseLostError.
+
+    Callers (app/workers/analysis_worker.py) must treat this as STALE
+    ATTEMPT / ABANDON -- never a retryable processing failure (nothing
+    is actually wrong with the attempt) and never a terminal failure
+    (that would mean releasing quota or deleting an image the new,
+    legitimate owner may still need)."""
 
 
 @dataclass(frozen=True)
@@ -125,11 +150,52 @@ class AnalysisExecutionService:
         # py's run_forever) -- so max_workers=1 costs nothing and
         # removes a class of risk for free. See compute_analysis()'s
         # cv_executor docstring for the other half of this fix.
+        self._owns_cv_executor = cv_executor is None
         self._cv_executor = cv_executor or ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="analysis-cv"
         )
 
-    async def execute(self, user_id: UUID, analysis_request_id: UUID) -> ExecutionOutcome:
+    def close(self) -> None:
+        """Executor lifecycle (System Integrity Gate V1, section 5):
+        shuts down the CV executor only if this instance created it
+        itself (`cv_executor=` was not passed to __init__) -- an
+        injected executor belongs to whoever constructed it (e.g. a
+        test sharing one across several service instances), and this
+        service must never shut down a resource it doesn't own. The
+        analysis worker process calls this during graceful shutdown,
+        before its database pool closes underneath it -- see
+        app/workers/analysis_worker.py's _main()."""
+        if self._owns_cv_executor:
+            self._cv_executor.shutdown(wait=True)
+
+    async def execute(
+        self, user_id: UUID, analysis_request_id: UUID,
+        claim_token: Optional[UUID] = None, job_id: Optional[UUID] = None,
+    ) -> ExecutionOutcome:
+        """`claim_token` is the active queue claim token for the Job
+        driving this attempt (System Integrity Gate V1, section 2) --
+        installed as analysis_requests.processing_claim_token by
+        mark_processing() below, and required again by
+        commit_analysis_result() before it may persist anything. None
+        (the default) mints a fresh, single-use token instead: correct
+        for a caller with no queue-level claim to fence against at all
+        (a direct call, e.g. most of this module's own tests), since a
+        freshly generated UUID can never collide with, or be mistaken
+        for, any other worker's real token.
+
+        `job_id` (independent-review follow-up to section 2) is that
+        same Job's own id -- passed straight through to
+        mark_processing(), which requires BOTH it and `claim_token` to
+        atomically prove this call is still the queue's current owner
+        of the actual `analysis` job driving this attempt before
+        installing anything (see that function's own docstring for why
+        `claim_token` alone, however improbable a collision, is never
+        trusted as sufficient proof of ownership by itself). None (the
+        default) skips that proof, matching `claim_token=None`'s own
+        "no real queue job to prove ownership against" caller."""
+        if claim_token is None:
+            claim_token = uuid.uuid4()
+
         req = await analysis_repository.get_request_by_id(self._pool, user_id, analysis_request_id)
         if req is None:
             raise AnalysisRequestNotFoundError(str(analysis_request_id))
@@ -147,9 +213,26 @@ class AnalysisExecutionService:
             )
 
         # Idempotent to call again on a retry (just re-sets status/
-        # started_at) -- a job that failed retryably after this point
-        # last attempt re-enters here exactly the same way.
-        await analysis_repository.mark_processing(self._pool, user_id, analysis_request_id)
+        # started_at/processing_claim_token) -- a job that failed
+        # retryably after this point last attempt re-enters here
+        # exactly the same way. System Integrity Gate V1 (independent-
+        # review follow-up): a worker resuming AFTER a legitimate newer
+        # worker has already reclaimed the same job and installed its
+        # own token must NOT be able to overwrite that ownership back
+        # to its own stale token -- mark_processing() now proves
+        # current queue ownership (job_id + claim_token + the
+        # jobs.request_id == analysis_requests.request_id relationship)
+        # atomically, in the same statement as the install, and returns
+        # False rather than installing anything if that proof fails.
+        installed = await analysis_repository.mark_processing(
+            self._pool, user_id, analysis_request_id, claim_token, job_id=job_id,
+        )
+        if not installed:
+            # Never reached the image/compute stage -- no image
+            # retrieval, no CV work, no quota/image mutation. The
+            # legitimate current owner's own attempt (if any) is
+            # completely unaffected by this one failing to install.
+            raise AnalysisExecutionLeaseLostError(str(analysis_request_id))
 
         try:
             image_bytes = await self._image_store.retrieve(req["image_object_key"])
@@ -172,18 +255,26 @@ class AnalysisExecutionService:
         # all in one transaction, idempotent via ON CONFLICT DO NOTHING
         # -- a retry after this call already committed re-runs
         # everything above (wasted compute, never wasted correctness)
-        # but writes nothing twice.
-        await analysis_repository.commit_analysis_result(
-            self._pool, user_id, analysis_request_id,
-            capture_assessment=result.capture_assessment,
-            scores=result.scores,
-            plan=result.plan,
-            eligible_for_longitudinal_comparison=result.eligible_for_longitudinal_comparison,
-            pipeline_version=result.capture_assessment.get("capture_pipeline_version") or "unknown",
-            metric_results=result.metric_results,
-            product_recommendations=result.product_recommendations,
-            usage_reservation_id=req["usage_reservation_id"],
-        )
+        # but writes nothing twice. System Integrity Gate V1: also
+        # requires `claim_token` to still be the request's current
+        # processing_claim_token -- raises AnalysisExecutionLeaseLostError,
+        # committing nothing, if a newer worker installed its own token
+        # while this compute was running (see that error's docstring).
+        try:
+            await analysis_repository.commit_analysis_result(
+                self._pool, user_id, analysis_request_id,
+                capture_assessment=result.capture_assessment,
+                scores=result.scores,
+                plan=result.plan,
+                eligible_for_longitudinal_comparison=result.eligible_for_longitudinal_comparison,
+                pipeline_version=result.capture_assessment.get("capture_pipeline_version") or "unknown",
+                metric_results=result.metric_results,
+                product_recommendations=result.product_recommendations,
+                usage_reservation_id=req["usage_reservation_id"],
+                processing_claim_token=claim_token,
+            )
+        except analysis_repository.AnalysisResultCommitFencedError as e:
+            raise AnalysisExecutionLeaseLostError(str(analysis_request_id)) from e
 
         # Primary raw-image deletion path (Part IV, Phase 20) -- best
         # effort. If this fails, the result is already durably
@@ -197,7 +288,9 @@ class AnalysisExecutionService:
 
         return ExecutionOutcome(analysis_request_id=analysis_request_id, already_completed=False)
 
-    async def mark_terminal_failure(self, user_id: UUID, analysis_request_id: UUID, error_code: str) -> None:
+    async def mark_terminal_failure(
+        self, user_id: UUID, analysis_request_id: UUID, error_code: str, claim_token: Optional[UUID] = None,
+    ) -> None:
         """Called by the worker once it has decided a failure is
         terminal -- either genuinely non-retryable, or a retryable
         one whose attempts are now exhausted (dead letter, Part VI
@@ -208,14 +301,38 @@ class AnalysisExecutionService:
         once, so a worker that dies partway through this and picks the
         dead-lettered job's cleanup back up (or the cleanup sweeper,
         for the image specifically) never double-charges or corrupts
-        state."""
+        state.
+
+        System Integrity Gate V1: `claim_token` (None if the caller
+        never entered processing at all, e.g. AnalysisRequestNotFoundError/
+        AnalysisRequestInvalidStateError raised before mark_processing
+        ever ran this attempt) must match analysis_requests.
+        processing_claim_token -- enforced by mark_failed()'s own
+        atomic, fenced UPDATE, checked and applied BEFORE this method
+        does anything else irreversible. If that fenced update does not
+        actually land (a newer worker already owns this request's
+        processing, or it reached a terminal state some other way in
+        the interim), this method raises AnalysisExecutionLeaseLostError
+        and performs NO compensation at all -- no reservation release,
+        no image deletion -- rather than risk undoing state a
+        legitimate newer owner still depends on."""
         req = await analysis_repository.get_request_by_id(self._pool, user_id, analysis_request_id)
-        if req is not None and req.get("usage_reservation_id") is not None:
+        if req is None:
+            return
+
+        if req["status"] not in ("RECEIVED", "QUEUED", "PROCESSING"):
+            return  # already terminal -- idempotent no-op, nothing to compensate
+
+        updated = await analysis_repository.mark_failed(
+            self._pool, user_id, analysis_request_id, error_code, processing_claim_token=claim_token,
+        )
+        if not updated:
+            raise AnalysisExecutionLeaseLostError(str(analysis_request_id))
+
+        if req.get("usage_reservation_id") is not None:
             await self._usage_policy_service.release_reservation(user_id, req["usage_reservation_id"])
 
-        await analysis_repository.mark_failed(self._pool, user_id, analysis_request_id, error_code)
-
-        if req is not None and req.get("image_object_key"):
+        if req.get("image_object_key"):
             confirmed = await self._image_store.delete_if_confirmed(req["image_object_key"])
             if confirmed:
                 await analysis_repository.clear_image_reference(self._pool, analysis_request_id)

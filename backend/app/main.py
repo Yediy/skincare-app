@@ -9,6 +9,7 @@ from asyncpg.exceptions import UniqueViolationError
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field, field_validator
+from redis.exceptions import RedisError
 
 from app.api.v2.analyses import router as analyses_v2_router
 from app.api.v2.webhooks import router as webhooks_v2_router
@@ -432,12 +433,24 @@ async def refresh(request: RefreshRequest, _rl: None = Depends(rate_limit_by_ip(
             if existing is not None and existing["used_at"] is not None and existing["revoked_at"] is None:
                 family_id = existing["family_id"]
                 await conn.execute("SELECT set_config('app.current_user_id', $1, true)", str(existing["user_id"]))
+                # Durable commit first -- this UPDATE is what actually
+                # revokes the family (get_current_user's Postgres check
+                # already sees it the instant this transaction commits,
+                # Redis or no Redis). The Redis marker below is
+                # best-effort cache propagation AFTER that success, so
+                # a Redis outage here must not stop this family from
+                # being genuinely revoked, and must not turn into a
+                # 500 that would make the caller think the replay went
+                # unnoticed.
                 await conn.execute(
                     "UPDATE refresh_tokens SET revoked_at = now() WHERE family_id = $1 AND revoked_at IS NULL",
                     family_id,
                 )
-                r = get_redis()
-                await r.set(f"revoked_family:{family_id}", "1", ex=settings.access_token_expire_minutes * 60)
+                try:
+                    r = get_redis()
+                    await r.set(f"revoked_family:{family_id}", "1", ex=settings.access_token_expire_minutes * 60)
+                except RedisError:
+                    logger.warning("refresh: Redis unavailable propagating replay-triggered family revocation")
 
     raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
 
@@ -473,8 +486,17 @@ async def logout(request: LogoutRequest, _rl: None = Depends(rate_limit_by_ip(AU
                 family_id,
             )
 
-    r = get_redis()
-    await r.set(f"revoked_family:{family_id}", "1", ex=settings.access_token_expire_minutes * 60)
+    # Postgres revocation above already committed -- that alone makes
+    # get_current_user reject this family's existing access tokens
+    # from now on, Redis or no Redis (System Integrity Gate V1, section
+    # 4). The Redis marker below is best-effort cache propagation
+    # AFTER that durable success; a Redis outage here must not make
+    # this request look like logout failed.
+    try:
+        r = get_redis()
+        await r.set(f"revoked_family:{family_id}", "1", ex=settings.access_token_expire_minutes * 60)
+    except RedisError:
+        logger.warning("logout: Redis unavailable propagating family revocation -- Postgres revocation already durable")
 
     return {"detail": "Logged out"}
 
@@ -486,15 +508,16 @@ async def get_me(user_id: str = Depends(rate_limit_by_user(GENERAL_POLICY))):
 
 @app.post("/logout-all")
 async def logout_all(user_id: str = Depends(rate_limit_by_user(GENERAL_POLICY))):
+    """Postgres revocation is the authoritative commit, done FIRST --
+    every one of this user's refresh_tokens families loses its last
+    unrevoked row in the same transaction, which is what
+    get_current_user's authoritative check actually reads (System
+    Integrity Gate V1, section 4). The Redis `user_tokens_invalid_before`
+    marker is best-effort cache propagation AFTER that success, purely
+    to let get_current_user fail fast against Redis without a DB round
+    trip when it's available -- never the thing standing between a
+    revoked session and rejection."""
     from app.db.connection import get_db_pool
-    r = get_redis()
-    now_ts = datetime.now(timezone.utc).timestamp()
-    await r.set(
-        f"user_tokens_invalid_before:{user_id}",
-        str(now_ts),
-        ex=settings.access_token_expire_minutes * 60,
-    )
-
     pool = get_db_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -503,6 +526,17 @@ async def logout_all(user_id: str = Depends(rate_limit_by_user(GENERAL_POLICY)))
                 "UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL",
                 uuid.UUID(user_id),
             )
+
+    try:
+        r = get_redis()
+        now_ts = datetime.now(timezone.utc).timestamp()
+        await r.set(
+            f"user_tokens_invalid_before:{user_id}",
+            str(now_ts),
+            ex=settings.access_token_expire_minutes * 60,
+        )
+    except RedisError:
+        logger.warning("logout-all: Redis unavailable propagating revocation -- Postgres revocation already durable")
 
     return {"detail": "Logged out of all sessions"}
 
@@ -538,13 +572,16 @@ async def delete_account(user_id: str = Depends(rate_limit_by_user(GENERAL_POLIC
                 user_uuid,
             )
 
-    r = get_redis()
-    now_ts = datetime.now(timezone.utc).timestamp()
-    await r.set(
-        f"user_tokens_invalid_before:{user_id}",
-        str(now_ts),
-        ex=settings.access_token_expire_minutes * 60,
-    )
+    try:
+        r = get_redis()
+        now_ts = datetime.now(timezone.utc).timestamp()
+        await r.set(
+            f"user_tokens_invalid_before:{user_id}",
+            str(now_ts),
+            ex=settings.access_token_expire_minutes * 60,
+        )
+    except RedisError:
+        logger.warning("delete_account: Redis unavailable propagating revocation -- Postgres state already durable")
 
     return {"detail": "Account deleted"}
 

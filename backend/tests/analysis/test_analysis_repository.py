@@ -43,6 +43,19 @@ async def _reserve(app_db_pool, user_id, request_id="r1", allowance=5):
     return await usage_repository.reserve(app_db_pool, user_id, request_id, "2026-09", allowance)
 
 
+async def _queue(app_db_pool, user_id, request_row_id):
+    """Advances a freshly created (RECEIVED) request to QUEUED --
+    mark_processing() now only accepts QUEUED/PROCESSING (System
+    Integrity Gate V1, section 3), so any test driving straight to
+    commit_analysis_result() via mark_processing() must pass through
+    this real intermediate state first, same as the actual submission
+    flow (AnalysisSubmissionService) does."""
+    await analysis_repository.mark_queued(
+        app_db_pool, user_id, request_row_id,
+        image_object_key="ephemeral-analysis/test/fixture", image_expires_at=None,
+    )
+
+
 async def test_create_request_is_idempotent(db_pool, app_db_pool):
     user_id = await _create_user(db_pool, "analysis-req-idempotent@test.com")
     request_id = str(uuid.uuid4())
@@ -142,6 +155,12 @@ async def test_commit_analysis_result_persists_everything_atomically(db_pool, ap
     product_recommendations[0]["product_id"] = product_id
     product_recommendations[0]["formulation_id"] = formulation_id
 
+    # commit_analysis_result() now requires the request to be PROCESSING
+    # (System Integrity Gate V1, section 3's status-transition graph
+    # only allows PROCESSING -> COMPLETED) -- queue then mark_processing()
+    # first, same as the real submission+execute() flow.
+    await _queue(app_db_pool, user_id, req["id"])
+    await analysis_repository.mark_processing(app_db_pool, user_id, req["id"])
     await analysis_repository.commit_analysis_result(
         app_db_pool, user_id, req["id"],
         capture_assessment={"quality_status": "PASS"},
@@ -177,14 +196,26 @@ async def test_commit_analysis_result_persists_everything_atomically(db_pool, ap
     assert usage_row["status"] == "CONSUMED"
 
 
-async def test_commit_analysis_result_is_idempotent_on_retry(db_pool, app_db_pool):
-    """A worker retrying commit_analysis_result() for the same
-    analysis_request_id (e.g. after a crash right after the first
-    commit but before acknowledging the job) must not create duplicate
-    rows or re-consume quota a second time."""
+async def test_commit_analysis_result_after_already_completed_is_rejected_not_duplicated(db_pool, app_db_pool):
+    """System Integrity Gate V1, section 3: once a request reaches
+    COMPLETED, a repeated commit_analysis_result() call must be
+    rejected outright (AnalysisResultCommitFencedError -- the
+    request is no longer PROCESSING, which the fenced UPDATE this
+    function opens with now requires) rather than silently re-running
+    and risking a duplicate write; either way, no second result row
+    is ever created.
+
+    User-facing "a worker retrying after a crash doesn't recompute"
+    idempotency has moved one layer up, into
+    AnalysisExecutionService.execute()'s own already-COMPLETED check
+    (see tests/domain/test_analysis_execution_service.py::
+    test_execute_on_already_completed_request_does_not_recompute) --
+    this repository function's own job is narrower and stricter now:
+    never let a terminal row's meaning change twice, full stop."""
     user_id = await _create_user(db_pool, "analysis-commit-retry@test.com")
     req = await analysis_repository.create_request(app_db_pool, user_id, str(uuid.uuid4()))
     reservation = await _reserve(app_db_pool, user_id, request_id=str(uuid.uuid4()))
+    token = uuid.uuid4()
 
     kwargs = dict(
         capture_assessment={"quality_status": "PASS"},
@@ -195,10 +226,15 @@ async def test_commit_analysis_result_is_idempotent_on_retry(db_pool, app_db_poo
         metric_results={},
         product_recommendations=[],
         usage_reservation_id=reservation.id,
+        processing_claim_token=token,
     )
 
+    await _queue(app_db_pool, user_id, req["id"])
+    await analysis_repository.mark_processing(app_db_pool, user_id, req["id"], token)
     await analysis_repository.commit_analysis_result(app_db_pool, user_id, req["id"], **kwargs)
-    await analysis_repository.commit_analysis_result(app_db_pool, user_id, req["id"], **kwargs)  # retry
+
+    with pytest.raises(analysis_repository.AnalysisResultCommitFencedError):
+        await analysis_repository.commit_analysis_result(app_db_pool, user_id, req["id"], **kwargs)  # retry
 
     count = await db_pool.fetchval(
         "SELECT COUNT(*) FROM analysis_results WHERE analysis_request_id = $1", req["id"]
@@ -226,6 +262,8 @@ async def test_get_product_recommendations_persists_and_prefers_display_snapshot
         db_pool, brand_name="OriginalBrand", product_name="OriginalProduct", verified_at=verified_at,
     )
 
+    await _queue(app_db_pool, user_id, req["id"])
+    await analysis_repository.mark_processing(app_db_pool, user_id, req["id"])
     await analysis_repository.commit_analysis_result(
         app_db_pool, user_id, req["id"],
         capture_assessment={"quality_status": "PASS"}, scores={"overall": 0.8}, plan={"am_routine": []},
@@ -328,6 +366,8 @@ async def test_get_product_recommendations_preserves_null_verification_date_on_v
         db_pool, brand_name="UnverifiedBrand", product_name="UnverifiedProduct", verified_at=None,
     )
 
+    await _queue(app_db_pool, user_id, req["id"])
+    await analysis_repository.mark_processing(app_db_pool, user_id, req["id"])
     await analysis_repository.commit_analysis_result(
         app_db_pool, user_id, req["id"],
         capture_assessment={"quality_status": "PASS"}, scores={"overall": 0.8}, plan={"am_routine": []},
@@ -374,6 +414,8 @@ async def test_get_product_recommendations_denies_another_user(db_pool, app_db_p
     reservation = await _reserve(app_db_pool, owner_id, request_id=str(uuid.uuid4()))
     product_id, formulation_id = await _seed_product(db_pool, brand_name="RlsBrand", product_name="RlsProduct")
 
+    await _queue(app_db_pool, owner_id, req["id"])
+    await analysis_repository.mark_processing(app_db_pool, owner_id, req["id"])
     await analysis_repository.commit_analysis_result(
         app_db_pool, owner_id, req["id"],
         capture_assessment={"quality_status": "PASS"}, scores={"overall": 0.8}, plan={"am_routine": []},

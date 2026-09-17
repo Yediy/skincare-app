@@ -200,6 +200,14 @@ async def test_get_completed_analysis_includes_metric_results(client, db_pool, a
 
     req = await analysis_repository.create_request(app_db_pool, user_id, str(uuid.uuid4()))
     reservation = await usage_repository.reserve(app_db_pool, user_id, str(uuid.uuid4()), "2026-09", allowance=5)
+    # commit_analysis_result() now requires the request to be PROCESSING
+    # (System Integrity Gate V1, section 3) -- queue then mark_processing()
+    # first, same as the real submission+execute() flow.
+    await analysis_repository.mark_queued(
+        app_db_pool, user_id, req["id"],
+        image_object_key="ephemeral-analysis/test/fixture", image_expires_at=None,
+    )
+    await analysis_repository.mark_processing(app_db_pool, user_id, req["id"])
     await analysis_repository.commit_analysis_result(
         app_db_pool, user_id, req["id"],
         capture_assessment={"quality_status": "PASS"},
@@ -246,6 +254,14 @@ async def test_get_measurements_response_excludes_internal_columns(client, db_po
 
     req = await analysis_repository.create_request(app_db_pool, user_id, str(uuid.uuid4()))
     reservation = await usage_repository.reserve(app_db_pool, user_id, str(uuid.uuid4()), "2026-09", allowance=5)
+    # commit_analysis_result() now requires the request to be PROCESSING
+    # (System Integrity Gate V1, section 3) -- queue then mark_processing()
+    # first, same as the real submission+execute() flow.
+    await analysis_repository.mark_queued(
+        app_db_pool, user_id, req["id"],
+        image_object_key="ephemeral-analysis/test/fixture", image_expires_at=None,
+    )
+    await analysis_repository.mark_processing(app_db_pool, user_id, req["id"])
     await analysis_repository.commit_analysis_result(
         app_db_pool, user_id, req["id"],
         capture_assessment={"quality_status": "PASS"},
@@ -305,6 +321,14 @@ async def test_get_completed_analysis_product_recommendations_projection(client,
 
     req = await analysis_repository.create_request(app_db_pool, user_id, str(uuid.uuid4()))
     reservation = await usage_repository.reserve(app_db_pool, user_id, str(uuid.uuid4()), "2026-09", allowance=5)
+    # commit_analysis_result() now requires the request to be PROCESSING
+    # (System Integrity Gate V1, section 3) -- queue then mark_processing()
+    # first, same as the real submission+execute() flow.
+    await analysis_repository.mark_queued(
+        app_db_pool, user_id, req["id"],
+        image_object_key="ephemeral-analysis/test/fixture", image_expires_at=None,
+    )
+    await analysis_repository.mark_processing(app_db_pool, user_id, req["id"])
     await analysis_repository.commit_analysis_result(
         app_db_pool, user_id, req["id"],
         capture_assessment={"quality_status": "PASS"}, scores={"skin_health_score": 0.8}, plan={"top_priorities": []},

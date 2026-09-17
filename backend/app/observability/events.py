@@ -54,7 +54,12 @@ def processing_result(
     *, job_id: str, analysis_id: str, outcome: str, duration_seconds: float,
     error_code: Optional[str] = None,
 ) -> None:
-    """outcome: SUCCESS | RETRY | DEAD_LETTER. error_code, when
+    """outcome: SUCCESS | RETRY | DEAD_LETTER | ABANDONED. ABANDONED
+    (System Integrity Gate V1) means this worker discovered mid-attempt
+    that its queue or execution lease was lost to a newer worker --
+    deliberately distinct from RETRY/DEAD_LETTER, since no compensation
+    (fail(), mark_terminal_failure()) was performed for it; whoever now
+    holds the lease owns that job's outcome instead. error_code, when
     present, is always one of the closed set of safe classifications
     app/workers/analysis_worker.py's classify_failure() assigns --
     never an exception message or stack trace."""

@@ -19,7 +19,7 @@ from uuid import UUID
 
 from app.domain.revenuecat_entitlement_processor import WebhookEventNotFoundError, process_webhook_event
 from app.observability import events as observability_events
-from app.queue.base import Job, JobNotFoundError, JobQueue
+from app.queue.base import Job, JobLeaseLostError, JobNotFoundError, JobQueue
 
 logger = logging.getLogger(__name__)
 
@@ -32,17 +32,33 @@ async def _process_job(job: Job, job_queue: JobQueue, pool) -> None:
     webhook_event_id = UUID(job.payload["webhook_event_id"])
     try:
         await process_webhook_event(pool, webhook_event_id)
-        await job_queue.acknowledge(job.id)
+        await job_queue.acknowledge(job.id, job.claim_token)
         logger.info("revenuecat_webhook_worker: job=%s webhook_event_id=%s completed", job.id, webhook_event_id)
     except WebhookEventNotFoundError:
         # The referenced revenuecat_webhook_events row doesn't exist --
         # cannot happen for a job this route itself just enqueued
         # inside the same transaction as the row insert, so retrying
         # will not change the outcome.
-        await job_queue.fail(job.id, "WEBHOOK_EVENT_NOT_FOUND", retryable=False)
+        await job_queue.fail(job.id, job.claim_token, "WEBHOOK_EVENT_NOT_FOUND", retryable=False)
         logger.error("revenuecat_webhook_worker: job=%s webhook_event_id=%s not found", job.id, webhook_event_id)
+    except JobLeaseLostError:
+        # System Integrity Gate V1: this job's lease already expired
+        # and was reclaimed by a newer worker -- STALE ATTEMPT /
+        # ABANDON, same as app/workers/analysis_worker.py. No further
+        # compensation; the newer worker owns this job's outcome.
+        logger.warning(
+            "revenuecat_webhook_worker: job=%s webhook_event_id=%s abandoned -- lease lost",
+            job.id, webhook_event_id,
+        )
     except Exception as e:
-        is_terminal = await job_queue.fail(job.id, f"{e.__class__.__name__}", retryable=True)
+        try:
+            is_terminal = await job_queue.fail(job.id, job.claim_token, f"{e.__class__.__name__}", retryable=True)
+        except JobLeaseLostError:
+            logger.warning(
+                "revenuecat_webhook_worker: job=%s webhook_event_id=%s abandoned -- lease lost while reporting failure",
+                job.id, webhook_event_id,
+            )
+            return
         logger.warning(
             "revenuecat_webhook_worker: job=%s webhook_event_id=%s failed terminal=%s",
             job.id, webhook_event_id, is_terminal, exc_info=True,

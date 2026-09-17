@@ -273,3 +273,51 @@ async def test_mark_terminal_failure_survives_delete_failure(db_pool, app_db_poo
     assert req["image_object_key"] is not None  # left for the sweeper
     usage = await db_pool.fetchrow("SELECT status FROM analysis_usage WHERE request_id = $1", request_id)
     assert usage["status"] == "RELEASED"
+
+
+# --- System Integrity Gate V1, section 5: CV executor lifecycle --------
+
+def test_close_shuts_down_an_executor_it_created_itself(app_db_pool, real_singletons):
+    """No `cv_executor=` was injected -- this instance created its own
+    ThreadPoolExecutor and must be the one to shut it down."""
+    safety_engine = real_singletons["safety_engine"]
+    service = AnalysisExecutionService(
+        app_db_pool,
+        pipeline=real_singletons["pipeline"], scorer=real_singletons["scorer"],
+        plan_service=real_singletons["plan_service"],
+        usage_policy_service=UsagePolicyService(app_db_pool, FreeTierEntitlementService()),
+        product_matching_service=ProductMatchingService(app_db_pool, safety_engine),
+        safety_engine=safety_engine,
+        image_store=EphemeralAnalysisImageStore(FakeObjectStorage()),
+    )
+
+    service.close()
+
+    with pytest.raises(RuntimeError):
+        service._cv_executor.submit(lambda: None)  # concurrent.futures raises RuntimeError once shut down
+
+
+def test_close_does_not_shut_down_an_injected_executor():
+    """An injected executor belongs to whoever constructed it -- this
+    service must never shut down a resource it doesn't own, so a
+    caller sharing one executor across multiple service instances (or
+    reusing it for something else entirely) is safe to do."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    injected_executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        service = AnalysisExecutionService(
+            None,  # unused -- close() never touches self._pool
+            pipeline=None, scorer=None, plan_service=None,
+            usage_policy_service=None, product_matching_service=None, safety_engine=None,
+            image_store=None,
+            cv_executor=injected_executor,
+        )
+
+        service.close()
+
+        # Still open -- submitting work to it must not raise.
+        future = injected_executor.submit(lambda: 42)
+        assert future.result(timeout=5) == 42
+    finally:
+        injected_executor.shutdown(wait=True)

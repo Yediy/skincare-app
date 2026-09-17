@@ -122,6 +122,14 @@ async def test_user_a_cannot_read_user_b_analysis_result(db_pool, app_db_pool):
 
     req_b = await analysis_repository.create_request(app_db_pool, user_b, str(uuid.uuid4()))
     reservation = await usage_repository.reserve(app_db_pool, user_b, str(uuid.uuid4()), "2026-09", allowance=5)
+    # commit_analysis_result() now requires the request to be PROCESSING
+    # (System Integrity Gate V1, section 3) -- queue then mark_processing()
+    # first, same as the real submission+execute() flow.
+    await analysis_repository.mark_queued(
+        app_db_pool, user_b, req_b["id"],
+        image_object_key="ephemeral-analysis/test/fixture", image_expires_at=None,
+    )
+    await analysis_repository.mark_processing(app_db_pool, user_b, req_b["id"])
     await analysis_repository.commit_analysis_result(
         app_db_pool, user_b, req_b["id"],
         capture_assessment={}, scores={}, plan={}, eligible_for_longitudinal_comparison=True,
