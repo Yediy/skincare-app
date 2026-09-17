@@ -177,26 +177,93 @@ async def record_ephemeral_image_reference(
 
 async def mark_processing(
     pool: asyncpg.Pool, user_id: UUID, analysis_request_id: UUID, processing_claim_token: Optional[UUID] = None,
-) -> None:
+    *, job_id: Optional[UUID] = None,
+) -> bool:
     """Installs `processing_claim_token` as this request's current
-    processing owner (System Integrity Gate V1, section 2) --
-    unconditionally, since calling mark_processing() IS the act of
-    becoming the current owner; there is nothing to fence against on
-    entry, only on the later exit paths (commit_analysis_result(),
-    mark_failed()) that require this exact token again. Restricted to
-    QUEUED/PROCESSING (also enforced independently at the database
-    level by migration 44a74f2a79a7's transition trigger for the
-    QUEUED->PROCESSING case; PROCESSING->PROCESSING doesn't change
-    `status` at all, so the trigger never even fires for a legitimate
-    re-entrant claim)."""
+    processing owner (System Integrity Gate V1, section 2).
+
+    Independent-review follow-up (the ENTRY-side race the original
+    section-2 fix missed): calling mark_processing() is the act of
+    *becoming* the current owner, so on its own it has nothing to
+    fence against -- but "on its own" was exactly the bug. Without
+    proof that the caller's `processing_claim_token` is still the
+    *queue's* current claim token for the *actual* job driving this
+    attempt, a stale worker A (claimed, then suspended past its lease
+    expiry while a legitimate worker B reclaimed the same job) could
+    resume and simply overwrite B's already-installed
+    processing_claim_token with its own stale one -- reversing
+    legitimate ownership, the mirror image of the exit-side race
+    section 2 already closed.
+
+    When `job_id` is given, the install is now proven atomically, in
+    the SAME statement, against the live `jobs` row: it must exist,
+    have `job_type = 'analysis'`, still be `status = 'claimed'`, still
+    carry exactly this `processing_claim_token` as its `claim_token`,
+    and -- the durable, normalized relationship
+    AnalysisSubmissionService itself establishes at submission time,
+    not a job_id/analysis_request_id pair parsed back out of arbitrary
+    JSON payload -- have a `request_id` equal to this analysis
+    request's own `request_id`. `job_id` alone would leave a caller
+    trusting `claim_token` as a bare, globally-unique secret; requiring
+    both plus the request_id relationship means a token from some
+    *other* job/analysis-request pair can never install ownership
+    here even in the astronomically unlikely event two live claims
+    ever shared a token. Deliberately one UPDATE, not a SELECT-to-
+    prove-ownership followed by a separate UPDATE -- splitting those
+    into two statements (or two transactions) would reopen exactly the
+    TOCTOU window this closes.
+
+    `job_id=None` (the default) skips that proof entirely -- correct
+    only for a caller with no real queue job to prove ownership
+    against (a direct call/test, mirroring `processing_claim_token`'s
+    own None-means-no-token-tracking default) -- and falls back to the
+    original QUEUED/PROCESSING-gated install (also enforced
+    independently at the database level by migration 44a74f2a79a7's
+    transition trigger for the QUEUED->PROCESSING case;
+    PROCESSING->PROCESSING doesn't change `status` at all, so the
+    trigger never even fires for a legitimate re-entrant claim).
+
+    Returns True if this call actually installed the token, False if
+    it was fenced out -- status was no longer QUEUED/PROCESSING, or
+    (when `job_id` was given) the ownership proof failed: the job is
+    no longer claimed, is claimed by a different token, or doesn't
+    correspond to this analysis request. Callers
+    (AnalysisExecutionService.execute()) must treat False as STALE
+    ATTEMPT / ABANDON -- never retry the same install, never proceed
+    to retrieve the image or run compute."""
     async with pool.acquire() as conn:
         async with conn.transaction():
             await conn.execute("SELECT set_config('app.current_user_id', $1, true)", str(user_id))
-            await conn.execute(
-                "UPDATE analysis_requests SET status = 'PROCESSING', started_at = now(), "
-                "processing_claim_token = $2 WHERE id = $1 AND status IN ('QUEUED', 'PROCESSING')",
-                analysis_request_id, processing_claim_token,
-            )
+            if job_id is not None:
+                row = await conn.fetchrow(
+                    """
+                    UPDATE analysis_requests
+                    SET status = 'PROCESSING', started_at = now(), processing_claim_token = $2
+                    WHERE id = $1
+                      AND status IN ('QUEUED', 'PROCESSING')
+                      AND EXISTS (
+                          SELECT 1 FROM jobs j
+                          WHERE j.id = $3
+                            AND j.job_type = 'analysis'
+                            AND j.status = 'claimed'
+                            AND j.claim_token = $2
+                            AND j.request_id = analysis_requests.request_id
+                      )
+                    RETURNING id
+                    """,
+                    analysis_request_id, processing_claim_token, job_id,
+                )
+            else:
+                row = await conn.fetchrow(
+                    """
+                    UPDATE analysis_requests
+                    SET status = 'PROCESSING', started_at = now(), processing_claim_token = $2
+                    WHERE id = $1 AND status IN ('QUEUED', 'PROCESSING')
+                    RETURNING id
+                    """,
+                    analysis_request_id, processing_claim_token,
+                )
+    return row is not None
 
 
 async def mark_failed(

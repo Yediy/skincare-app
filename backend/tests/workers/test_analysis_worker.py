@@ -72,7 +72,7 @@ class _StubExecutionService:
         self.execute_calls = 0
         self.terminal_failure_calls = []
 
-    async def execute(self, user_id, analysis_request_id, claim_token=None):
+    async def execute(self, user_id, analysis_request_id, claim_token=None, job_id=None):
         self.execute_calls += 1
         if self.delay_seconds:
             await asyncio.sleep(self.delay_seconds)

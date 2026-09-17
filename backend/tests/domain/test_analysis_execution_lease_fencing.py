@@ -280,3 +280,196 @@ async def test_stale_worker_cannot_terminal_fail_while_newer_worker_still_proces
     assert req["processing_claim_token"] == token_b  # still B's, untouched by A
     usage = await db_pool.fetchrow("SELECT status FROM analysis_usage WHERE request_id = $1", request_id)
     assert usage["status"] == "RESERVED"  # never released by A's rejected attempt
+
+
+# --- Independent-review follow-up: PROCESSING ENTRY fencing --------------
+#
+# The races above all prove EXIT-side fencing (commit_analysis_result(),
+# mark_failed()) correctly reject a stale token. Independent review
+# found the ENTRY side (mark_processing() itself) was NOT fenced at
+# all: it installed whatever token it was given unconditionally, so a
+# stale worker A resuming after a legitimate worker B had already
+# reclaimed the same queue job and installed its own ownership could
+# simply overwrite B's processing_claim_token back to A's own stale
+# one -- reversing legitimate ownership. These tests drive the REAL
+# PostgresJobQueue (never two arbitrary UUIDs standing in for
+# "ownership") to prove the fix: mark_processing() now proves, in the
+# same statement as the install, that the presented (job_id,
+# claim_token) pair is still the queue's current claim on a real
+# `analysis` job that corresponds to this exact analysis request via
+# the durable jobs.request_id == analysis_requests.request_id
+# relationship.
+
+async def test_processing_entry_ownership_cannot_be_stolen_back_by_stale_queue_claim(
+    db_pool, app_db_pool, real_singletons,
+):
+    """The exact required regression sequence: A claims the real queue
+    job and enters PROCESSING; A's lease expires; B legitimately
+    reclaims the SAME job and installs its own ownership; stale A's
+    later attempt to reinstall itself (same job_id, its own now-stale
+    token) must be rejected without altering B's ownership; B can then
+    continue and commit normally."""
+    user_id = await _create_user_with_consent(db_pool, "entry-fencing-takeover@test.com")
+    fake_storage = FakeObjectStorage()
+    submitted, request_id, _ = await _submit(app_db_pool, user_id, fake_storage)
+    job_queue = PostgresJobQueue(app_db_pool)
+
+    claimed_a = await job_queue.claim("analysis", visibility_timeout_seconds=0)
+    assert claimed_a is not None
+    job_id = claimed_a.id
+    token_a = claimed_a.claim_token
+
+    installed_a = await analysis_repository.mark_processing(
+        app_db_pool, user_id, submitted.analysis_request_id, token_a, job_id=job_id,
+    )
+    assert installed_a is True
+    req = await analysis_repository.get_request_by_id(app_db_pool, user_id, submitted.analysis_request_id)
+    assert req["status"] == "PROCESSING"
+    assert req["processing_claim_token"] == token_a
+
+    # visibility_timeout_seconds=0 above already put A's lease in the
+    # past -- this is a legitimate reclaim, not a race being exploited.
+    claimed_b = await job_queue.claim("analysis")
+    assert claimed_b is not None
+    assert claimed_b.id == job_id
+    token_b = claimed_b.claim_token
+    assert token_b != token_a
+
+    installed_b = await analysis_repository.mark_processing(
+        app_db_pool, user_id, submitted.analysis_request_id, token_b, job_id=job_id,
+    )
+    assert installed_b is True
+    req = await analysis_repository.get_request_by_id(app_db_pool, user_id, submitted.analysis_request_id)
+    assert req["processing_claim_token"] == token_b
+
+    # Stale A resumes and tries to reinstall itself using the SAME
+    # job_id and its own now-stale token.
+    installed_a_again = await analysis_repository.mark_processing(
+        app_db_pool, user_id, submitted.analysis_request_id, token_a, job_id=job_id,
+    )
+    assert installed_a_again is False
+
+    req = await analysis_repository.get_request_by_id(app_db_pool, user_id, submitted.analysis_request_id)
+    assert req["processing_claim_token"] == token_b  # still B's -- A never reversed it
+    assert req["status"] == "PROCESSING"
+
+    # B continues and commits normally afterward.
+    result = await _compute_real_result(app_db_pool, user_id, req, fake_storage, real_singletons)
+    await _commit(app_db_pool, user_id, submitted.analysis_request_id, req, result, processing_claim_token=token_b)
+    final = await analysis_repository.get_request_by_id(app_db_pool, user_id, submitted.analysis_request_id)
+    assert final["status"] == "COMPLETED"
+
+
+async def test_stale_entry_rejected_even_before_newer_worker_enters_processing(db_pool, app_db_pool):
+    """The narrower variant: B has reclaimed the queue job but hasn't
+    called mark_processing() yet at all -- stale A's entry attempt must
+    still be rejected purely because the *queue* already disagrees A
+    holds the current claim, independent of whatever
+    analysis_requests.processing_claim_token currently holds (nothing,
+    in this case -- A itself never got to install it either)."""
+    user_id = await _create_user_with_consent(db_pool, "entry-fencing-before-b-enters@test.com")
+    fake_storage = FakeObjectStorage()
+    submitted, request_id, _ = await _submit(app_db_pool, user_id, fake_storage)
+    job_queue = PostgresJobQueue(app_db_pool)
+
+    claimed_a = await job_queue.claim("analysis", visibility_timeout_seconds=0)
+    job_id = claimed_a.id
+    token_a = claimed_a.claim_token
+
+    claimed_b = await job_queue.claim("analysis")  # legitimate reclaim
+    token_b = claimed_b.claim_token
+    assert token_b != token_a
+
+    # B has NOT called mark_processing() yet -- the queue alone already
+    # disagrees A owns the claim.
+    installed_a = await analysis_repository.mark_processing(
+        app_db_pool, user_id, submitted.analysis_request_id, token_a, job_id=job_id,
+    )
+    assert installed_a is False
+
+    req = await analysis_repository.get_request_by_id(app_db_pool, user_id, submitted.analysis_request_id)
+    assert req["status"] == "QUEUED"  # A's rejected entry never touched status
+    assert req["processing_claim_token"] is None
+
+
+async def test_token_from_one_analysis_job_cannot_install_ownership_for_a_different_analysis_request(
+    db_pool, app_db_pool,
+):
+    """A token that IS a real, currently-claimed `analysis` job's
+    claim_token must still be rejected if that job doesn't correspond
+    to the analysis request being entered -- proves the fix binds job
+    identity to the SPECIFIC analysis request via the durable
+    jobs.request_id == analysis_requests.request_id relationship, not
+    merely "some currently claimed analysis job, any of them"."""
+    user_id = await _create_user_with_consent(db_pool, "entry-fencing-mismatch@test.com")
+    fake_storage = FakeObjectStorage()
+    submitted_x, _, _ = await _submit(app_db_pool, user_id, fake_storage)
+    submitted_y, _, _ = await _submit(app_db_pool, user_id, fake_storage)
+
+    job_queue = PostgresJobQueue(app_db_pool)
+    claimed = await job_queue.claim("analysis")
+    assert claimed is not None
+
+    # Whichever of X/Y this real job actually belongs to, prove the
+    # OTHER one rejects it -- order-independent.
+    if claimed.payload["analysis_request_id"] == str(submitted_x.analysis_request_id):
+        mismatched_request_id = submitted_y.analysis_request_id
+    else:
+        mismatched_request_id = submitted_x.analysis_request_id
+
+    installed = await analysis_repository.mark_processing(
+        app_db_pool, user_id, mismatched_request_id, claimed.claim_token, job_id=claimed.id,
+    )
+    assert installed is False
+
+    req = await analysis_repository.get_request_by_id(app_db_pool, user_id, mismatched_request_id)
+    assert req["status"] == "QUEUED"
+    assert req["processing_claim_token"] is None
+
+
+async def test_execute_surfaces_entry_lease_loss_without_touching_image_or_quota(
+    db_pool, app_db_pool, real_singletons,
+):
+    """Service-level: the same stale-entry race driven through
+    AnalysisExecutionService.execute() itself, not just
+    mark_processing() directly -- proves execute() surfaces it as
+    AnalysisExecutionLeaseLostError and never reaches image retrieval/
+    compute/quota mutation once the ownership install itself has
+    already failed."""
+    user_id = await _create_user_with_consent(db_pool, "entry-fencing-service-level@test.com")
+    fake_storage = FakeObjectStorage()
+    submitted, request_id, usage_policy_service = await _submit(app_db_pool, user_id, fake_storage)
+    execution_service = _execution_service(app_db_pool, fake_storage, usage_policy_service, real_singletons)
+    job_queue = PostgresJobQueue(app_db_pool)
+
+    claimed_a = await job_queue.claim("analysis", visibility_timeout_seconds=0)
+    job_id = claimed_a.id
+    token_a = claimed_a.claim_token
+
+    claimed_b = await job_queue.claim("analysis")  # B legitimately reclaims
+    token_b = claimed_b.claim_token
+
+    # B installs its own ownership first, exactly as the real worker
+    # flow would (via its own execute() call).
+    installed_b = await analysis_repository.mark_processing(
+        app_db_pool, user_id, submitted.analysis_request_id, token_b, job_id=job_id,
+    )
+    assert installed_b is True
+
+    # Stale A now calls execute() itself, not mark_processing() directly.
+    with pytest.raises(AnalysisExecutionLeaseLostError):
+        await execution_service.execute(user_id, submitted.analysis_request_id, token_a, job_id)
+
+    # Never touched the image: still exactly the one object
+    # AnalysisSubmissionService itself uploaded at submission time --
+    # execute() never reached retrieve()/compute for A's rejected attempt.
+    assert len(fake_storage.objects) == 1
+
+    # Quota untouched by A's rejected attempt.
+    usage = await db_pool.fetchrow("SELECT status FROM analysis_usage WHERE request_id = $1", request_id)
+    assert usage["status"] == "RESERVED"
+
+    # analysis_requests state still belongs to B, untouched by A.
+    req = await analysis_repository.get_request_by_id(app_db_pool, user_id, submitted.analysis_request_id)
+    assert req["processing_claim_token"] == token_b
+    assert req["status"] == "PROCESSING"

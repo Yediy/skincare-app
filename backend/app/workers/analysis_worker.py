@@ -134,7 +134,7 @@ async def _process_job(job: Job, job_queue: JobQueue, execution_service: Analysi
         user_id = UUID(job.payload["user_id"])
 
         try:
-            outcome = await execution_service.execute(user_id, analysis_request_id, job.claim_token)
+            outcome = await execution_service.execute(user_id, analysis_request_id, job.claim_token, job.id)
             await job_queue.acknowledge(job.id, job.claim_token)
             logger.info(
                 "analysis_worker: job=%s analysis_request_id=%s completed already_completed=%s",

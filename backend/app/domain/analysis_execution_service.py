@@ -168,7 +168,10 @@ class AnalysisExecutionService:
         if self._owns_cv_executor:
             self._cv_executor.shutdown(wait=True)
 
-    async def execute(self, user_id: UUID, analysis_request_id: UUID, claim_token: Optional[UUID] = None) -> ExecutionOutcome:
+    async def execute(
+        self, user_id: UUID, analysis_request_id: UUID,
+        claim_token: Optional[UUID] = None, job_id: Optional[UUID] = None,
+    ) -> ExecutionOutcome:
         """`claim_token` is the active queue claim token for the Job
         driving this attempt (System Integrity Gate V1, section 2) --
         installed as analysis_requests.processing_claim_token by
@@ -178,7 +181,18 @@ class AnalysisExecutionService:
         for a caller with no queue-level claim to fence against at all
         (a direct call, e.g. most of this module's own tests), since a
         freshly generated UUID can never collide with, or be mistaken
-        for, any other worker's real token."""
+        for, any other worker's real token.
+
+        `job_id` (independent-review follow-up to section 2) is that
+        same Job's own id -- passed straight through to
+        mark_processing(), which requires BOTH it and `claim_token` to
+        atomically prove this call is still the queue's current owner
+        of the actual `analysis` job driving this attempt before
+        installing anything (see that function's own docstring for why
+        `claim_token` alone, however improbable a collision, is never
+        trusted as sufficient proof of ownership by itself). None (the
+        default) skips that proof, matching `claim_token=None`'s own
+        "no real queue job to prove ownership against" caller."""
         if claim_token is None:
             claim_token = uuid.uuid4()
 
@@ -200,14 +214,25 @@ class AnalysisExecutionService:
 
         # Idempotent to call again on a retry (just re-sets status/
         # started_at/processing_claim_token) -- a job that failed
-        # retryably after this point last attempt, or was legitimately
-        # reclaimed by a newer worker after a stale one's lease
-        # expired, re-enters here exactly the same way. Unconditionally
-        # installs `claim_token` as the current owner -- this is the
-        # "install the new token" step itself, so it has nothing to
-        # fence against on entry; only the exit paths below (commit,
-        # terminal failure) check it.
-        await analysis_repository.mark_processing(self._pool, user_id, analysis_request_id, claim_token)
+        # retryably after this point last attempt re-enters here
+        # exactly the same way. System Integrity Gate V1 (independent-
+        # review follow-up): a worker resuming AFTER a legitimate newer
+        # worker has already reclaimed the same job and installed its
+        # own token must NOT be able to overwrite that ownership back
+        # to its own stale token -- mark_processing() now proves
+        # current queue ownership (job_id + claim_token + the
+        # jobs.request_id == analysis_requests.request_id relationship)
+        # atomically, in the same statement as the install, and returns
+        # False rather than installing anything if that proof fails.
+        installed = await analysis_repository.mark_processing(
+            self._pool, user_id, analysis_request_id, claim_token, job_id=job_id,
+        )
+        if not installed:
+            # Never reached the image/compute stage -- no image
+            # retrieval, no CV work, no quota/image mutation. The
+            # legitimate current owner's own attempt (if any) is
+            # completely unaffected by this one failing to install.
+            raise AnalysisExecutionLeaseLostError(str(analysis_request_id))
 
         try:
             image_bytes = await self._image_store.retrieve(req["image_object_key"])
