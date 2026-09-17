@@ -229,6 +229,31 @@ class Settings(BaseSettings):
     password_reset_url_base: str = "skincare://reset-password"
     password_reset_token_ttl_minutes: int = 30
 
+    # Independent-review timing-enumeration fix: the secret Fernet key
+    # (app/security/reset_delivery_crypto.py) protecting the
+    # password-reset-email delivery job's payload at rest in the
+    # ordinary, non-RLS-restricted `jobs` table. Deliberately no
+    # default at all -- same treatment as jwt_secret/database_url/
+    # redis_url, not the Optional[str]=None-gated-by-a-flag pattern
+    # revenuecat_api_key/resend_api_key use, because this protects an
+    # always-on security boundary (every POST /password/forgot for an
+    # eligible account touches it), not an opt-in feature. A real value
+    # must be supplied in every environment, including tests/CI -- see
+    # backend/.env.example and .github/workflows/ci.yml.
+    password_reset_email_delivery_key: str
+    # Bounded jitter range (Part: timing normalization) POST
+    # /password/forgot pads every response out to, chosen independently
+    # of account eligibility (app/domain/timing_normalization.py) --
+    # masks the small residual local-Postgres-work timing difference
+    # between an eligible and ineligible request now that the dominant
+    # signal (outbound provider network I/O) has been moved off this
+    # request path entirely. Defaults are small enough to not be a
+    # perceptible UX delay, large enough to comfortably exceed that
+    # residual (single-digit milliseconds) with real statistical
+    # margin.
+    password_reset_forgot_min_response_seconds: float = 0.2
+    password_reset_forgot_max_response_seconds: float = 0.5
+
     @property
     def is_production(self) -> bool:
         return self.environment.lower() == "production"
@@ -354,6 +379,28 @@ class Settings(BaseSettings):
 
         if self.password_reset_token_ttl_minutes <= 0:
             errors.append("PASSWORD_RESET_TOKEN_TTL_MINUTES must be a positive number of minutes")
+
+        if (
+            self.password_reset_email_delivery_key.strip().lower() in _PLACEHOLDER_SECRET_VALUES
+            or len(self.password_reset_email_delivery_key) < 32
+        ):
+            errors.append(
+                "PASSWORD_RESET_EMAIL_DELIVERY_KEY is blank, a known placeholder, or shorter than 32 characters"
+            )
+
+        if self.password_reset_forgot_min_response_seconds < 0:
+            errors.append("PASSWORD_RESET_FORGOT_MIN_RESPONSE_SECONDS must not be negative")
+        if self.password_reset_forgot_max_response_seconds < self.password_reset_forgot_min_response_seconds:
+            errors.append(
+                "PASSWORD_RESET_FORGOT_MAX_RESPONSE_SECONDS must be >= "
+                "PASSWORD_RESET_FORGOT_MIN_RESPONSE_SECONDS"
+            )
+        # A sanity ceiling, not a precision SLA -- guards against an
+        # operator fat-fingering a much larger range (e.g. seconds
+        # meant as milliseconds) turning this endpoint into a trivial
+        # self-inflicted slow-request DoS surface.
+        if self.password_reset_forgot_max_response_seconds > 5.0:
+            errors.append("PASSWORD_RESET_FORGOT_MAX_RESPONSE_SECONDS must not exceed 5 seconds")
 
         if errors:
             raise ValueError(

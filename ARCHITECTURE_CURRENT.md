@@ -33,8 +33,24 @@ resurrect a revoked one (System Integrity Gate V1's Postgres-
 authoritative `get_current_user` already guarantees this). A new
 provider-neutral `TransactionalEmailService` boundary
 (`app/domain/transactional_email.py`) with a real Resend adapter and a
-production-fail-closed config validator. Full detail, including the
-mobile screens and EAS/release-URL scaffolding this same pass added, in
+production-fail-closed config validator.
+
+**Independent-review hardening pass**: `POST /password/forgot` no
+longer performs any outbound provider network I/O in its own request
+path -- a timing-based account-enumeration side channel the original
+version had, since only an eligible account's request paid Resend's
+network latency. Email delivery now goes through a durable, encrypted-
+at-rest Postgres job (`app/workers/password_reset_email_worker.py`, a
+new `password_reset_email` type on the existing `PostgresJobQueue`),
+and the request itself pads its response to a randomized target
+duration chosen before eligibility is known
+(`app/domain/timing_normalization.py`). The plaintext-token-never-
+persisted invariant is preserved through the delivery job via Fernet
+encryption (`app/security/reset_delivery_crypto.py`) under a dedicated
+key that lives only in application config, never in Postgres.
+
+Full detail, including the mobile screens and EAS/release-URL
+scaffolding this same pass added, in
 `ACCOUNT_RECOVERY_ARCHITECTURE.md`.
 
 ## Consent — `VERIFIED_IMPLEMENTED`

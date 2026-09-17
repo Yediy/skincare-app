@@ -25,6 +25,7 @@ from app.domain.entitlement import (
 )
 from app.domain.product_matching_service import ProductMatchingService
 from app.domain.safety_engine import SafetyEngine
+from app.domain.timing_normalization import TimingNormalizer
 from app.ml.scorer import FacialScorer
 from app.services.plan_service import PlanService
 from app.db.connection import init_db_pool, close_db_pool
@@ -509,15 +510,61 @@ _FORGOT_PASSWORD_RESPONSE = {
     "message": "If an eligible account exists for that email, password reset instructions will be sent."
 }
 
+# Module-level singleton (same pattern as `pipeline`/`scorer`/
+# `plan_service`/`safety_engine` above) -- constructed once from
+# settings, not fresh per request, specifically so tests can
+# monkeypatch its `.monotonic`/`.random_fn`/`.sleep_fn` attributes
+# directly for deterministic timing tests (see
+# app/domain/timing_normalization.py's own docstring for why real
+# per-request construction would defeat that: a dataclass field's
+# callable default is bound at class-body-execution time, not looked
+# up fresh from the stdlib module on every instantiation, so
+# monkeypatching `time.monotonic`/`asyncio.sleep` globally after import
+# would not reach a freshly-constructed instance's defaults anyway).
+_FORGOT_PASSWORD_TIMING_NORMALIZER = TimingNormalizer(
+    min_seconds=settings.password_reset_forgot_min_response_seconds,
+    max_seconds=settings.password_reset_forgot_max_response_seconds,
+)
+
+
+def _build_password_reset_service():
+    from app.db.connection import get_db_pool
+    from app.domain.password_reset_service import PasswordResetService
+    from app.queue.postgres_queue import PostgresJobQueue
+
+    pool = get_db_pool()
+    return PasswordResetService(
+        pool,
+        PostgresJobQueue(pool),
+        url_base=settings.password_reset_url_base,
+        token_ttl_minutes=settings.password_reset_token_ttl_minutes,
+        delivery_encryption_key=settings.password_reset_email_delivery_key,
+        timing_normalizer=_FORGOT_PASSWORD_TIMING_NORMALIZER,
+    )
+
 
 @app.post("/password/forgot")
 async def forgot_password(request: ForgotPasswordRequest, _rl: None = Depends(rate_limit_by_ip(AUTH_POLICY))):
     """
-    Account-enumeration-safe (V1 account recovery pass, Part 2): the
-    outward response is byte-for-byte identical for an existing
-    account, a nonexistent email, and a disabled/deleted account --
-    see PasswordResetService.request_reset, which silently no-ops for
-    every ineligible case rather than raising or varying its behavior.
+    Account-enumeration-safe (V1 account recovery pass, Part 2; timing
+    side channel closed by independent review). The outward response is
+    byte-for-byte identical for an existing account, a nonexistent
+    email, and a disabled/deleted account -- see
+    PasswordResetService.request_reset, which silently no-ops for every
+    ineligible case rather than raising or varying its behavior.
+
+    Critically, this route now performs NO outbound provider network
+    I/O of any kind: PasswordResetService.request_reset only does
+    bounded local Postgres work (a lookup, or that lookup plus issuing
+    a token and enqueueing a durable delivery job -- see
+    app/workers/password_reset_email_worker.py for the actual Resend
+    call, which happens entirely out of band after this request has
+    already returned) and pads its own response out to a randomized
+    target duration chosen independently of account eligibility
+    (app/domain/timing_normalization.py). Before this fix, only an
+    eligible account's request paid Resend's network latency -- an
+    unbounded, much larger timing signal than response-body
+    enumeration-safety alone protects against.
 
     Two independent abuse-protection layers, both enforced
     unconditionally before PasswordResetService ever learns whether
@@ -531,21 +578,12 @@ async def forgot_password(request: ForgotPasswordRequest, _rl: None = Depends(ra
     """
     import hashlib
 
-    from app.db.connection import get_db_pool
-    from app.domain.password_reset_service import PasswordResetService
-    from app.domain.transactional_email import build_transactional_email_service
     from app.middleware.rate_limiter import PASSWORD_RESET_EMAIL_POLICY, enforce_rate_limit
 
     email_key = hashlib.sha256(request.email.strip().lower().encode("utf-8")).hexdigest()
     await enforce_rate_limit(PASSWORD_RESET_EMAIL_POLICY, f"email:{email_key}")
 
-    pool = get_db_pool()
-    service = PasswordResetService(
-        pool,
-        build_transactional_email_service(),
-        url_base=settings.password_reset_url_base,
-        token_ttl_minutes=settings.password_reset_token_ttl_minutes,
-    )
+    service = _build_password_reset_service()
     await service.request_reset(request.email)
     return _FORGOT_PASSWORD_RESPONSE
 
@@ -575,17 +613,7 @@ async def reset_password(request: ResetPasswordRequest, _rl: None = Depends(rate
     so every previously issued access/refresh session becomes unusable
     and the resetting device is NOT automatically signed in.
     """
-    from app.db.connection import get_db_pool
-    from app.domain.password_reset_service import PasswordResetService
-    from app.domain.transactional_email import build_transactional_email_service
-
-    pool = get_db_pool()
-    service = PasswordResetService(
-        pool,
-        build_transactional_email_service(),
-        url_base=settings.password_reset_url_base,
-        token_ttl_minutes=settings.password_reset_token_ttl_minutes,
-    )
+    service = _build_password_reset_service()
     new_password_hash = hash_password(request.new_password)
     user_id = await service.reset_password(request.token, new_password_hash)
     if user_id is None:

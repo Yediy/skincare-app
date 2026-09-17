@@ -11,6 +11,17 @@ boundary, EAS build scaffolding, and external release URL seams. It does
 not touch RevenueCat, C3/history/progress, the recommendation/safety
 model, or the catalog.
 
+**Independent-review update:** the original version of this pass had a
+timing-based account-enumeration side channel -- `POST /password/forgot`
+awaited the outbound Resend call synchronously, so only an eligible
+account's request paid that (large, variable) network latency. Sections
+1, 5, and 8 below describe the fix actually shipped: email delivery moved
+to a durable, out-of-band Postgres job
+(`app/workers/password_reset_email_worker.py`), and the request path
+itself pads its response to a randomized target duration chosen
+independently of account eligibility
+(`app/domain/timing_normalization.py`).
+
 Documents only what this pass actually implements and tests. For
 everything else, see `ARCHITECTURE_CURRENT.md` / `MOBILE_ARCHITECTURE.md`
 / `OPEN_ENGINEERING_ITEMS.md`.
@@ -19,11 +30,20 @@ everything else, see `ARCHITECTURE_CURRENT.md` / `MOBILE_ARCHITECTURE.md`
 
 ```
 Forgot password
-  -> POST /password/forgot (always the same outward response)
-  -> hashed, single-use, expiring token issued (only if the account is
-     real and eligible -- invisible to the caller either way)
-  -> token delivered by email, via the TransactionalEmailService
-     boundary (never Resend called directly from a route/domain module)
+  -> POST /password/forgot -- entire handler runs inside
+     TimingNormalizer.run(), which pads the response to a randomized
+     target duration selected BEFORE eligibility is known:
+       -> eligibility lookup (bounded local Postgres read)
+       -> IF eligible: generate raw token + SHA-256 digest, persist the
+          hashed token, encrypt {to_email, reset_url} and enqueue a
+          durable `password_reset_email` job -- all in ONE transaction
+       -> always: the same generic response, after the target duration
+  -> NO outbound provider network I/O happens in this request at all
+  -> separately, out of band: app/workers/password_reset_email_worker.py
+     claims the job, re-checks the token is still unused/unexpired,
+     decrypts the payload in process memory only, and calls
+     TransactionalEmailService.send_password_reset (never Resend called
+     directly from a route/domain module)
 Reset
   -> POST /password/reset (token + new password)
   -> one atomic statement: verify token exists/unused/unexpired AND the
@@ -138,7 +158,7 @@ proof (see `SYSTEM_INTEGRITY_GATE.md` section 2) -- account-recovery
 security-critical code reuses that exact pattern rather than
 reinventing a weaker one.
 
-## 5. Account-enumeration protection
+## 5. Account-enumeration protection (response body AND timing)
 
 **IMPLEMENTED, TESTED.** `POST /password/forgot`'s outward response is
 byte-for-byte identical for an existing account, a nonexistent email, a
@@ -155,6 +175,39 @@ code path in the route handler that branches on account existence. The
 same discipline extends to `POST /password/reset`'s failure response
 (one generic 400 for expired/used/unknown/malformed token, or an
 otherwise-valid token whose account has since become ineligible).
+
+**Independent-review fix -- timing.** Response-body identity alone was
+not sufficient: the original implementation `await`ed the outbound
+Resend HTTP call directly inside `request_reset()`, so only an eligible
+account's request paid that latency -- a large, variable, and
+statistically distinguishable signal, strictly worse than anything
+identical response bodies protect against. Two structural changes closed
+this:
+
+1. **No provider network I/O in the request path at all.** Email
+   delivery is handed off to a durable Postgres job (section 8) and
+   processed entirely out of band, after the HTTP response has already
+   returned. `PasswordResetService.request_reset()` now performs only
+   bounded local Postgres work for either branch (a lookup, or that
+   lookup plus issuing a token and enqueueing a job) --
+   proven by `tests/auth/test_password_reset.py::
+   test_forgot_password_never_calls_provider_http_directly`, which
+   guards `httpx.AsyncClient.post` against Resend's own URL for the
+   duration of a real request.
+2. **Bounded, randomized response-duration normalization** for the
+   small residual that remains: `app/domain/timing_normalization.py`'s
+   `TimingNormalizer` selects a target duration from `[PASSWORD_RESET_
+   FORGOT_MIN_RESPONSE_SECONDS, _MAX_RESPONSE_SECONDS]` (default
+   0.2-0.5s) *before* the eligible-or-ineligible branch ever runs, then
+   pads the response out to that target. The target selection is
+   structurally independent of eligibility -- `choose_target_seconds()`
+   takes no eligibility-related input and is called before the branch's
+   own closure executes (proven deterministically, with no real sleep or
+   wall-clock assertion, by `tests/domain/test_timing_normalization.py`).
+   This is explicitly **not** a claim of true constant-time HTTP
+   behavior -- TLS/OS-scheduling/GC/network jitter remain real,
+   unremovable variance outside this application's control; see that
+   module's own docstring.
 
 ## 6. Session invalidation after reset
 
@@ -222,6 +275,55 @@ minutes). `RESEND_API_KEY` is a backend-only secret -- never exposed to
 mobile/Expo (mobile has no `EXPO_PUBLIC_RESEND_*` variable, and never
 will; email sending is entirely server-side).
 
+**Independent-review fix -- durable delivery outbox.** This interface is
+no longer called from `POST /password/forgot`'s request path at all
+(section 5) -- it is called exactly once, from
+`app/workers/password_reset_email_worker.py`, a separate process
+(`python -m app.workers.password_reset_email_worker`) consuming a new
+`password_reset_email` job type on the existing `PostgresJobQueue`
+(`app/queue/`, the same durable, at-least-once, claim/heartbeat/retry
+infrastructure `analysis`/`revenuecat_webhook` jobs already use -- no new
+queue technology introduced). This is a real, durable outbox, not
+`asyncio.create_task()`: a job survives process crash/restart (proven by
+`tests/workers/test_password_reset_email_worker.py::
+test_delivery_survives_a_simulated_worker_crash_before_acknowledge`,
+using the same `visibility_timeout_seconds=0`-simulated-expiry technique
+`tests/queue/test_postgres_job_queue.py` already established for its own
+reclaim tests), retries provider/network failures with the queue's
+existing exponential backoff (`max_attempts=3` default), and is never
+reachable from the HTTP request that enqueued it.
+
+**Plaintext-token invariant, preserved.** `password_reset_repository.py`
+still never persists the raw reset token anywhere. The delivery job's
+payload does need enough information to send the actual email (the
+recipient address and the reset URL, which necessarily embeds the raw
+token) -- `app/security/reset_delivery_crypto.py` encrypts that payload
+(Fernet: AES-128-CBC + HMAC-SHA256) under `PASSWORD_RESET_EMAIL_DELIVERY_
+KEY`, a secret that lives only in application configuration, never in
+Postgres itself, before it ever reaches `jobs.payload` -- an ordinary
+JSONB column with no RLS restricting who can `SELECT` it, unlike
+`password_reset_tokens`. Only that ciphertext, plus the already-
+non-sensitive `token_hash` (identical treatment to `refresh_tokens.
+token_hash`), is ever persisted (proven by
+`tests/workers/test_password_reset_email_worker.py::
+test_jobs_payload_never_contains_the_plaintext_token` and
+`tests/auth/test_password_reset.py::
+test_plaintext_reset_token_never_appears_in_the_jobs_table`, reading the
+raw column directly). The worker decrypts only in process memory,
+immediately before calling `TransactionalEmailService`, and redacts the
+row's payload (`{"redacted": true}`) once the job reaches a terminal
+state (delivered, or permanently failed) so the ciphertext does not
+linger any longer than the job is still meaningfully pending.
+
+**Respecting token expiry / avoiding stale sends.** Before decrypting or
+sending anything, the worker re-checks
+`password_reset_tokens.used_at`/`expires_at` for the job's `token_hash`
+(`password_reset_repository.get_token_status`) and acknowledges as a
+no-op, without sending, if the token has since been superseded by a
+newer `/password/forgot` call or has expired while the job sat in the
+queue -- there is never a code path that emails a link that can no
+longer work.
+
 ## 9. Production config validation
 
 **IMPLEMENTED, TESTED** (`backend/tests/unit/test_config_validation.py`).
@@ -240,8 +342,22 @@ production:
   (`example.com`/`localhost`/`127.0.0.1`).
 - `PASSWORD_RESET_TOKEN_TTL_MINUTES > 0`.
 
-Development/CI are unaffected -- these checks only run when
-`ENVIRONMENT=production`.
+`PASSWORD_RESET_EMAIL_DELIVERY_KEY` (independent-review fix) is required
+in **every** environment, not gated behind `ENVIRONMENT=production` --
+same treatment as `JWT_SECRET`/`DATABASE_URL`/`REDIS_URL` (no default at
+all in `Settings`, so the application fails to even start without it),
+because it protects an always-on security boundary, not an opt-in
+feature. Production additionally rejects a blank/placeholder/
+shorter-than-32-character value. `PASSWORD_RESET_FORGOT_MIN/MAX_
+RESPONSE_SECONDS` (the timing-jitter range) are validated for a sane
+range (`min >= 0`, `max >= min`, `max <= 5.0s` -- a sanity ceiling against
+turning this endpoint into a self-inflicted slow-request surface, not a
+precision requirement) in every environment.
+
+Development/CI are otherwise unaffected by the production-only checks
+above -- see `backend/.env.example` and `.github/workflows/ci.yml` for
+where the always-required `PASSWORD_RESET_EMAIL_DELIVERY_KEY` is
+supplied in each environment.
 
 ## 10. Deep-link contract
 

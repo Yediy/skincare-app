@@ -35,7 +35,10 @@ async def test_resend_sends_the_documented_request_shape():
         return httpx.Response(200, json={"id": "email-id-123"})
 
     client = _resend_client(handler)
-    await client.send_password_reset(to_email="user@test.invalid", reset_url="https://app.test.invalid/reset?token=abc")
+    await client.send_password_reset(
+        to_email="user@test.invalid", reset_url="https://app.test.invalid/reset?token=abc",
+        idempotency_key="password-reset/11111111-1111-1111-1111-111111111111",
+    )
 
     assert captured["url"] == "https://api.resend.com/emails"
     assert captured["authorization"] == "Bearer test-resend-key"
@@ -46,13 +49,52 @@ async def test_resend_sends_the_documented_request_shape():
     assert "https://app.test.invalid/reset?token=abc" in payload["text"]
 
 
+async def test_resend_sends_the_idempotency_key_header():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["idempotency_key"] = request.headers.get("idempotency-key")
+        return httpx.Response(200, json={"id": "email-id-123"})
+
+    client = _resend_client(handler)
+    await client.send_password_reset(
+        to_email="user@test.invalid", reset_url="https://app.test.invalid/reset?token=abc",
+        idempotency_key="password-reset/11111111-1111-1111-1111-111111111111",
+    )
+
+    assert captured["idempotency_key"] == "password-reset/11111111-1111-1111-1111-111111111111"
+
+
+async def test_resend_reuses_the_same_idempotency_key_across_retries_of_the_same_job():
+    """The whole point of provider-level idempotency: a worker that
+    reclaims the SAME durable job after a crash between "Resend
+    accepted this" and this process's own acknowledge() must send the
+    identical Idempotency-Key on the retried attempt, or Resend has no
+    way to recognize it as a retry."""
+    seen_keys = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_keys.append(request.headers.get("idempotency-key"))
+        return httpx.Response(200, json={"id": "email-id-123"})
+
+    client = _resend_client(handler)
+    key = "password-reset/22222222-2222-2222-2222-222222222222"
+    await client.send_password_reset(to_email="user@test.invalid", reset_url="https://app.test.invalid/reset?token=abc", idempotency_key=key)
+    await client.send_password_reset(to_email="user@test.invalid", reset_url="https://app.test.invalid/reset?token=abc", idempotency_key=key)
+
+    assert seen_keys == [key, key]
+
+
 async def test_resend_raises_transactional_email_error_on_http_error_status():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(422, json={"message": "invalid recipient"})
 
     client = _resend_client(handler)
     with pytest.raises(TransactionalEmailError):
-        await client.send_password_reset(to_email="user@test.invalid", reset_url="https://app.test.invalid/reset?token=abc")
+        await client.send_password_reset(
+            to_email="user@test.invalid", reset_url="https://app.test.invalid/reset?token=abc",
+            idempotency_key="password-reset/11111111-1111-1111-1111-111111111111",
+        )
 
 
 async def test_resend_raises_transactional_email_error_on_network_failure():
@@ -61,7 +103,10 @@ async def test_resend_raises_transactional_email_error_on_network_failure():
 
     client = _resend_client(handler)
     with pytest.raises(TransactionalEmailError):
-        await client.send_password_reset(to_email="user@test.invalid", reset_url="https://app.test.invalid/reset?token=abc")
+        await client.send_password_reset(
+            to_email="user@test.invalid", reset_url="https://app.test.invalid/reset?token=abc",
+            idempotency_key="password-reset/11111111-1111-1111-1111-111111111111",
+        )
 
 
 async def test_resend_error_message_never_contains_recipient_or_url():
@@ -76,6 +121,7 @@ async def test_resend_error_message_never_contains_recipient_or_url():
     with pytest.raises(TransactionalEmailError) as exc_info:
         await client.send_password_reset(
             to_email="super-secret-user@test.invalid", reset_url="https://app.test.invalid/reset?token=super-secret-token",
+            idempotency_key="password-reset/11111111-1111-1111-1111-111111111111",
         )
     message = str(exc_info.value)
     assert "super-secret-user" not in message
@@ -84,13 +130,23 @@ async def test_resend_error_message_never_contains_recipient_or_url():
 
 async def test_null_service_does_not_raise_and_performs_no_network_io():
     service = NullTransactionalEmailService()
-    await service.send_password_reset(to_email="user@test.invalid", reset_url="https://app.test.invalid/reset?token=abc")
+    await service.send_password_reset(
+        to_email="user@test.invalid", reset_url="https://app.test.invalid/reset?token=abc",
+        idempotency_key="password-reset/11111111-1111-1111-1111-111111111111",
+    )
 
 
 async def test_in_memory_service_records_calls_without_network_io():
     service = InMemoryTransactionalEmailService()
-    await service.send_password_reset(to_email="user@test.invalid", reset_url="https://app.test.invalid/reset?token=abc")
-    assert service.sent == [{"to_email": "user@test.invalid", "reset_url": "https://app.test.invalid/reset?token=abc"}]
+    await service.send_password_reset(
+        to_email="user@test.invalid", reset_url="https://app.test.invalid/reset?token=abc",
+        idempotency_key="password-reset/11111111-1111-1111-1111-111111111111",
+    )
+    assert service.sent == [{
+        "to_email": "user@test.invalid",
+        "reset_url": "https://app.test.invalid/reset?token=abc",
+        "idempotency_key": "password-reset/11111111-1111-1111-1111-111111111111",
+    }]
 
 
 def test_factory_returns_null_service_by_default(monkeypatch):

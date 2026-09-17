@@ -30,7 +30,7 @@ class TransactionalEmailError(Exception):
 
 class TransactionalEmailService(ABC):
     @abstractmethod
-    async def send_password_reset(self, *, to_email: str, reset_url: str) -> None:
+    async def send_password_reset(self, *, to_email: str, reset_url: str, idempotency_key: str) -> None:
         """Sends a password-reset email whose body links to
         `reset_url` (itself carrying the one-time plaintext reset
         token as a query parameter -- see PASSWORD_RESET_URL_BASE in
@@ -38,7 +38,23 @@ class TransactionalEmailService(ABC):
         never raises for "this recipient doesn't exist" (that
         decision belongs to PasswordResetService, upstream of this
         interface, which never calls this method for an ineligible
-        account in the first place)."""
+        account in the first place).
+
+        `idempotency_key` is the caller's stable delivery identity --
+        app/workers/password_reset_email_worker.py derives it from the
+        durable job's own UUID (`f"password-reset/{job.id}"`), never a
+        value generated per attempt, so every reclaim/retry of the same
+        job presents the exact same key. Queue-level at-least-once
+        delivery alone cannot undo an email a provider already sent
+        (unlike a DB write, there is no local transaction to roll
+        back), so this key exists to push that same idempotency
+        guarantee out to the provider itself -- an adapter that
+        actually talks to a provider (ResendTransactionalEmailService)
+        must forward it as that provider's own idempotency mechanism.
+        Implementations must never derive a key from `to_email` or
+        `reset_url` themselves (those belong in the request body, not
+        the identity used to deduplicate it) and never fall back to
+        generating one of their own."""
         raise NotImplementedError
 
 
@@ -61,7 +77,7 @@ class ResendTransactionalEmailService(TransactionalEmailService):
         self._timeout_seconds = timeout_seconds
         self._transport = transport
 
-    async def send_password_reset(self, *, to_email: str, reset_url: str) -> None:
+    async def send_password_reset(self, *, to_email: str, reset_url: str, idempotency_key: str) -> None:
         payload = {
             "from": self._from_email,
             "to": [to_email],
@@ -72,7 +88,20 @@ class ResendTransactionalEmailService(TransactionalEmailService):
                 "This link expires soon. If you didn't request this, you can safely ignore this email."
             ),
         }
-        headers = {"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"}
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+            # Resend's own retry-safe delivery mechanism
+            # (https://resend.com/docs/api-reference/emails/send-email#idempotency-key):
+            # a worker that reclaims the SAME durable job after a
+            # crash/lease-loss between "Resend accepted this" and this
+            # process's own acknowledge() replays this exact header, so
+            # Resend itself recognizes the retry and returns the
+            # original send rather than dispatching a second email --
+            # the one thing queue-level (Postgres) idempotency cannot
+            # do once the provider has already accepted a request.
+            "Idempotency-Key": idempotency_key,
+        }
         async with httpx.AsyncClient(timeout=self._timeout_seconds, transport=self._transport) as client:
             try:
                 response = await client.post(self._API_URL, json=payload, headers=headers)
@@ -96,7 +125,7 @@ class NullTransactionalEmailService(TransactionalEmailService):
     never become the production provider merely by an operator leaving
     EMAIL_PROVIDER unset, unlike a bare pass-through no-op would."""
 
-    async def send_password_reset(self, *, to_email: str, reset_url: str) -> None:
+    async def send_password_reset(self, *, to_email: str, reset_url: str, idempotency_key: str) -> None:
         logger.info("password_reset_email_skipped: EMAIL_PROVIDER=none, no email was sent")
 
 
@@ -110,8 +139,8 @@ class InMemoryTransactionalEmailService(TransactionalEmailService):
     def __init__(self):
         self.sent: List[dict] = []
 
-    async def send_password_reset(self, *, to_email: str, reset_url: str) -> None:
-        self.sent.append({"to_email": to_email, "reset_url": reset_url})
+    async def send_password_reset(self, *, to_email: str, reset_url: str, idempotency_key: str) -> None:
+        self.sent.append({"to_email": to_email, "reset_url": reset_url, "idempotency_key": idempotency_key})
 
 
 def build_transactional_email_service() -> TransactionalEmailService:

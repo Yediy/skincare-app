@@ -44,7 +44,10 @@ async def lookup_eligible_user_by_email(pool: asyncpg.Pool, email: str) -> Optio
     return dict(row) if row is not None else None
 
 
-async def issue_reset_token(pool: asyncpg.Pool, user_id: UUID, token_hash: str, expires_at: datetime) -> None:
+async def issue_reset_token(
+    pool: asyncpg.Pool, user_id: UUID, token_hash: str, expires_at: datetime,
+    *, conn: Optional[asyncpg.Connection] = None,
+) -> None:
     """Invalidates every other outstanding (unused) reset token for
     this user before inserting the new one, in the same transaction --
     "old reset tokens for the same user are invalidated when a new one
@@ -55,18 +58,57 @@ async def issue_reset_token(pool: asyncpg.Pool, user_id: UUID, token_hash: str, 
     statement, the same "establish identity as part of the operation"
     pattern /signup uses before its own INSERT -- this call only ever
     runs after PasswordResetService has already proven eligibility via
-    lookup_eligible_user_by_email above."""
+    lookup_eligible_user_by_email above.
+
+    `conn`, when given, is used directly instead of acquiring+
+    transacting a new connection -- lets PasswordResetService.request_reset
+    (independent-review timing-enumeration fix) run this INSERT in the
+    same transaction as PostgresJobQueue.enqueue()'s password-reset-
+    email job INSERT, so a token is never issued with no corresponding
+    delivery job, or vice versa. Mirrors analysis_repository.mark_queued's
+    own conn-optional pattern exactly."""
+    if conn is not None:
+        await _issue_reset_token_with_conn(conn, user_id, token_hash, expires_at)
+        return
+    async with pool.acquire() as acquired:
+        async with acquired.transaction():
+            await _issue_reset_token_with_conn(acquired, user_id, token_hash, expires_at)
+
+
+async def _issue_reset_token_with_conn(
+    conn: asyncpg.Connection, user_id: UUID, token_hash: str, expires_at: datetime,
+) -> None:
+    await conn.execute("SELECT set_config('app.current_user_id', $1, true)", str(user_id))
+    await conn.execute(
+        "UPDATE password_reset_tokens SET used_at = now() WHERE user_id = $1 AND used_at IS NULL",
+        user_id,
+    )
+    await conn.execute(
+        "INSERT INTO password_reset_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)",
+        user_id, token_hash, expires_at,
+    )
+
+
+async def get_token_status(pool: asyncpg.Pool, token_hash: str) -> Optional[dict]:
+    """Pre-identity read by token_hash (`app.current_reset_token_hash`,
+    same GUC consume_token_and_apply_reset uses) -- lets
+    app/workers/password_reset_email_worker.py check whether a token is
+    still unused/unexpired immediately before decrypting and sending
+    its email, without consuming it. Used to skip sending an email for
+    a token that was superseded (a newer /password/forgot call
+    invalidated it) or has since expired while the job sat in the
+    queue -- 'avoid sending obviously expired reset links where
+    practical'. Returns None if the token_hash doesn't exist at all
+    (should not happen for a job this service itself just enqueued,
+    but handled the same as any other pre-identity lookup miss)."""
     async with pool.acquire() as conn:
         async with conn.transaction():
-            await conn.execute("SELECT set_config('app.current_user_id', $1, true)", str(user_id))
-            await conn.execute(
-                "UPDATE password_reset_tokens SET used_at = now() WHERE user_id = $1 AND used_at IS NULL",
-                user_id,
+            await conn.execute("SELECT set_config('app.current_reset_token_hash', $1, true)", token_hash)
+            row = await conn.fetchrow(
+                "SELECT used_at, expires_at FROM password_reset_tokens WHERE token_hash = $1",
+                token_hash,
             )
-            await conn.execute(
-                "INSERT INTO password_reset_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)",
-                user_id, token_hash, expires_at,
-            )
+    return dict(row) if row is not None else None
 
 
 async def consume_token_and_apply_reset(

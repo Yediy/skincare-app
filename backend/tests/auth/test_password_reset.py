@@ -1,36 +1,44 @@
 """V1 account recovery pass: POST /password/forgot and
-POST /password/reset. Covers account-enumeration safety, hashed
-single-use tokens, expiry, concurrent double-use, session-family
-revocation, Redis-outage safety, and abuse rate limiting.
+POST /password/reset. Covers account-enumeration safety (response body
+AND timing), hashed single-use tokens, expiry, concurrent double-use,
+session-family revocation, Redis-outage safety, abuse rate limiting,
+and the durable out-of-band email-delivery boundary (independent-review
+timing-enumeration fix).
 
-Every test that needs an email actually delivered wires a real
-app.domain.transactional_email.InMemoryTransactionalEmailService in
-place of build_transactional_email_service() -- no test in this file
-ever sends, or could send, a real email.
+No test in this file ever sends, or could send, a real email --
+delivery jobs enqueued here are inspected directly at the database
+layer (decrypted with the real app.security.reset_delivery_crypto
+module and the test environment's own configured key), never processed
+by a running worker, since /password/forgot itself must never depend
+on that happening.
 """
 import asyncio
+import json
 
 import pytest
 from redis.exceptions import RedisError
 
-from app.domain.transactional_email import InMemoryTransactionalEmailService
+from app.config import settings
+from app.security.reset_delivery_crypto import decrypt_delivery_payload
 from app.security.tokens import hash_refresh_token
 
 
 @pytest.fixture(autouse=True)
-def fake_email_service(monkeypatch):
-    """Every test in this file gets a fresh InMemoryTransactionalEmailService
-    wired in place of the real factory. app.main's routes do
-    `from app.domain.transactional_email import build_transactional_email_service`
-    fresh inside each request handler, so patching the name where it's
-    actually defined (not a copy already bound into app.main's module
-    namespace, which doesn't exist until that import statement runs)
-    is what takes effect."""
-    import app.domain.transactional_email as email_module
+def fast_forgot_password_timing(monkeypatch):
+    """This file is about /password/forgot's OTHER behaviors
+    (enumeration safety, token lifecycle, rate limiting, the delivery
+    boundary) -- app.main._FORGOT_PASSWORD_TIMING_NORMALIZER's own
+    real jitter/sleep is exercised deliberately, deterministically, and
+    without any real sleep in tests/domain/test_timing_normalization.py
+    instead. Patching sleep_fn to a no-op here just keeps this file
+    fast; it does not change which branch ran or what target duration
+    would have been chosen."""
+    import app.main as main_module
 
-    fake = InMemoryTransactionalEmailService()
-    monkeypatch.setattr(email_module, "build_transactional_email_service", lambda: fake)
-    return fake
+    async def _no_sleep(seconds):
+        return None
+
+    monkeypatch.setattr(main_module._FORGOT_PASSWORD_TIMING_NORMALIZER, "sleep_fn", _no_sleep)
 
 
 async def _signup(client, email="resettest@test.com", password="testpass123"):
@@ -39,33 +47,59 @@ async def _signup(client, email="resettest@test.com", password="testpass123"):
     return resp.json()
 
 
+async def _count_enqueued_delivery_jobs(db_pool) -> int:
+    return await db_pool.fetchval("SELECT count(*) FROM jobs WHERE job_type = 'password_reset_email'")
+
+
+async def _decrypt_latest_delivery_job(db_pool) -> dict:
+    """Reads the most recently enqueued password_reset_email job
+    directly from the durable `jobs` table and decrypts its payload
+    with the real crypto module -- this is exactly, and only, what
+    app/workers/password_reset_email_worker.py itself would do, just
+    without a worker process actually running during these HTTP-level
+    tests (proving the request path never depends on one)."""
+    row = await db_pool.fetchrow(
+        "SELECT payload FROM jobs WHERE job_type = 'password_reset_email' ORDER BY created_at DESC LIMIT 1"
+    )
+    assert row is not None, "no password_reset_email job was enqueued"
+    payload = row["payload"]
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    return decrypt_delivery_payload(payload["encrypted_delivery"], settings.password_reset_email_delivery_key)
+
+
+async def _get_raw_token_from_latest_job(db_pool) -> str:
+    delivery = await _decrypt_latest_delivery_job(db_pool)
+    return delivery["reset_url"].split("token=")[1]
+
+
 # ---------------------------------------------------------------------------
-# POST /password/forgot -- account enumeration safety
+# POST /password/forgot -- account enumeration safety (response body)
 # ---------------------------------------------------------------------------
 
 
-async def test_forgot_password_existing_account_returns_generic_message(client, fake_email_service):
+async def test_forgot_password_existing_account_returns_generic_message(client, db_pool):
     await _signup(client, email="existing@test.com")
     resp = await client.post("/password/forgot", json={"email": "existing@test.com"})
     assert resp.status_code == 200
     assert "message" in resp.json()
-    assert len(fake_email_service.sent) == 1
-    assert fake_email_service.sent[0]["to_email"] == "existing@test.com"
+    assert await _count_enqueued_delivery_jobs(db_pool) == 1
+    delivery = await _decrypt_latest_delivery_job(db_pool)
+    assert delivery["to_email"] == "existing@test.com"
 
 
-async def test_forgot_password_nonexistent_email_returns_identical_response(client, fake_email_service):
+async def test_forgot_password_nonexistent_email_returns_identical_response(client, db_pool):
     existing = await client.post("/password/forgot", json={"email": "doesnotexist@test.com"})
     await _signup(client, email="realaccount@test.com")
     real = await client.post("/password/forgot", json={"email": "realaccount@test.com"})
 
     assert existing.status_code == real.status_code == 200
     assert existing.json() == real.json()
-    # Only the real account actually got an email queued.
-    assert len(fake_email_service.sent) == 1
-    assert fake_email_service.sent[0]["to_email"] == "realaccount@test.com"
+    # Only the real account actually got a delivery job queued.
+    assert await _count_enqueued_delivery_jobs(db_pool) == 1
 
 
-async def test_forgot_password_disabled_account_indistinguishable(client, db_pool, fake_email_service):
+async def test_forgot_password_disabled_account_indistinguishable(client, db_pool):
     await _signup(client, email="disabledforgot@test.com")
     await db_pool.execute("UPDATE users SET is_active = false WHERE email = $1", "disabledforgot@test.com")
 
@@ -74,10 +108,10 @@ async def test_forgot_password_disabled_account_indistinguishable(client, db_poo
 
     assert resp.status_code == baseline.status_code == 200
     assert resp.json() == baseline.json()
-    assert fake_email_service.sent == []  # never emailed a disabled account
+    assert await _count_enqueued_delivery_jobs(db_pool) == 0  # never queued for a disabled account
 
 
-async def test_forgot_password_deleted_account_indistinguishable(client, db_pool, fake_email_service):
+async def test_forgot_password_deleted_account_indistinguishable(client, db_pool):
     await _signup(client, email="deletedforgot@test.com")
     await db_pool.execute("UPDATE users SET deleted_at = now() WHERE email = $1", "deletedforgot@test.com")
 
@@ -86,7 +120,7 @@ async def test_forgot_password_deleted_account_indistinguishable(client, db_pool
 
     assert resp.status_code == baseline.status_code == 200
     assert resp.json() == baseline.json()
-    assert fake_email_service.sent == []
+    assert await _count_enqueued_delivery_jobs(db_pool) == 0
 
 
 async def test_forgot_password_malformed_email_is_a_normal_validation_error(client):
@@ -98,15 +132,103 @@ async def test_forgot_password_malformed_email_is_a_normal_validation_error(clie
 
 
 # ---------------------------------------------------------------------------
+# Durable email-delivery boundary (independent-review timing-enumeration fix)
+# ---------------------------------------------------------------------------
+
+
+async def test_forgot_password_never_calls_provider_http_directly(client, db_pool, monkeypatch):
+    """The single most important structural proof this fix requires:
+    POST /password/forgot must not perform outbound provider network
+    I/O in its own request path. Guards httpx.AsyncClient.post (the
+    one place ResendTransactionalEmailService -- and any future
+    provider adapter built the same way -- would issue that call) so
+    ONLY a call to Resend's own endpoint raises; the test client's own
+    calls (also httpx.AsyncClient.post, against the ASGI transport)
+    pass through to the real implementation unaffected, since it is
+    literally the same class/method both use."""
+    import httpx
+
+    original_post = httpx.AsyncClient.post
+
+    async def _fail_only_for_resend(self, url, *args, **kwargs):
+        if "api.resend.com" in str(url):
+            raise AssertionError("POST /password/forgot must never perform outbound HTTP itself")
+        return await original_post(self, url, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", _fail_only_for_resend)
+
+    await _signup(client, email="nonetworkcall@test.com")
+    resp = await client.post("/password/forgot", json={"email": "nonetworkcall@test.com"})
+    assert resp.status_code == 200
+    assert await _count_enqueued_delivery_jobs(db_pool) == 1
+
+
+async def test_forgot_password_eligible_request_returns_before_delivery_is_processed(client, db_pool):
+    """The delivery job must still be 'pending' (unclaimed) immediately
+    after the HTTP response comes back -- proving the request path
+    genuinely hands delivery off rather than processing it inline
+    under a different name."""
+    await _signup(client, email="returnsbeforedelivery@test.com")
+    resp = await client.post("/password/forgot", json={"email": "returnsbeforedelivery@test.com"})
+    assert resp.status_code == 200
+
+    row = await db_pool.fetchrow(
+        "SELECT status FROM jobs WHERE job_type = 'password_reset_email' ORDER BY created_at DESC LIMIT 1"
+    )
+    assert row["status"] == "pending"
+
+
+async def test_forgot_password_response_unaffected_by_provider_failure(client, db_pool, monkeypatch):
+    """Provider failure must never be exposed to the POST /password/forgot
+    caller -- trivially guaranteed by construction now (the route never
+    awaits the provider at all), proven dynamically here by breaking
+    only calls to Resend's own endpoint and confirming the response is
+    still the normal 200 generic body. See the previous test's own
+    docstring for why only Resend's URL is guarded, not every
+    httpx.AsyncClient.post call (the test client itself uses the same
+    method against the ASGI transport)."""
+    import httpx
+
+    original_post = httpx.AsyncClient.post
+
+    async def _fail_only_for_resend(self, url, *args, **kwargs):
+        if "api.resend.com" in str(url):
+            raise httpx.ConnectError("simulated total provider outage")
+        return await original_post(self, url, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", _fail_only_for_resend)
+
+    await _signup(client, email="providerdown@test.com")
+    resp = await client.post("/password/forgot", json={"email": "providerdown@test.com"})
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "message": "If an eligible account exists for that email, password reset instructions will be sent."
+    }
+
+
+async def test_plaintext_reset_token_never_appears_in_the_jobs_table(client, db_pool):
+    await _signup(client, email="jobsplaintextcheck@test.com")
+    await client.post("/password/forgot", json={"email": "jobsplaintextcheck@test.com"})
+
+    raw_token = await _get_raw_token_from_latest_job(db_pool)
+
+    raw_payload_text = await db_pool.fetchval(
+        "SELECT payload::text FROM jobs WHERE job_type = 'password_reset_email' ORDER BY created_at DESC LIMIT 1"
+    )
+    assert raw_token not in raw_payload_text
+    assert "jobsplaintextcheck@test.com" not in raw_payload_text
+
+
+# ---------------------------------------------------------------------------
 # Token storage: hashed only, plaintext never persisted
 # ---------------------------------------------------------------------------
 
 
-async def test_reset_token_stored_hashed_never_plaintext(client, db_pool, fake_email_service):
+async def test_reset_token_stored_hashed_never_plaintext(client, db_pool):
     await _signup(client, email="hashcheck@test.com")
     await client.post("/password/forgot", json={"email": "hashcheck@test.com"})
 
-    raw_token = fake_email_service.sent[0]["reset_url"].split("token=")[1]
+    raw_token = await _get_raw_token_from_latest_job(db_pool)
 
     row = await db_pool.fetchrow(
         "SELECT token_hash FROM password_reset_tokens WHERE user_id = (SELECT id FROM users WHERE email = $1)",
@@ -123,13 +245,13 @@ async def test_reset_token_stored_hashed_never_plaintext(client, db_pool, fake_e
         assert raw_token not in r["token_hash"]
 
 
-async def test_issuing_new_token_invalidates_previous_outstanding_token(client, db_pool, fake_email_service):
+async def test_issuing_new_token_invalidates_previous_outstanding_token(client, db_pool):
     await _signup(client, email="reissue@test.com")
     await client.post("/password/forgot", json={"email": "reissue@test.com"})
-    first_raw = fake_email_service.sent[0]["reset_url"].split("token=")[1]
+    first_raw = await _get_raw_token_from_latest_job(db_pool)
 
     await client.post("/password/forgot", json={"email": "reissue@test.com"})
-    second_raw = fake_email_service.sent[1]["reset_url"].split("token=")[1]
+    second_raw = await _get_raw_token_from_latest_job(db_pool)
 
     assert first_raw != second_raw
 
@@ -147,7 +269,7 @@ async def test_issuing_new_token_invalidates_previous_outstanding_token(client, 
 # ---------------------------------------------------------------------------
 
 
-async def test_reset_with_expired_token_rejected(client, db_pool, fake_email_service):
+async def test_reset_with_expired_token_rejected(client, db_pool):
     signup = await _signup(client, email="expiredreset@test.com")
     user_id = signup["id"]
     raw_token = "expired-token-raw-value-for-test-only"
@@ -162,10 +284,10 @@ async def test_reset_with_expired_token_rejected(client, db_pool, fake_email_ser
     assert "detail" in resp.json()
 
 
-async def test_reset_token_single_use(client, fake_email_service):
+async def test_reset_token_single_use(client, db_pool):
     await _signup(client, email="singleuse@test.com")
     await client.post("/password/forgot", json={"email": "singleuse@test.com"})
-    raw_token = fake_email_service.sent[0]["reset_url"].split("token=")[1]
+    raw_token = await _get_raw_token_from_latest_job(db_pool)
 
     first = await client.post("/password/reset", json={"token": raw_token, "new_password": "newpassword123"})
     assert first.status_code == 200
@@ -174,13 +296,13 @@ async def test_reset_token_single_use(client, fake_email_service):
     assert second.status_code == 400
 
 
-async def test_reset_concurrent_double_use_exactly_one_succeeds(client, fake_email_service):
+async def test_reset_concurrent_double_use_exactly_one_succeeds(client, db_pool):
     """Part 5: two simultaneous attempts with the same token must
     result in exactly one success -- proven against the real database
     under real concurrency, not mocked."""
     await _signup(client, email="concurrentreset@test.com")
     await client.post("/password/forgot", json={"email": "concurrentreset@test.com"})
-    raw_token = fake_email_service.sent[0]["reset_url"].split("token=")[1]
+    raw_token = await _get_raw_token_from_latest_job(db_pool)
 
     results = await asyncio.gather(
         client.post("/password/reset", json={"token": raw_token, "new_password": "passwordone11"}),
@@ -204,18 +326,18 @@ async def test_reset_with_unknown_but_well_formed_token_rejected_generically(cli
     assert resp.status_code == 400
 
 
-async def test_reset_password_policy_enforced(client, fake_email_service):
+async def test_reset_password_policy_enforced(client, db_pool):
     """No separate password policy -- the same min_length=8 rule
     /signup already enforces via Pydantic Field."""
     await _signup(client, email="policytest@test.com")
     await client.post("/password/forgot", json={"email": "policytest@test.com"})
-    raw_token = fake_email_service.sent[0]["reset_url"].split("token=")[1]
+    raw_token = await _get_raw_token_from_latest_job(db_pool)
 
     resp = await client.post("/password/reset", json={"token": raw_token, "new_password": "short"})
     assert resp.status_code == 422
 
 
-async def test_reset_account_no_longer_eligible_rejected(client, db_pool, fake_email_service):
+async def test_reset_account_no_longer_eligible_rejected(client, db_pool):
     """A token issued while the account was still active must not
     reset the password once the account has since been disabled --
     the atomic UPDATE's password_reset_account_eligible() check covers
@@ -223,7 +345,7 @@ async def test_reset_account_no_longer_eligible_rejected(client, db_pool, fake_e
     valid/unused/unexpired."""
     await _signup(client, email="disabledbeforereset@test.com")
     await client.post("/password/forgot", json={"email": "disabledbeforereset@test.com"})
-    raw_token = fake_email_service.sent[0]["reset_url"].split("token=")[1]
+    raw_token = await _get_raw_token_from_latest_job(db_pool)
 
     await db_pool.execute("UPDATE users SET is_active = false WHERE email = $1", "disabledbeforereset@test.com")
 
@@ -236,10 +358,10 @@ async def test_reset_account_no_longer_eligible_rejected(client, db_pool, fake_e
 # ---------------------------------------------------------------------------
 
 
-async def test_successful_reset_does_not_auto_authenticate(client, fake_email_service):
+async def test_successful_reset_does_not_auto_authenticate(client, db_pool):
     await _signup(client, email="noautologin@test.com")
     await client.post("/password/forgot", json={"email": "noautologin@test.com"})
-    raw_token = fake_email_service.sent[0]["reset_url"].split("token=")[1]
+    raw_token = await _get_raw_token_from_latest_job(db_pool)
 
     resp = await client.post("/password/reset", json={"token": raw_token, "new_password": "newpassword123"})
     assert resp.status_code == 200
@@ -248,7 +370,7 @@ async def test_successful_reset_does_not_auto_authenticate(client, fake_email_se
     assert "refresh_token" not in body
 
 
-async def test_all_refresh_families_revoked_after_reset(client, fake_email_service):
+async def test_all_refresh_families_revoked_after_reset(client, db_pool):
     await _signup(client, email="revokeall@test.com", password="oldpassword123")
     login1 = await client.post("/login", json={"email": "revokeall@test.com", "password": "oldpassword123"})
     login2 = await client.post("/login", json={"email": "revokeall@test.com", "password": "oldpassword123"})
@@ -260,7 +382,7 @@ async def test_all_refresh_families_revoked_after_reset(client, fake_email_servi
     old_access_2 = login2.json()["access_token"]
 
     await client.post("/password/forgot", json={"email": "revokeall@test.com"})
-    raw_token = fake_email_service.sent[-1]["reset_url"].split("token=")[1]
+    raw_token = await _get_raw_token_from_latest_job(db_pool)
     reset_resp = await client.post("/password/reset", json={"token": raw_token, "new_password": "brandnewpassword123"})
     assert reset_resp.status_code == 200
 
@@ -287,7 +409,7 @@ async def test_all_refresh_families_revoked_after_reset(client, fake_email_servi
     assert old_login.status_code == 401
 
 
-async def test_redis_outage_after_reset_does_not_restore_old_sessions(client, fake_email_service, monkeypatch):
+async def test_redis_outage_after_reset_does_not_restore_old_sessions(client, db_pool, monkeypatch):
     """System Integrity Gate V1: Postgres is the durable revocation
     authority, Redis only a best-effort cache. Simulating a Redis
     outage for the post-reset cache-propagation step must not leave
@@ -299,7 +421,7 @@ async def test_redis_outage_after_reset_does_not_restore_old_sessions(client, fa
     old_access = login.json()["access_token"]
 
     await client.post("/password/forgot", json={"email": "redisoutage@test.com"})
-    raw_token = fake_email_service.sent[-1]["reset_url"].split("token=")[1]
+    raw_token = await _get_raw_token_from_latest_job(db_pool)
 
     import app.main as main_module
 
@@ -321,7 +443,7 @@ async def test_redis_outage_after_reset_does_not_restore_old_sessions(client, fa
 # ---------------------------------------------------------------------------
 
 
-async def test_forgot_password_rate_limited_per_email(client, fake_email_service):
+async def test_forgot_password_rate_limited_per_email(client):
     """PASSWORD_RESET_EMAIL_POLICY is a module-level constant computed
     once from settings at import time (app/middleware/rate_limiter.py)
     -- monkeypatching settings.rate_limit_password_reset_email_max
@@ -338,7 +460,7 @@ async def test_forgot_password_rate_limited_per_email(client, fake_email_service
     assert "Retry-After" in denied.headers
 
 
-async def test_forgot_password_rate_limit_is_per_email_not_global(client, fake_email_service):
+async def test_forgot_password_rate_limit_is_per_email_not_global(client):
     """A different target address is unaffected by another address
     having been rate-limited -- the limiter must not become a global
     kill switch for the endpoint."""

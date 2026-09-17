@@ -23,6 +23,12 @@ PyJWT==2.13.0
 email-validator==2.3.0
 boto3==1.34.131
 httpx==0.27.0
+# Fernet symmetric encryption for the password-reset-email delivery
+# outbox (V1 account recovery pass, independent-review timing-
+# enumeration fix) -- see app/security/reset_delivery_crypto.py. The
+# raw reset token/reset URL is encrypted before it ever reaches the
+# durable jobs table, never persisted there in plaintext.
+cryptography==50.0.1
 Pillow==12.3.0
 mediapipe==0.10.14
 opencv-python-headless==4.10.0.84

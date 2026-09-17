@@ -24,6 +24,11 @@ _SAFE_PROD_KWARGS = dict(
     resend_api_key="a-real-configured-resend-api-key",
     password_reset_from_email="noreply@app.example.com",
     password_reset_url_base="https://app.skincare-launch.internal/reset-password",
+    # Independent-review timing-enumeration fix: required in every
+    # environment (see the dedicated section near the bottom of this
+    # file), so every _SAFE_PROD_KWARGS-based test needs a real-looking
+    # value too.
+    password_reset_email_delivery_key="a-real-configured-delivery-key-for-tests-0123456789",
 )
 
 
@@ -44,6 +49,7 @@ def test_development_config_is_never_validated_against_production_rules():
         redis_url="redis://localhost:6379/0",
         enable_docs=True,
         allowed_origins=["*"],
+        password_reset_email_delivery_key="dev-delivery-key-not-a-real-secret",
     )
     assert not settings.is_production
 
@@ -158,6 +164,7 @@ def test_development_config_unaffected_by_revenuecat_billing_flag():
         redis_url="redis://localhost:6379/0",
         enable_docs=True,
         allowed_origins=["*"],
+        password_reset_email_delivery_key="dev-delivery-key-not-a-real-secret",
         revenuecat_billing_enabled=True,
     )
     assert not settings.is_production
@@ -219,6 +226,7 @@ def test_development_config_unaffected_by_catalog_admin_flag():
         redis_url="redis://localhost:6379/0",
         enable_docs=True,
         allowed_origins=["*"],
+        password_reset_email_delivery_key="dev-delivery-key-not-a-real-secret",
         catalog_admin_enabled=True,
     )
     assert not settings.is_production
@@ -309,6 +317,55 @@ def test_development_defaults_to_no_op_email_provider_unaffected_by_validation()
         redis_url="redis://localhost:6379/0",
         enable_docs=True,
         allowed_origins=["*"],
+        password_reset_email_delivery_key="dev-delivery-key-not-a-real-secret",
     )
     assert settings.email_provider == "none"
     assert settings.password_reset_url_base == "skincare://reset-password"
+
+
+# ---------------------------------------------------------------------------
+# Independent-review timing-enumeration fix: password-reset-email delivery
+# encryption key and forgot-password response-timing jitter range.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("placeholder", ["", "changeme", "short-key"])
+def test_production_rejects_placeholder_or_short_delivery_key(placeholder):
+    kwargs = {**_SAFE_PROD_KWARGS, "password_reset_email_delivery_key": placeholder}
+    with pytest.raises(ValueError) as exc_info:
+        Settings(_env_file=None, **kwargs)
+    assert "PASSWORD_RESET_EMAIL_DELIVERY_KEY" in str(exc_info.value)
+
+
+def test_production_accepts_real_delivery_key():
+    settings = Settings(_env_file=None, **_SAFE_PROD_KWARGS)
+    assert len(settings.password_reset_email_delivery_key) >= 32
+
+
+def test_production_rejects_negative_min_response_seconds():
+    kwargs = {**_SAFE_PROD_KWARGS, "password_reset_forgot_min_response_seconds": -0.1}
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, **kwargs)
+
+
+def test_production_rejects_max_response_seconds_below_min():
+    kwargs = {
+        **_SAFE_PROD_KWARGS,
+        "password_reset_forgot_min_response_seconds": 0.5,
+        "password_reset_forgot_max_response_seconds": 0.2,
+    }
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, **kwargs)
+
+
+def test_production_rejects_excessive_max_response_seconds():
+    """Sanity ceiling against a self-inflicted slow-request DoS surface
+    -- not a precision timing requirement."""
+    kwargs = {**_SAFE_PROD_KWARGS, "password_reset_forgot_max_response_seconds": 10.0}
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, **kwargs)
+
+
+def test_production_accepts_default_timing_jitter_range():
+    settings = Settings(_env_file=None, **_SAFE_PROD_KWARGS)
+    assert 0 <= settings.password_reset_forgot_min_response_seconds <= settings.password_reset_forgot_max_response_seconds
