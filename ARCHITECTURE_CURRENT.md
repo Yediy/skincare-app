@@ -16,6 +16,27 @@ Real FastAPI app (`app/main.py`), 17 routes: `/health/live`, `/health/ready`, `/
 
 JWT access tokens + opaque, SHA-256-hashed refresh tokens with family IDs (`app/security/tokens.py`). Refresh rotation is transactional (`app/main.py`'s `/refresh`): old-token consumption and successor creation happen in one explicit Postgres transaction, proven to roll back coherently on a real forced `UniqueViolationError`, not a mock. Replay of a consumed token revokes the whole family via Redis (`revoked_family:{family_id}`), verified by minting a second token from the same family after a replay and confirming it's also rejected. `get_current_user` (`app/security/auth.py`) checks Redis revocation *and* `users.is_active`/`deleted_at` directly against Postgres on every request — a disabled/deleted account's outstanding access tokens stop working immediately, not just at natural JWT expiry, verified with a real test disabling an account mid-session. Redis unreachability fails closed (`503`), distinct from `401`, both tested.
 
+## Password recovery — `VERIFIED_IMPLEMENTED`
+
+**V1 account recovery pass.** `POST /password/forgot` / `POST
+/password/reset` (`app/main.py`), backed by `password_reset_tokens`
+(migration `dec963f29e8d`) and `app/domain/password_reset_service.py`.
+Account-enumeration-safe (identical outward response for an existing,
+nonexistent, disabled, or deleted account); cryptographically random,
+SHA-256-hashed, single-use, expiring tokens, consumed by one atomic
+row-locked `UPDATE` proven correct under real concurrent Postgres access
+(exactly one of two simultaneous attempts on the same token succeeds); a
+successful reset revokes every refresh-token family for that user in the
+same transaction as the password-hash update, so every previously issued
+access/refresh session becomes unusable and Redis unavailability cannot
+resurrect a revoked one (System Integrity Gate V1's Postgres-
+authoritative `get_current_user` already guarantees this). A new
+provider-neutral `TransactionalEmailService` boundary
+(`app/domain/transactional_email.py`) with a real Resend adapter and a
+production-fail-closed config validator. Full detail, including the
+mobile screens and EAS/release-URL scaffolding this same pass added, in
+`ACCOUNT_RECOVERY_ARCHITECTURE.md`.
+
 ## Consent — `VERIFIED_IMPLEMENTED`
 
 `consent_events` (append-only; `withdrawn_at` on the active row is the one narrow, deliberate exception) gates `/analyze` on a valid, current-policy-version grant (`app/db/consent_repository.py`). An old policy version or a withdrawn grant both correctly deny analysis; re-consenting to the current version restores access. Verified with 5 real tests plus the E2E test. **Mobile V1 foundation pass**: added `GET /consent` (read-only, additive) so a client can read current consent status/required policy version instead of caching its own boolean — see `MOBILE_ARCHITECTURE.md`.

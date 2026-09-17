@@ -90,6 +90,38 @@ On successful refresh: access + refresh tokens are replaced together in `SecureS
 
 Not every 401 means "bad password." `/login`'s own 401 is shown directly as "incorrect email or password" (`app/(public)/sign-in.tsx`) -- it is the one 401 that is never routed through the refresh coordinator, since `/login` is an unauthenticated call. Every other 401 (an expired access token, a revoked family, a disabled/deleted account -- `backend/app/security/auth.py::get_current_user` returns 401 for all three, by design, since the corrective action is identical: refresh or log out) goes through `refreshOnce()` uniformly. Account deletion revokes the user's refresh-token family server-side, so a deleted account's session ends the first time any authenticated call's refresh attempt hits that revoked family.
 
+## Password recovery — IMPLEMENTED, TESTED (V1 account recovery pass)
+
+Two new public routes, wired to the **existing**-shape backend auth
+surface's newest members, `POST /password/forgot` / `POST
+/password/reset`:
+
+- `app/(public)/forgot-password.tsx` -- email entry, linked from
+  `sign-in.tsx`'s new "Forgot password?" button. Renders exactly one
+  generic confirmation on success, regardless of what the backend
+  actually did (no "account not found" branch exists in this screen at
+  all -- the backend's own response never distinguishes that case
+  either, see `ACCOUNT_RECOVERY_ARCHITECTURE.md` section 5).
+- `app/(public)/reset-password.tsx` -- reached via a deep link carrying
+  `?token=...` (the app's existing `skincare` scheme in dev; a future
+  HTTPS universal/app-link origin in production, see
+  `ACCOUNT_RECOVERY_ARCHITECTURE.md` section 10). Reads the token with
+  `useLocalSearchParams`; new/confirm password fields with client-side
+  mismatch validation; on success, defensively clears any local
+  session (`useSession().signOut()`) and routes to sign-in -- never
+  auto-authenticates. **The reset token lives only in this component's
+  own React state** for the duration of the flow: never written to
+  SecureStore, AsyncStorage, SQLite, the filesystem, the persisted
+  TanStack Query cache, or a log line.
+
+Both screens reuse the existing form primitives (`Button`, `Screen`,
+`TextField`), theme, and `ErrorState` conventions -- no new component
+system was introduced. `src/api/auth-api.ts` gained `forgotPassword`/
+`resetPassword`, both plain unauthenticated `request()` calls, and
+`src/auth/use-auth-actions.ts` gained matching mutation hooks that do
+not touch session state themselves (the reset screen owns the explicit
+post-success session clear).
+
 ## Consent — IMPLEMENTED, TESTED
 
 Wired to the **existing** consent ledger (`backend/app/db/consent_repository.py`) with one additive, read-only backend change: **`GET /consent`** (new). Before this pass, `consent_events` was write-only from the API's perspective (`POST /consent`, `POST /consent/withdraw` existed; nothing read current status), which made "does this user need to (re-)consent" undecidable from backend truth alone -- exactly the local-boolean trap section 10 of this pass's brief explicitly forbids. `GET /consent` returns `{consent_type, required_policy_version, has_valid_consent}`, backed by the pre-existing `has_valid_consent()`/`REQUIRED_POLICY_VERSION` (never a value hardcoded client-side). Granting consent (`app/(onboarding)/consent.tsx`) always uses the `required_policy_version` value this endpoint returns. If the backend's required version is ever bumped, `has_valid_consent` flips to `false` and the bootstrap boundary routes back into onboarding-consent automatically -- no local boolean to go stale.
@@ -144,6 +176,34 @@ Reusable primitives (`TextField`, `CheckboxRow`, `TagInput`, `Button`) so no scr
 ## Credential storage — token pair, single SecureStore value (Phase A repair pass) — IMPLEMENTED, TESTED
 
 `src/auth/token-storage.ts` stores access + refresh together as one versioned JSON value under `auth.token_pair`, replacing an earlier two-independent-keys scheme an independent review flagged: a second-write failure across two keys could have left a new access token paired with an old, already-consumed (single-use) refresh token, colliding with the backend's replay-family revocation. `clear()` also removes the old two-key values for any dev install still carrying them. A SecureStore write failure occurring *after* a successful server refresh (`src/auth/refresh-coordinator.ts`) fails closed: the old refresh token is never retried, storage is best-effort cleared, and the session ends (`TOKEN_STORAGE_ERROR`) rather than trusting an inconsistent local state.
+
+## EAS build foundation (V1 account recovery / release-foundation pass) — CONFIGURED, NOT BUILT
+
+`mobile/eas.json`: `development` (`developmentClient: true`, internal
+distribution), `preview` (internal distribution), `production`
+(`autoIncrement`). This pass only wrote the profile declarations --
+no `eas build` was run, no RevenueCat packages were installed, and
+`expo-dev-client` was **not** installed (installing it is left to
+Mobile C2). **STILL REQUIRED BEFORE C2 STORE INTEGRATION:**
+`ios.bundleIdentifier` / `android.package` are absent from
+`mobile/app.json` -- no canonical value could be verified from
+repository/Expo project state, so this pass left that irreversible
+decision explicit rather than guessing.
+
+## Release URL seams (V1 account recovery / release-foundation pass) — IMPLEMENTED, CONFIGURATION EXTERNAL
+
+Four optional, public (non-secret) environment variables
+(`EXPO_PUBLIC_PRIVACY_POLICY_URL`, `EXPO_PUBLIC_TERMS_URL`,
+`EXPO_PUBLIC_SUPPORT_URL`, `EXPO_PUBLIC_ACCOUNT_DELETION_URL`,
+`src/constants/config.ts`), each independently optional in development
+(Settings' new "Legal & support" section renders only the links whose
+URL is actually set) and required to be `https://` if configured in a
+production build (enforced at startup, same pattern
+`EXPO_PUBLIC_API_BASE_URL` already uses). **None of the four is
+actually configured yet, and no privacy/terms/support/account-deletion
+page content was authored by this pass** -- see
+`ACCOUNT_RECOVERY_ARCHITECTURE.md` section 13. The account-deletion
+link is additive: existing in-app `DELETE /me` is unchanged.
 
 ## Bootstrap error state (Phase A repair pass) — IMPLEMENTED, TESTED
 

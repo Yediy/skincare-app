@@ -94,6 +94,18 @@ class Settings(BaseSettings):
     rate_limit_general_max: int = 120
     rate_limit_general_window_seconds: int = 60
 
+    # POST /password/forgot's second, independent limiter (Part 7 of
+    # the V1 account recovery pass): keyed by the *submitted* email
+    # itself, not by IP -- AUTH_POLICY above already covers per-IP
+    # abuse, but a single target address spammed from many different
+    # IPs would sail through IP-based limiting alone. Deliberately its
+    # own policy/config rather than reusing rate_limit_auth_max: the
+    # right threshold for "how many reset emails can one address
+    # receive per hour" is a different number from "how many auth
+    # attempts can one IP make per minute".
+    rate_limit_password_reset_email_max: int = 5
+    rate_limit_password_reset_email_window_seconds: int = 3600
+
     # Only X-Forwarded-For values relayed by a listed, trusted
     # reverse-proxy peer IP are honored for IP-based rate-limit keying
     # -- otherwise any client could simply forge the header to any
@@ -196,6 +208,27 @@ class Settings(BaseSettings):
     # table at all.
     catalog_admin_database_url: Optional[str] = None
 
+    # Password recovery / transactional email (V1 account recovery
+    # pass -- see ACCOUNT_RECOVERY_ARCHITECTURE.md). Unlike
+    # revenuecat_billing_enabled/catalog_admin_enabled, there is no
+    # PASSWORD_RESET_ENABLED flag: POST /password/forgot and
+    # POST /password/reset always exist as core V1 launch surface, so
+    # _reject_unsafe_production_config below always requires a real
+    # (non-"none") EMAIL_PROVIDER in production rather than gating
+    # validation on an opt-in flag the way billing/catalog do.
+    email_provider: str = "none"
+    resend_api_key: Optional[str] = None
+    password_reset_from_email: Optional[str] = None
+    # Dev/CI default is this app's own custom scheme -- correct ONLY
+    # for a device/simulator that already has this Expo dev/preview
+    # build installed (see ACCOUNT_RECOVERY_ARCHITECTURE.md's
+    # "deep-link contract" section for the distinction between this
+    # and a future HTTPS universal/app-link origin). Production must
+    # override this to a real https:// origin -- enforced below, not
+    # just documented.
+    password_reset_url_base: str = "skincare://reset-password"
+    password_reset_token_ttl_minutes: int = 30
+
     @property
     def is_production(self) -> bool:
         return self.environment.lower() == "production"
@@ -293,6 +326,34 @@ class Settings(BaseSettings):
                 for marker in _DEV_ONLY_DATABASE_URL_MARKERS:
                     if marker in lowered_catalog_url:
                         errors.append(f"CATALOG_ADMIN_DATABASE_URL contains a dev/CI-only marker ({marker!r})")
+
+        if self.email_provider not in ("none", "resend"):
+            errors.append(f"EMAIL_PROVIDER={self.email_provider!r} is not a recognized provider")
+        elif self.email_provider != "resend":
+            # Password recovery is always-on production surface, not a
+            # feature flag (see the settings above) -- EMAIL_PROVIDER=
+            # none in production would silently accept every forgot-
+            # password request while never actually sending mail.
+            errors.append(
+                "EMAIL_PROVIDER must be 'resend' in production -- password reset requires a real "
+                "transactional email provider, not the no-op default"
+            )
+        else:
+            for field_name, value in (
+                ("RESEND_API_KEY", self.resend_api_key),
+                ("PASSWORD_RESET_FROM_EMAIL", self.password_reset_from_email),
+            ):
+                if not value or value.strip().lower() in _PLACEHOLDER_SECRET_VALUES:
+                    errors.append(f"EMAIL_PROVIDER=resend but {field_name} is blank or a placeholder")
+
+        lowered_reset_url_base = self.password_reset_url_base.lower()
+        if not lowered_reset_url_base.startswith("https://"):
+            errors.append("PASSWORD_RESET_URL_BASE must be an https:// URL in production, not a dev scheme")
+        elif any(marker in lowered_reset_url_base for marker in ("example.com", "localhost", "127.0.0.1")):
+            errors.append("PASSWORD_RESET_URL_BASE looks like a placeholder/dev value")
+
+        if self.password_reset_token_ttl_minutes <= 0:
+            errors.append("PASSWORD_RESET_TOKEN_TTL_MINUTES must be a positive number of minutes")
 
         if errors:
             raise ValueError(

@@ -1,12 +1,18 @@
 import { useRouter } from "expo-router";
 import React from "react";
-import { Alert, Text, View } from "react-native";
+import { Alert, Linking, Text, View } from "react-native";
 
 import { useDeleteAccountMutation, useSignOutMutation } from "@/auth/use-auth-actions";
 import { Button } from "@/components/button";
 import { ErrorState } from "@/components/error-state";
 import { Screen } from "@/components/screen";
-import { APP_VERSION } from "@/constants/config";
+import {
+  ACCOUNT_DELETION_URL,
+  APP_VERSION,
+  PRIVACY_POLICY_URL,
+  SUPPORT_URL,
+  TERMS_URL,
+} from "@/constants/config";
 import { useConsentQuery, useWithdrawConsentMutation } from "@/query/use-consent";
 import { useTheme } from "@/theme/theme-provider";
 
@@ -63,6 +69,33 @@ export default function Settings() {
         ) : null}
         {withdrawConsent.isError ? <ErrorState error={withdrawConsent.error} /> : null}
       </Section>
+
+      {/* Release URL seams (V1 account recovery / release-foundation
+          pass, Part 11): each link is present only when its URL is
+          actually configured -- an unconfigured dev build simply
+          omits the row rather than showing a broken link. This pass
+          does not author privacy/terms/support content; see
+          ACCOUNT_RECOVERY_ARCHITECTURE.md. */}
+      {PRIVACY_POLICY_URL || TERMS_URL || SUPPORT_URL || ACCOUNT_DELETION_URL ? (
+        <Section title="Legal & support">
+          {PRIVACY_POLICY_URL ? (
+            <Button label="Privacy policy" variant="secondary" onPress={() => Linking.openURL(PRIVACY_POLICY_URL!)} />
+          ) : null}
+          {TERMS_URL ? (
+            <Button label="Terms of service" variant="secondary" onPress={() => Linking.openURL(TERMS_URL!)} />
+          ) : null}
+          {SUPPORT_URL ? (
+            <Button label="Support" variant="secondary" onPress={() => Linking.openURL(SUPPORT_URL!)} />
+          ) : null}
+          {ACCOUNT_DELETION_URL ? (
+            <Button
+              label="Delete account (web)"
+              variant="secondary"
+              onPress={() => Linking.openURL(ACCOUNT_DELETION_URL!)}
+            />
+          ) : null}
+        </Section>
+      ) : null}
 
       <Section>
         <Button label="Sign out" variant="secondary" onPress={() => signOut.mutate()} loading={signOut.isPending} />

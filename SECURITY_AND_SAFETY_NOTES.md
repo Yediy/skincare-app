@@ -11,6 +11,15 @@ Plain statement of the actual security and safety posture after this foundation 
 - Account state (`is_active`, `deleted_at`) is checked against Postgres directly on **every** authenticated request (`get_current_user`), not just a Redis TTL artifact — a disabled/deleted account's existing access tokens stop working immediately, verified with a real test that disables an account mid-session and reuses its still-unexpired token.
 - Redis unreachability fails closed (`503`), never silently treated as "not revoked" (`401`) — this distinction is deliberately preserved and tested.
 
+## Password recovery (V1 account recovery pass)
+
+- `POST /password/forgot` is account-enumeration-safe: identical outward response for an existing account, a nonexistent email, a disabled account, and a deleted account. No code path in the route or `PasswordResetService` branches on account existence.
+- Reset tokens are generated with `secrets.token_urlsafe(32)`, stored server-side only as SHA-256 hashes (`password_reset_tokens.token_hash`), and never logged, put in observability events, returned in any API response beyond the one outbound email, or stored in mobile persistent storage.
+- Single-use and expiry are enforced by one atomic, row-locked `UPDATE` (`password_reset_repository.consume_token_and_apply_reset`) — never a check-then-update pair — proven correct under real concurrent Postgres access (exactly one of two simultaneous consumption attempts on the same token succeeds).
+- A successful reset revokes every refresh-token family for that user in the same transaction as the password-hash update, so every previously issued access/refresh session becomes unusable immediately (not just at natural JWT expiry) — verified with a real test asserting both a pre-reset access token and a pre-reset refresh token are rejected afterward. Redis unavailability during the post-reset cache-propagation step cannot resurrect a revoked session, since `get_current_user` falls through to the authoritative Postgres check on any `RedisError`.
+- Two independent abuse-protection limiters on `POST /password/forgot`: the existing per-IP `AUTH_POLICY`, plus a new limiter keyed by a SHA-256 hash of the submitted email itself — closes the gap where a single target address could be spammed from many different IPs.
+- The transactional-email boundary (`app/domain/transactional_email.py`) never lets the domain layer touch Resend directly; `RESEND_API_KEY` is a backend-only secret, never exposed to mobile/Expo. Production config validation fails closed if `EMAIL_PROVIDER` is not `resend` with real, non-placeholder credentials configured. Full detail in `ACCOUNT_RECOVERY_ARCHITECTURE.md`.
+
 ## Consent
 
 - `consent_events` is append-only: granting always inserts a new row. The one narrow, deliberate exception is `withdrawn_at`, set on the currently-active row by a withdrawal — never a rewrite of what was actually granted historically.

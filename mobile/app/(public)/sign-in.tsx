@@ -58,6 +58,11 @@ export default function SignIn() {
         error={errorMessage}
       />
       <Button label="Sign in" onPress={handleSubmit} loading={signIn.isPending} disabled={!email || !password} />
+      <Button
+        label="Forgot password?"
+        onPress={() => router.push("/(public)/forgot-password")}
+        variant="secondary"
+      />
       <Button label="Back" onPress={() => router.back()} variant="secondary" />
     </Screen>
   );

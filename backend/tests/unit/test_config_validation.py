@@ -13,6 +13,17 @@ _SAFE_PROD_KWARGS = dict(
     redis_url="redis://redis.internal.example.com:6379/0",
     enable_docs=False,
     allowed_origins=["https://app.example.com"],
+    # Password recovery is always-on production surface (V1 account
+    # recovery pass) -- every _SAFE_PROD_KWARGS-based test needs a
+    # valid email-provider configuration or it would trip the new
+    # EMAIL_PROVIDER validation for reasons unrelated to what it's
+    # actually testing. See the dedicated "Password recovery /
+    # transactional email" section below for tests of this validation
+    # itself.
+    email_provider="resend",
+    resend_api_key="a-real-configured-resend-api-key",
+    password_reset_from_email="noreply@app.example.com",
+    password_reset_url_base="https://app.skincare-launch.internal/reset-password",
 )
 
 
@@ -211,3 +222,93 @@ def test_development_config_unaffected_by_catalog_admin_flag():
         catalog_admin_enabled=True,
     )
     assert not settings.is_production
+
+
+# ---------------------------------------------------------------------------
+# Password recovery / transactional email (V1 account recovery pass, Part
+# 3/8) -- unlike revenuecat_billing_enabled/catalog_admin_enabled there is no
+# opt-in flag: password reset is always-on production surface, so production
+# always requires a real (non-"none") EMAIL_PROVIDER, not just when some flag
+# is set.
+# ---------------------------------------------------------------------------
+
+
+def test_production_rejects_default_email_provider_none():
+    kwargs = {**_SAFE_PROD_KWARGS}
+    kwargs["email_provider"] = "none"
+    with pytest.raises(ValueError) as exc_info:
+        Settings(_env_file=None, **kwargs)
+    assert "EMAIL_PROVIDER" in str(exc_info.value)
+
+
+def test_production_rejects_unrecognized_email_provider():
+    kwargs = {**_SAFE_PROD_KWARGS}
+    kwargs["email_provider"] = "sendgrid"
+    with pytest.raises(ValueError) as exc_info:
+        Settings(_env_file=None, **kwargs)
+    assert "EMAIL_PROVIDER" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("missing_field", ["resend_api_key", "password_reset_from_email"])
+def test_production_rejects_resend_enabled_with_missing_field(missing_field):
+    kwargs = {**_SAFE_PROD_KWARGS}
+    kwargs[missing_field] = None
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, **kwargs)
+
+
+@pytest.mark.parametrize("placeholder", ["", "changeme", "placeholder"])
+def test_production_rejects_resend_api_key_placeholder(placeholder):
+    kwargs = {**_SAFE_PROD_KWARGS, "resend_api_key": placeholder}
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, **kwargs)
+
+
+def test_production_rejects_dev_scheme_password_reset_url_base():
+    kwargs = {**_SAFE_PROD_KWARGS, "password_reset_url_base": "skincare://reset-password"}
+    with pytest.raises(ValueError) as exc_info:
+        Settings(_env_file=None, **kwargs)
+    assert "PASSWORD_RESET_URL_BASE" in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "placeholder_url",
+    [
+        "https://example.com/reset-password",
+        "https://localhost/reset-password",
+    ],
+)
+def test_production_rejects_placeholder_password_reset_url_base(placeholder_url):
+    kwargs = {**_SAFE_PROD_KWARGS, "password_reset_url_base": placeholder_url}
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, **kwargs)
+
+
+def test_production_rejects_non_positive_token_ttl():
+    kwargs = {**_SAFE_PROD_KWARGS, "password_reset_token_ttl_minutes": 0}
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, **kwargs)
+
+
+def test_production_accepts_fully_configured_resend():
+    settings = Settings(_env_file=None, **_SAFE_PROD_KWARGS)
+    assert settings.email_provider == "resend"
+    assert settings.password_reset_url_base.startswith("https://")
+
+
+def test_development_defaults_to_no_op_email_provider_unaffected_by_validation():
+    """Development's default (EMAIL_PROVIDER unset -> "none",
+    PASSWORD_RESET_URL_BASE unset -> the skincare:// dev scheme) must
+    keep working unmodified -- these production-only rules never run
+    outside ENVIRONMENT=production."""
+    settings = Settings(
+        _env_file=None,
+        environment="development",
+        jwt_secret="",
+        database_url="postgresql://postgres:postgres@localhost:5432/skincare",
+        redis_url="redis://localhost:6379/0",
+        enable_docs=True,
+        allowed_origins=["*"],
+    )
+    assert settings.email_provider == "none"
+    assert settings.password_reset_url_base == "skincare://reset-password"

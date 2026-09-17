@@ -501,6 +501,110 @@ async def logout(request: LogoutRequest, _rl: None = Depends(rate_limit_by_ip(AU
     return {"detail": "Logged out"}
 
 
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+_FORGOT_PASSWORD_RESPONSE = {
+    "message": "If an eligible account exists for that email, password reset instructions will be sent."
+}
+
+
+@app.post("/password/forgot")
+async def forgot_password(request: ForgotPasswordRequest, _rl: None = Depends(rate_limit_by_ip(AUTH_POLICY))):
+    """
+    Account-enumeration-safe (V1 account recovery pass, Part 2): the
+    outward response is byte-for-byte identical for an existing
+    account, a nonexistent email, and a disabled/deleted account --
+    see PasswordResetService.request_reset, which silently no-ops for
+    every ineligible case rather than raising or varying its behavior.
+
+    Two independent abuse-protection layers, both enforced
+    unconditionally before PasswordResetService ever learns whether
+    the address is real (so being rate-limited never itself discloses
+    account existence): AUTH_POLICY above (the same unauthenticated
+    per-IP limiting /signup and /login already use) plus
+    PASSWORD_RESET_EMAIL_POLICY, keyed by the submitted email itself
+    (hashed before use as a Redis key -- see app/config.py), so a
+    single target address can't be spammed indefinitely from many
+    different IPs.
+    """
+    import hashlib
+
+    from app.db.connection import get_db_pool
+    from app.domain.password_reset_service import PasswordResetService
+    from app.domain.transactional_email import build_transactional_email_service
+    from app.middleware.rate_limiter import PASSWORD_RESET_EMAIL_POLICY, enforce_rate_limit
+
+    email_key = hashlib.sha256(request.email.strip().lower().encode("utf-8")).hexdigest()
+    await enforce_rate_limit(PASSWORD_RESET_EMAIL_POLICY, f"email:{email_key}")
+
+    pool = get_db_pool()
+    service = PasswordResetService(
+        pool,
+        build_transactional_email_service(),
+        url_base=settings.password_reset_url_base,
+        token_ttl_minutes=settings.password_reset_token_ttl_minutes,
+    )
+    await service.request_reset(request.email)
+    return _FORGOT_PASSWORD_RESPONSE
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str = Field(min_length=8, max_length=72)
+
+
+@app.post("/password/reset")
+async def reset_password(request: ResetPasswordRequest, _rl: None = Depends(rate_limit_by_ip(AUTH_POLICY))):
+    """
+    Completes a password reset (V1 account recovery pass, Part 4/5).
+    The atomic verify-and-apply core lives in
+    password_reset_repository.consume_token_and_apply_reset -- one
+    UPDATE proves the token exists, is unused, is unexpired, and its
+    account is still active/not-deleted, and consumes it, all as a
+    single row-locked conditional write. Two concurrent requests with
+    the same token can both reach that UPDATE, but only one can ever
+    see it match (Part 5); the other gets this same generic 400.
+
+    On success, within that same transaction: users.password_hash is
+    updated (existing hash_password, no separate password policy),
+    every other outstanding reset token for this user is invalidated,
+    and every refresh_token family for this user is revoked (System
+    Integrity Gate V1's durable Postgres-authoritative revocation) --
+    so every previously issued access/refresh session becomes unusable
+    and the resetting device is NOT automatically signed in.
+    """
+    from app.db.connection import get_db_pool
+    from app.domain.password_reset_service import PasswordResetService
+    from app.domain.transactional_email import build_transactional_email_service
+
+    pool = get_db_pool()
+    service = PasswordResetService(
+        pool,
+        build_transactional_email_service(),
+        url_base=settings.password_reset_url_base,
+        token_ttl_minutes=settings.password_reset_token_ttl_minutes,
+    )
+    new_password_hash = hash_password(request.new_password)
+    user_id = await service.reset_password(request.token, new_password_hash)
+    if user_id is None:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset token")
+
+    try:
+        r = get_redis()
+        now_ts = datetime.now(timezone.utc).timestamp()
+        await r.set(
+            f"user_tokens_invalid_before:{user_id}",
+            str(now_ts),
+            ex=settings.access_token_expire_minutes * 60,
+        )
+    except RedisError:
+        logger.warning("password/reset: Redis unavailable propagating revocation -- Postgres revocation already durable")
+
+    return {"detail": "Password has been reset. Sign in with your new password."}
+
+
 @app.get("/me")
 async def get_me(user_id: str = Depends(rate_limit_by_user(GENERAL_POLICY))):
     return {"user_id": user_id}
