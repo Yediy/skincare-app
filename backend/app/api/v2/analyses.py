@@ -140,13 +140,41 @@ async def submit_analysis(
     )
 
 
+class ProductRecommendationOut(BaseModel):
+    """Mobile V1 Phase C1's client-facing product-recommendation
+    contract. Deliberately excludes database bookkeeping (`id`,
+    `user_id`, `analysis_request_id`, `created_at`) that
+    get_product_recommendations() never even selects in the first
+    place -- this model is a second, independent enforcement layer:
+    even if that query were ever changed to `SELECT *` again by
+    mistake, an unlisted field here is silently dropped, never
+    forwarded to the client (Pydantic v2's default `extra='ignore'`).
+
+    `rank_position` is kept only as provenance, never as a claim of
+    demonstrated clinical efficacy -- see
+    ProductMatchingService._compatibility_ordering_key's own docstring.
+    Mobile must never render "#1 product"/"best product"/"top ranked
+    product" from this field."""
+    plan_step_key: str
+    product_id: str
+    formulation_id: str
+    brand: Optional[str] = None
+    product_name: Optional[str] = None
+    safety_status: str
+    reason_codes: List[str]
+    restrictions: Dict[str, Any]
+    rules_version: str
+    verification_date: Optional[str] = None
+    rank_position: int
+
+
 class AnalysisStatusResponse(BaseModel):
     analysis_id: str
     request_id: str
     status: str
     error_code: Optional[str] = None
     result: Optional[Dict[str, Any]] = None
-    product_recommendations: Optional[List[Dict[str, Any]]] = None
+    product_recommendations: Optional[List[ProductRecommendationOut]] = None
     # Mobile V1 Phase B addition: per-metric VALID/BORDERLINE/ABSTAINED
     # detail (see app/db/analysis_repository.py::get_measurements) --
     # additive only, every existing field/behavior above is unchanged.
@@ -195,9 +223,15 @@ async def get_analysis(
 
     if req["status"] == "COMPLETED":
         response.result = await analysis_repository.get_result(pool, user_uuid, analysis_uuid)
-        response.product_recommendations = await analysis_repository.get_product_recommendations(
-            pool, user_uuid, analysis_uuid,
-        )
+        # Explicit construction (not a raw dict assignment) is what
+        # actually makes ProductRecommendationOut's field allowlist
+        # real: Pydantic only validates/strips extra fields when a
+        # model is constructed, never when a plain list of dicts is
+        # assigned to an already-built response object's field.
+        response.product_recommendations = [
+            ProductRecommendationOut(**rec)
+            for rec in await analysis_repository.get_product_recommendations(pool, user_uuid, analysis_uuid)
+        ]
         response.metric_results = await analysis_repository.get_measurements(pool, user_uuid, analysis_uuid)
     elif req["status"] == "FAILED":
         raw_code = req.get("error_code")

@@ -274,6 +274,76 @@ async def test_get_measurements_response_excludes_internal_columns(client, db_po
     assert "created_at" not in metric
 
 
+async def test_get_completed_analysis_product_recommendations_projection(client, db_pool, app_db_pool):
+    """Mobile V1 Phase C1: the product_recommendations contract is
+    exactly plan_step_key/product_id/formulation_id/brand/product_name/
+    safety_status/reason_codes/restrictions/rules_version/
+    verification_date/rank_position -- id/user_id/analysis_request_id/
+    created_at (internal database bookkeeping) must never appear, even
+    though RLS already scopes this row to its owner regardless. Also
+    proves the documented fields actually round-trip correctly through
+    ProductRecommendationOut."""
+    from app.db import analysis_repository, usage_repository
+
+    headers = await _signup_login_consent(client, "v2-product-recs@test.com")
+    user_row = await db_pool.fetchrow("SELECT id FROM users WHERE email = $1", "v2-product-recs@test.com")
+    user_id = user_row["id"]
+
+    unique = uuid.uuid4().hex[:8]
+    brand_id = await db_pool.fetchval(
+        "INSERT INTO brands (name, normalized_name) VALUES ($1, $2) RETURNING id", f"Brand-{unique}", f"brand-{unique}"
+    )
+    product_id = await db_pool.fetchval(
+        "INSERT INTO products (brand_id, name, normalized_name, category) VALUES ($1, $2, $3, 'moisturizer') RETURNING id",
+        brand_id, f"Product-{unique}", f"product-{unique}",
+    )
+    formulation_id = await db_pool.fetchval(
+        "INSERT INTO product_formulations (product_id, version, source_type, ingredient_data_status) "
+        "VALUES ($1, '1', 'manufacturer_disclosure', 'COMPLETE') RETURNING id",
+        product_id,
+    )
+
+    req = await analysis_repository.create_request(app_db_pool, user_id, str(uuid.uuid4()))
+    reservation = await usage_repository.reserve(app_db_pool, user_id, str(uuid.uuid4()), "2026-09", allowance=5)
+    await analysis_repository.commit_analysis_result(
+        app_db_pool, user_id, req["id"],
+        capture_assessment={"quality_status": "PASS"}, scores={"skin_health_score": 0.8}, plan={"top_priorities": []},
+        eligible_for_longitudinal_comparison=True, pipeline_version="test-1.0", metric_results={},
+        product_recommendations=[{
+            "plan_step_key": "AM:1", "product_id": product_id, "formulation_id": formulation_id,
+            "rank_position": 1, "safety_status": "SAFE", "reason_codes": ["FRAGRANCE_FREE"], "restrictions": {},
+            "rules_version": "1.0", "brand": f"Brand-{unique}", "product_name": f"Product-{unique}",
+            "verification_date": None,
+        }],
+        usage_reservation_id=reservation.id,
+    )
+
+    resp = await client.get(f"/api/v2/analyses/{req['id']}", headers=headers)
+    assert resp.status_code == 200
+    rec = resp.json()["product_recommendations"][0]
+
+    assert set(rec.keys()) == {
+        "plan_step_key", "product_id", "formulation_id", "brand", "product_name",
+        "safety_status", "reason_codes", "restrictions", "rules_version",
+        "verification_date", "rank_position",
+    }
+    assert "id" not in rec
+    assert "user_id" not in rec
+    assert "analysis_request_id" not in rec
+    assert "created_at" not in rec
+
+    assert rec["plan_step_key"] == "AM:1"
+    assert rec["product_id"] == str(product_id)
+    assert rec["formulation_id"] == str(formulation_id)
+    assert rec["brand"] == f"Brand-{unique}"
+    assert rec["product_name"] == f"Product-{unique}"
+    assert rec["safety_status"] == "SAFE"
+    assert rec["reason_codes"] == ["FRAGRANCE_FREE"]
+    assert rec["rules_version"] == "1.0"
+    assert rec["verification_date"] is None
+    assert rec["rank_position"] == 1
+
+
 # Section 7: server-side image input limits, exercised through the
 # real HTTP path -- the mobile client is not a security boundary.
 

@@ -9,10 +9,12 @@ import { useProfileQuery } from "@/profile/queries";
 import { useTheme } from "@/theme/theme-provider";
 
 /**
- * Phase A home is intentionally simple (section 14): no facial
- * capture/analysis UI exists yet, and this screen never fakes a
- * result or seeds a placeholder recommendation into a real data path
- * -- it just says plainly what's coming.
+ * Home stays intentionally simple through Phase C1: an entry point
+ * into skin analysis plus account status, nothing else. Per this
+ * phase's own scope boundary, no subscription/paywall, progress
+ * charts, purchase UI, history, or notifications belong here yet
+ * (Phase C2/C3) -- this screen never fakes any of those or seeds a
+ * placeholder into a real data path.
  */
 export default function AppHome() {
   const theme = useTheme();
@@ -35,16 +37,11 @@ export default function AppHome() {
       <Card>
         <Text style={[theme.typography.subtitle, { color: theme.colors.foreground }]}>Skin analysis</Text>
         <Text style={[theme.typography.body, { color: theme.colors.muted }]}>
-          Get an image-derived estimate of your skin&apos;s appearance in a few minutes.
+          Take a photo to get an image-derived estimate of your skin&apos;s appearance, your top priorities,
+          measurements, and a suggested AM/PM routine -- with a compatible product match for each step when one is
+          available.
         </Text>
         <Button label="Start skin analysis" onPress={() => router.push("/(app)/analysis")} />
-      </Card>
-
-      <Card>
-        <Text style={[theme.typography.subtitle, { color: theme.colors.foreground }]}>Your routine</Text>
-        <Text style={[theme.typography.body, { color: theme.colors.muted }]}>
-          Your personalized routine will appear here once analysis is available.
-        </Text>
       </Card>
 
       <Button label="Settings" variant="secondary" onPress={() => router.push("/(app)/settings")} />
