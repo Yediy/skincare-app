@@ -30,6 +30,10 @@ import asyncpg
 
 from app.db import catalog_admin_repository as repo
 from app.db.catalog_repository import resolve_ingredient
+from app.domain.catalog_source_adapter import (
+    is_wave1_source_reference,
+    normalized_payload_has_sufficient_ingredient_evidence,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +47,21 @@ STRUCTURAL_MARKET_MISSING = "STRUCTURAL_MARKET_MISSING"
 STRUCTURAL_SOURCE_TYPE_INVALID = "STRUCTURAL_SOURCE_TYPE_INVALID"
 STRUCTURAL_PRODUCT_IDENTITY_AMBIGUOUS = "STRUCTURAL_PRODUCT_IDENTITY_AMBIGUOUS"
 STRUCTURAL_PROVENANCE_MISSING = "STRUCTURAL_PROVENANCE_MISSING"
+
+# Production Catalog Wave 1 publication-time backstop
+# (PRODUCTION_CATALOG_WAVE_1.md, independent-review Blocker 1). A Wave
+# 1 record (identified durably via `is_wave1_source_reference` against
+# its own `source_reference` -- never an in-memory flag) that fails
+# Wave 1's own sufficiency bar may never become PUBLISHED, full stop --
+# not merely excluded from product matching after the fact. This is a
+# DIRECT, load-bearing check inside `CatalogPublicationService.publish()`
+# itself, so it applies even to a caller that invokes this shared
+# service directly, bypassing every piece of Wave 1's own CLI/reporting
+# tooling. Legacy/non-Wave records (whose `source_reference` never
+# carries Wave 1's schema-version marker) are completely unaffected --
+# this pass does not change what the existing architecture already
+# intentionally permits for them.
+WAVE1_INSUFFICIENT_SOURCE_DATA = "WAVE1_INSUFFICIENT_SOURCE_DATA"
 
 _VALID_FORMULATION_SOURCE_TYPES = frozenset({
     "manufacturer_label", "manufacturer_disclosure", "regulatory_filing",
@@ -206,6 +225,28 @@ class CatalogPublicationService:
             )
 
         normalized = record["normalized_payload"]
+
+        # Production Catalog Wave 1 publication-time backstop
+        # (independent-review Blocker 1) -- checked BEFORE any brand/
+        # product/formulation creation, so a rejected attempt leaves
+        # no side effect at all (the whole transaction still rolls
+        # back regardless, via this method's own caller, but nothing
+        # here even attempts a write first). Only ever fires for a
+        # record this module can durably prove is Wave 1 evidence;
+        # every other record's publish() behavior is byte-for-byte
+        # unchanged from before this check existed.
+        if is_wave1_source_reference(normalized.get("source_reference")):
+            if not normalized_payload_has_sufficient_ingredient_evidence(normalized):
+                raise PublicationError(
+                    "Wave 1 record has insufficient source data (empty ingredient list, or ingredient_list_complete "
+                    "is not true) and may not be published -- see PRODUCTION_CATALOG_WAVE_1.md's publication "
+                    "safety gate",
+                    code=WAVE1_INSUFFICIENT_SOURCE_DATA,
+                    details={
+                        "ingredient_count": len(normalized.get("ingredients") or []),
+                        "ingredient_list_complete": normalized.get("ingredient_list_complete"),
+                    },
+                )
 
         # Step 2/3: resolve/create brand and product deterministically
         # (Section 10 -- exact normalized match only, never fuzzy).

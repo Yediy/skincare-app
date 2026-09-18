@@ -275,6 +275,54 @@ def manifest_record_has_sufficient_ingredient_evidence(record: SourceManifestRec
     return len(record.ingredient_list_raw) > 0 and record.ingredient_list_complete is True
 
 
+# The one durable marker that identifies a `catalog_import_records`
+# row (or the `NormalizedImportRecord.source_reference` it was built
+# from) as Wave 1 evidence, independent of any in-memory object --
+# present in every `source_reference` this module ever produces (see
+# `manifest_record_to_raw_import_dict`). Used by
+# `CatalogPublicationService` (independent-review Blocker 1,
+# PRODUCTION_CATALOG_WAVE_1.md) to apply Wave 1's stricter
+# publication-time sufficiency backstop WITHOUT that shared,
+# heavily-reviewed module needing to import anything from this one
+# beyond this single, narrow recognition function -- legacy/non-Wave
+# records (whose `source_reference` never contains this key) are
+# completely unaffected.
+WAVE1_SCHEMA_VERSION_KEY = "wave1_manifest_schema_version"
+
+
+def is_wave1_source_reference(source_reference: Optional[str]) -> bool:
+    """True only when `source_reference` is a JSON object carrying
+    Wave 1's own schema-version marker. Fails closed toward "not Wave
+    1" on anything unparseable/unexpected (`None`, a plain non-JSON
+    string, a JSON scalar/array) -- this function must never mistake a
+    legacy or hand-authored `source_reference` for Wave 1 evidence, so
+    every ambiguous case resolves to `False`, never `True`."""
+    if not source_reference:
+        return False
+    try:
+        parsed = json.loads(source_reference)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(parsed, dict) and WAVE1_SCHEMA_VERSION_KEY in parsed
+
+
+def normalized_payload_has_sufficient_ingredient_evidence(normalized_payload: Optional[Dict[str, Any]]) -> bool:
+    """The same rule `manifest_record_has_sufficient_ingredient_evidence`
+    applies to a `SourceManifestRecord`, re-derived here against
+    `NormalizedImportRecord`'s own field names (`ingredients`,
+    `ingredient_list_complete`) -- the shape `catalog_import_records.
+    normalized_payload` actually stores, and what
+    `CatalogPublicationService`'s own Wave 1 publication backstop reads
+    directly. One canonical predicate, reused by both
+    `app.domain.catalog_wave_report` (report-time classification) and
+    `app.domain.catalog_publication_service` (the actual publish-time
+    gate) -- never two independently-maintained copies of this rule."""
+    if not normalized_payload:
+        return False
+    ingredients = normalized_payload.get("ingredients") or []
+    return len(ingredients) > 0 and normalized_payload.get("ingredient_list_complete") is True
+
+
 def _build_sku(record: SourceManifestRecord) -> Dict[str, Any]:
     """Real UPC/GTIN/SKU wins if the source supplied any of them
     (preferring an explicit SKU, then UPC, then GTIN). Only when the
@@ -315,17 +363,73 @@ def group_key_for_record(record: SourceManifestRecord) -> tuple:
     )
 
 
+def _describe_trust_conflicts(group: List[SourceManifestRecord]) -> List[str]:
+    """Independent-review Blocker 2: grouping SKU/size variants must
+    never let manifest ORDER determine verification status, ingredient
+    evidence quality, completeness, or provenance. Before this check
+    existed, `manifest_record_to_raw_import_dict` took every trust-
+    critical field from `group[0]` alone -- `[A, B]` and `[B, A]` could
+    silently produce different (COMPLETE/manufacturer-grade vs.
+    incomplete/unverified) output for the exact same set of records.
+
+    This function requires every member of a group to agree EXACTLY on
+    every trust-critical formulation fact before they may be merged at
+    all -- `ingredient_list_raw` (content, not just its fingerprint:
+    two records both claiming the same explicit
+    `formulation_version_evidence` but disclosing DIFFERENT ingredient
+    lists must not merge either), `ingredient_list_complete`,
+    `ingredient_source`, and `formulation_version_evidence` itself
+    (category is checked separately, by the pre-existing
+    `CONFLICTING_PRODUCT_IDENTITY` path; jurisdiction/market is already
+    part of `group_key_for_record`, so it cannot differ within a group
+    by construction). Once every member agrees, WHICH member is treated
+    as representative is irrelevant -- they are identical on every
+    field this function checks -- so this is what makes downstream
+    representative-field selection safe regardless of input order.
+
+    Returns a list of human-readable conflict descriptions -- empty
+    means the group is safe to merge. This pass deliberately REJECTS a
+    conflicting group rather than inventing a reconciliation policy
+    (e.g. "prefer the more complete one") -- per this pass's own
+    brief, rejection/review is safer than guessing when semantics
+    aren't formally defined."""
+    if len(group) <= 1:
+        return []
+    conflicts = []
+    if len({tuple(r.ingredient_list_raw) for r in group}) > 1:
+        conflicts.append("ingredient_list_raw differs")
+    if len({r.ingredient_list_complete for r in group}) > 1:
+        conflicts.append("ingredient_list_complete differs")
+    if len({r.ingredient_source for r in group}) > 1:
+        conflicts.append("ingredient_source differs")
+    if len({r.formulation_version_evidence for r in group}) > 1:
+        conflicts.append("formulation_version_evidence differs")
+    return conflicts
+
+
 def group_manifest_records(
     records: List[SourceManifestRecord],
 ) -> tuple[List[List[SourceManifestRecord]], List[ManifestRecordIssue]]:
-    """Groups schema-valid records by `group_key_for_record`, preserving
-    first-seen order both across groups and within a group. A group
-    whose members disagree on `category` is a genuine identity conflict
-    (this pass's own "conflicting product identity" scenario) -- Wave 1
-    never guesses which is right; every member of such a group is
-    excluded and surfaced as a `CONFLICTING_PRODUCT_IDENTITY` issue
-    instead, exactly the "never convert uncertain identity resolution
-    into guessed catalog identity" rule this pass's brief states."""
+    """Groups schema-valid records by `group_key_for_record` -- a pure
+    set partition, so WHICH records land in the same group never
+    depends on input order. Two independent conflict checks then run
+    per group, neither of which may be resolved by picking a "winning"
+    record:
+
+    - Members disagreeing on `category` (a genuine identity conflict,
+      this pass's own "conflicting product identity" scenario) are
+      excluded and surfaced as `CONFLICTING_PRODUCT_IDENTITY` -- Wave 1
+      never guesses which category is right.
+    - Members disagreeing on any OTHER trust-critical formulation fact
+      (`_describe_trust_conflicts`, independent-review Blocker 2) are
+      excluded and surfaced as `CONFLICTING_FORMULATION_EVIDENCE`.
+
+    A group that passes both checks is safe to merge regardless of the
+    order its members were supplied in -- see
+    `manifest_record_to_raw_import_dict`, which additionally sorts a
+    clean group by `source_evidence_id` before building output, making
+    every field of the result (not just the trust-critical ones)
+    fully order-independent."""
     groups: Dict[tuple, List[SourceManifestRecord]] = {}
     order: List[tuple] = []
     for record in records:
@@ -339,6 +443,7 @@ def group_manifest_records(
     issues: List[ManifestRecordIssue] = []
     for key in order:
         group = groups[key]
+
         categories = {r.category for r in group}
         if len(categories) > 1:
             for r in group:
@@ -350,36 +455,91 @@ def group_manifest_records(
                     ),
                 ))
             continue
+
+        trust_conflicts = _describe_trust_conflicts(group)
+        if trust_conflicts:
+            for r in group:
+                issues.append(ManifestRecordIssue(
+                    index=-1, source_evidence_id=r.source_evidence_id, code="CONFLICTING_FORMULATION_EVIDENCE",
+                    detail=(
+                        f"records for {r.brand!r}/{r.product_name!r} share formulation-content identity but "
+                        f"disagree on trust-critical evidence: {'; '.join(trust_conflicts)}"
+                    ),
+                ))
+            continue
+
         clean_groups.append(group)
     return clean_groups, issues
 
 
-def manifest_record_to_raw_import_dict(group: List[SourceManifestRecord], *, registered_source_type: str) -> Dict[str, Any]:
+def _build_evidence_entry(record: SourceManifestRecord) -> Dict[str, Any]:
+    """One durable provenance entry per contributing manifest row --
+    independent-review Blocker 2's "preserve ALL merged provenance."
+    Every field a merged group's OTHER members carry (source URL,
+    product URL, retrieval timestamp, verification date, ingredient-
+    source declaration, source evidence id) is captured here, never
+    discarded in favor of only the representative member's own
+    values."""
+    return {
+        "source_evidence_id": record.source_evidence_id,
+        "source_name": record.source_name,
+        "source_url": record.source_url,
+        "product_url": record.product_url,
+        "retrieved_at": record.retrieved_at.isoformat(),
+        "verification_date": record.verification_date.isoformat(),
+        "ingredient_source": record.ingredient_source,
+    }
+
+
+def manifest_record_to_raw_import_dict(
+    group: List[SourceManifestRecord], *, registered_source_type: str, registered_source_name: str,
+) -> Dict[str, Any]:
     """The core field-mapping transform -- see this module's own
     docstring for the full contract. `group` is one or more manifest
     records sharing `group_key_for_record` (SKU/size variants of the
-    same formulation -- see `group_manifest_records`); the first
-    member is representative for every field except `skus`, which
-    merges every member's own SKU (deduplicated by SKU value, first
-    occurrence wins). Returns a dict containing ONLY the fields
-    `app.domain.catalog_normalization.NormalizedImportRecord` accepts
-    (that model is `extra="forbid"`, and this exact dict is what
-    becomes `catalog_import_records.raw_payload` verbatim -- see
-    `app.domain.catalog_ingestion_service._ingest_one_raw_record`), so
-    nothing here may add a field that model doesn't already declare.
+    same formulation -- see `group_manifest_records`), already proven
+    free of trust-critical conflicts (`_describe_trust_conflicts`) by
+    the time this function is called.
 
-    Raises `ManifestRecordError` (`SOURCE_TYPE_MISMATCH`) if any
-    member's own declared `source_type` doesn't match the
-    catalog_sources row it's actually being imported under -- a real,
-    load-bearing cross-check (see this module's docstring), not a
-    decorative field."""
-    record = group[0]
-    for member in group:
+    Independent-review Blocker 2, fully closed here:
+
+    - **Order-independence**: `group` is sorted by `source_evidence_id`
+      before anything else runs -- every field of the returned dict,
+      not merely the trust-critical ones, is therefore identical
+      regardless of the order `group_manifest_records` (or the
+      manifest itself) happened to supply members in.
+    - **Source-name binding**: every member's own declared
+      `source_name` must match the `catalog_sources` row this manifest
+      is actually being imported under (`registered_source_name`,
+      compared via the same `normalize_name()` every other identity
+      lookup in this codebase uses) -- `SOURCE_NAME_MISMATCH` otherwise,
+      never a silent import under the wrong source. Cross-checked
+      alongside the pre-existing `source_type` binding.
+    - **Full provenance preservation**: `source_reference` carries an
+      `evidence` array with one entry per contributing manifest row
+      (`_build_evidence_entry`) -- nothing beyond the representative
+      member's own identity/notes is ever discarded.
+
+    Returns a dict containing ONLY the fields `app.domain.
+    catalog_normalization.NormalizedImportRecord` accepts (that model
+    is `extra="forbid"`, and this exact dict is what becomes
+    `catalog_import_records.raw_payload` verbatim -- see
+    `app.domain.catalog_ingestion_service._ingest_one_raw_record`), so
+    nothing here may add a field that model doesn't already declare."""
+    ordered_group = sorted(group, key=lambda m: m.source_evidence_id)
+    record = ordered_group[0]
+    for member in ordered_group:
         if member.source_type != registered_source_type:
             raise ManifestRecordError(
                 f"manifest record declares source_type {member.source_type!r} but is being imported "
                 f"under a source registered as {registered_source_type!r}",
                 code="SOURCE_TYPE_MISMATCH", index=-1, source_evidence_id=member.source_evidence_id,
+            )
+        if normalize_name(member.source_name) != normalize_name(registered_source_name):
+            raise ManifestRecordError(
+                f"manifest record declares source_name {member.source_name!r} but is being imported "
+                f"under a source registered as {registered_source_name!r}",
+                code="SOURCE_NAME_MISMATCH", index=-1, source_evidence_id=member.source_evidence_id,
             )
 
     formulation_version = record.formulation_version_evidence or compute_ingredient_fingerprint(record.ingredient_list_raw)
@@ -387,15 +547,8 @@ def manifest_record_to_raw_import_dict(group: List[SourceManifestRecord], *, reg
 
     provenance = {
         "wave1_manifest_schema_version": 1,
-        "source_name": record.source_name,
-        "source_url": record.source_url,
-        "product_url": record.product_url,
-        "retrieved_at": record.retrieved_at.isoformat(),
-        "verification_date": record.verification_date.isoformat(),
-        "ingredient_source": record.ingredient_source,
         "jurisdiction": record.jurisdiction,
-        "source_evidence_id": record.source_evidence_id,
-        "merged_evidence_ids": [m.source_evidence_id for m in group[1:]] or None,
+        "evidence": [_build_evidence_entry(m) for m in ordered_group],
     }
     source_reference = json.dumps(provenance, sort_keys=True)
     if len(source_reference) > MAX_LONG_STRING:
@@ -411,7 +564,7 @@ def manifest_record_to_raw_import_dict(group: List[SourceManifestRecord], *, reg
 
     skus: List[Dict[str, Any]] = []
     seen_skus = set()
-    for member in group:
+    for member in ordered_group:
         sku = _build_sku(member)
         if sku["sku"] in seen_skus:
             continue

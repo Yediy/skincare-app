@@ -54,7 +54,7 @@ def _write_jsonl(tmp_path: Path, records, name="manifest.jsonl") -> Path:
 @pytest.fixture
 async def source_id(catalog_admin_db_pool, clean_catalog_ingestion):
     from app.db import catalog_admin_repository as repo
-    source = await repo.create_source(catalog_admin_db_pool, name="wave1_cli_test_source", source_type="curated_dataset")
+    source = await repo.create_source(catalog_admin_db_pool, name="Wave1 CLI Test Source", source_type="curated_dataset")
     return str(source["id"])
 
 

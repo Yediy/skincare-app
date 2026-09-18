@@ -215,7 +215,9 @@ async def import_manifest(
     raw_dicts: List[Dict[str, Any]] = []
     for group in groups:
         try:
-            raw_dicts.append(manifest_record_to_raw_import_dict(group, registered_source_type=source["source_type"]))
+            raw_dicts.append(manifest_record_to_raw_import_dict(
+                group, registered_source_type=source["source_type"], registered_source_name=source["name"],
+            ))
         except ManifestRecordError as e:
             manifest_issues.append({
                 "index": e.index, "source_evidence_id": e.source_evidence_id, "code": e.code, "detail": str(e),
@@ -235,7 +237,7 @@ async def import_manifest(
         source_id=source_id, file_bytes=file_bytes_for_pipeline, file_format="jsonl", dry_run=dry_run,
     )
 
-    if not dry_run and import_outcome.batch_id is not None:
+    if not dry_run and import_outcome.batch_id is not None and import_outcome.batch_is_new:
         # Durable record of the manifest's OWN total record count
         # (including records that failed Wave 1's own schema/grouping
         # checks and never reached import_file() at all) -- the one
@@ -247,6 +249,15 @@ async def import_manifest(
         # structured summary, never load-bearing for correctness"
         # posture every other write_audit() call in this codebase
         # already has).
+        #
+        # Independent-review Blocker 3: gated on `batch_is_new` --
+        # writing this on EVERY call (including a byte-identical,
+        # idempotent reimport that reuses the same existing batch)
+        # accumulated a second audit entry for that batch, which
+        # catalog_wave_report.py's own reader would then double-count.
+        # A reused batch already got its one true audit entry the
+        # first time it was genuinely imported; nothing new happened
+        # this time, so nothing new is written.
         async with pool.acquire() as conn:
             async with conn.transaction():
                 await repo.write_audit(

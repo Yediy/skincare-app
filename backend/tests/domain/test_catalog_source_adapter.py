@@ -1,7 +1,14 @@
 """app.domain.catalog_source_adapter -- the Wave 1 CatalogSourceAdapter
 boundary. Pure, in-memory -- no database access anywhere in this file
 (PRODUCTION_CATALOG_WAVE_1.md's own "source manifest" and "source
-architecture" sections)."""
+architecture" sections).
+
+Includes independent-review-Blocker-2 regression coverage: grouping
+must never let manifest ORDER determine verification status, ingredient
+evidence quality, completeness, or provenance, source-name must be
+bound to the registered catalog_sources row, and every contributing
+manifest row's provenance must be reconstructible after a merge.
+"""
 import json
 
 import pytest
@@ -10,20 +17,25 @@ from pydantic import ValidationError
 from app.domain.catalog_normalization import normalize_record
 from app.domain.catalog_source_adapter import (
     CuratedManifestSourceAdapter,
+    ManifestRecordError,
     SourceManifestRecord,
     compute_ingredient_fingerprint,
     group_key_for_record,
     group_manifest_records,
     is_reserved_test_source_name,
+    is_wave1_source_reference,
     manifest_record_has_sufficient_ingredient_evidence,
     manifest_record_to_raw_import_dict,
+    normalized_payload_has_sufficient_ingredient_evidence,
 )
+
+REGISTERED_SOURCE_NAME = "Unit Test Source"
 
 
 def _manifest_record(evidence_id="ev-1", **overrides):
     base = {
         "source_evidence_id": evidence_id,
-        "source_name": "Unit Test Source",
+        "source_name": REGISTERED_SOURCE_NAME,
         "source_type": "curated_dataset",
         "source_url": "https://example.invalid/source",
         "retrieved_at": "2026-09-17T00:00:00Z",
@@ -42,6 +54,12 @@ def _manifest_record(evidence_id="ev-1", **overrides):
     }
     base.update(overrides)
     return base
+
+
+def _to_raw(group, **overrides):
+    kwargs = {"registered_source_type": "curated_dataset", "registered_source_name": REGISTERED_SOURCE_NAME}
+    kwargs.update(overrides)
+    return manifest_record_to_raw_import_dict(group, **kwargs)
 
 
 def _jsonl(records):
@@ -110,7 +128,7 @@ def test_ingredient_order_is_preserved_exactly():
     record = SourceManifestRecord.model_validate(
         _manifest_record(ingredient_list_raw=["Zinc Oxide", "Water", "Niacinamide", "Glycerin"])
     )
-    raw = manifest_record_to_raw_import_dict([record], registered_source_type="curated_dataset")
+    raw = _to_raw([record])
     names_in_order = [i["raw_name"] for i in raw["ingredients"]]
     assert names_in_order == ["Zinc Oxide", "Water", "Niacinamide", "Glycerin"]
     positions = [i["position"] for i in raw["ingredients"]]
@@ -144,26 +162,50 @@ def test_fingerprint_is_deterministic_and_order_and_case_sensitive_appropriately
 
 def test_explicit_formulation_version_evidence_wins_over_fingerprint():
     record = SourceManifestRecord.model_validate(_manifest_record(formulation_version_evidence="v2-2026"))
-    raw = manifest_record_to_raw_import_dict([record], registered_source_type="curated_dataset")
+    raw = _to_raw([record])
     assert raw["formulation_version"] == "v2-2026"
 
 
 def test_missing_version_evidence_uses_fingerprint():
     record = SourceManifestRecord.model_validate(_manifest_record(formulation_version_evidence=None))
-    raw = manifest_record_to_raw_import_dict([record], registered_source_type="curated_dataset")
+    raw = _to_raw([record])
     assert raw["formulation_version"] == compute_ingredient_fingerprint(record.ingredient_list_raw)
 
 
 # ---------------------------------------------------------------------------
-# Source-type cross-check
+# Source-type / source-name binding (independent-review Blocker 2A)
 # ---------------------------------------------------------------------------
 
 
 def test_source_type_mismatch_is_rejected():
     record = SourceManifestRecord.model_validate(_manifest_record(source_type="curated_dataset"))
     with pytest.raises(Exception) as exc_info:
-        manifest_record_to_raw_import_dict([record], registered_source_type="manufacturer_disclosure")
+        _to_raw([record], registered_source_type="manufacturer_disclosure")
     assert getattr(exc_info.value, "code", None) == "SOURCE_TYPE_MISMATCH"
+
+
+def test_source_name_mismatch_is_rejected():
+    record = SourceManifestRecord.model_validate(_manifest_record(source_name="Some Other Source"))
+    with pytest.raises(ManifestRecordError) as exc_info:
+        _to_raw([record])
+    assert exc_info.value.code == "SOURCE_NAME_MISMATCH"
+
+
+def test_source_name_binding_uses_normalized_comparison():
+    """Same normalize_name() rule every other catalog identity lookup
+    uses -- case/whitespace differences are not a mismatch."""
+    record = SourceManifestRecord.model_validate(_manifest_record(source_name="  unit   TEST source  "))
+    raw = _to_raw([record])  # does not raise
+    assert raw is not None
+
+
+def test_source_name_mismatch_does_not_import_under_the_wrong_source():
+    """The record is rejected outright -- there is no code path by
+    which it could be silently imported under the selected source_id
+    anyway."""
+    record = SourceManifestRecord.model_validate(_manifest_record(source_name="Totally Different Vendor"))
+    with pytest.raises(ManifestRecordError):
+        _to_raw([record], registered_source_name="Unit Test Source")
 
 
 # ---------------------------------------------------------------------------
@@ -173,14 +215,14 @@ def test_source_type_mismatch_is_rejected():
 
 def test_sku_is_synthesized_when_source_supplies_none():
     record = SourceManifestRecord.model_validate(_manifest_record(sku=None, upc=None, gtin=None))
-    raw = manifest_record_to_raw_import_dict([record], registered_source_type="curated_dataset")
+    raw = _to_raw([record])
     assert raw["skus"][0]["sku"].startswith("WAVE1-")
     assert record.source_evidence_id in raw["skus"][0]["sku"]
 
 
 def test_real_sku_is_used_when_provided():
     record = SourceManifestRecord.model_validate(_manifest_record(sku="REAL-BARCODE-123"))
-    raw = manifest_record_to_raw_import_dict([record], registered_source_type="curated_dataset")
+    raw = _to_raw([record])
     assert raw["skus"][0]["sku"] == "REAL-BARCODE-123"
 
 
@@ -208,6 +250,39 @@ def test_complete_nonempty_ingredient_list_is_sufficient():
     assert manifest_record_has_sufficient_ingredient_evidence(record) is True
 
 
+def test_normalized_payload_predicate_matches_manifest_predicate():
+    """One canonical rule, two shapes -- `normalized_payload_has_
+    sufficient_ingredient_evidence` (the `NormalizedImportRecord`/
+    `catalog_import_records.normalized_payload` shape,
+    `CatalogPublicationService`'s own publication backstop reads this
+    one directly) must agree with `manifest_record_has_sufficient_
+    ingredient_evidence` (the manifest shape) for equivalent data."""
+    assert normalized_payload_has_sufficient_ingredient_evidence(
+        {"ingredients": [{"raw_name": "Water"}], "ingredient_list_complete": True}
+    ) is True
+    assert normalized_payload_has_sufficient_ingredient_evidence(
+        {"ingredients": [], "ingredient_list_complete": False}
+    ) is False
+    assert normalized_payload_has_sufficient_ingredient_evidence(None) is False
+    assert normalized_payload_has_sufficient_ingredient_evidence({}) is False
+
+
+# ---------------------------------------------------------------------------
+# Wave 1 record recognition (publication backstop basis)
+# ---------------------------------------------------------------------------
+
+
+def test_mapped_raw_dict_is_recognized_as_wave1():
+    record = SourceManifestRecord.model_validate(_manifest_record())
+    raw = _to_raw([record])
+    assert is_wave1_source_reference(raw["source_reference"]) is True
+
+
+@pytest.mark.parametrize("value", [None, "", "plain text, not json", "42", "[1, 2, 3]", '{"no_marker": true}'])
+def test_non_wave1_source_references_are_not_recognized(value):
+    assert is_wave1_source_reference(value) is False
+
+
 # ---------------------------------------------------------------------------
 # Grouping / merge (duplicate product from same source, conflicting identity)
 # ---------------------------------------------------------------------------
@@ -227,8 +302,8 @@ def test_grouped_records_merge_into_one_raw_dict_with_both_skus():
     a = SourceManifestRecord.model_validate(_manifest_record("v1", sku="SIZE-30ML"))
     b = SourceManifestRecord.model_validate(_manifest_record("v2", sku="SIZE-50ML"))
     groups, _ = group_manifest_records([a, b])
-    raw = manifest_record_to_raw_import_dict(groups[0], registered_source_type="curated_dataset")
-    assert raw["external_record_id"] == "v1"
+    raw = _to_raw(groups[0])
+    assert raw["external_record_id"] == "v1"  # lexicographically smallest source_evidence_id
     sku_values = sorted(s["sku"] for s in raw["skus"])
     assert sku_values == ["SIZE-30ML", "SIZE-50ML"]
     normalize_record(raw)  # still passes the real, unmodified contract
@@ -252,6 +327,126 @@ def test_conflicting_category_for_same_formulation_is_flagged_not_guessed():
 
 
 # ---------------------------------------------------------------------------
+# Independent-review Blocker 2: order-independent grouping,
+# trust-critical-evidence conflict detection, full provenance
+# preservation
+# ---------------------------------------------------------------------------
+
+
+def test_reversing_grouped_record_order_produces_identical_output():
+    a = SourceManifestRecord.model_validate(_manifest_record("v1", sku="SIZE-30ML", source_url="https://example.invalid/a"))
+    b = SourceManifestRecord.model_validate(_manifest_record("v2", sku="SIZE-50ML", source_url="https://example.invalid/b"))
+
+    groups_forward, issues_forward = group_manifest_records([a, b])
+    groups_reversed, issues_reversed = group_manifest_records([b, a])
+    assert issues_forward == issues_reversed == []
+
+    raw_forward = _to_raw(groups_forward[0])
+    raw_reversed = _to_raw(groups_reversed[0])
+    assert raw_forward == raw_reversed
+
+
+def test_complete_vs_incomplete_evidence_cannot_be_first_record_wins():
+    complete = SourceManifestRecord.model_validate(
+        _manifest_record("v1", sku="SIZE-30ML", ingredient_list_complete=True)
+    )
+    incomplete = SourceManifestRecord.model_validate(
+        _manifest_record("v2", sku="SIZE-50ML", ingredient_list_complete=False)
+    )
+
+    groups_forward, issues_forward = group_manifest_records([complete, incomplete])
+    groups_reversed, issues_reversed = group_manifest_records([incomplete, complete])
+
+    # Neither order may merge -- not "complete wins" and not
+    # "incomplete wins," a real conflict either way.
+    assert groups_forward == groups_reversed == []
+    codes_forward = {i.code for i in issues_forward}
+    codes_reversed = {i.code for i in issues_reversed}
+    assert codes_forward == codes_reversed == {"CONFLICTING_FORMULATION_EVIDENCE"}
+
+
+def test_manufacturer_vs_unverified_ingredient_source_cannot_be_first_record_wins():
+    manufacturer = SourceManifestRecord.model_validate(
+        _manifest_record("v1", sku="SIZE-30ML", ingredient_source="manufacturer_label_text")
+    )
+    unverified = SourceManifestRecord.model_validate(
+        _manifest_record("v2", sku="SIZE-50ML", ingredient_source="unverified")
+    )
+
+    groups_forward, issues_forward = group_manifest_records([manufacturer, unverified])
+    groups_reversed, issues_reversed = group_manifest_records([unverified, manufacturer])
+
+    assert groups_forward == groups_reversed == []
+    codes_forward = {i.code for i in issues_forward}
+    codes_reversed = {i.code for i in issues_reversed}
+    assert codes_forward == codes_reversed == {"CONFLICTING_FORMULATION_EVIDENCE"}
+
+
+def test_conflicting_formulation_version_evidence_is_rejected():
+    """Two records both claiming the SAME explicit
+    formulation_version_evidence (so they share a group key) but
+    disclosing genuinely DIFFERENT ingredient content must not merge
+    with one silently winning -- this is exactly the gap that would
+    otherwise let group[0]-wins logic discard a real content
+    discrepancy."""
+    a = SourceManifestRecord.model_validate(
+        _manifest_record("v1", formulation_version_evidence="v2", ingredient_list_raw=["Water", "Glycerin"])
+    )
+    b = SourceManifestRecord.model_validate(
+        _manifest_record("v2", formulation_version_evidence="v2", ingredient_list_raw=["Water", "Niacinamide"])
+    )
+    assert group_key_for_record(a) == group_key_for_record(b)  # same explicit version -> same group key
+    groups, issues = group_manifest_records([a, b])
+    assert groups == []
+    assert all(i.code == "CONFLICTING_FORMULATION_EVIDENCE" for i in issues)
+
+
+def test_every_merged_evidence_record_is_reconstructible_from_persisted_provenance():
+    a = SourceManifestRecord.model_validate(_manifest_record(
+        "eva-1", sku="SIZE-30ML", source_url="https://example.invalid/a", product_url="https://example.invalid/pa",
+        retrieved_at="2026-09-10T00:00:00Z", verification_date="2026-09-10",
+    ))
+    b = SourceManifestRecord.model_validate(_manifest_record(
+        "eva-2", sku="SIZE-50ML", source_url="https://example.invalid/b", product_url="https://example.invalid/pb",
+        retrieved_at="2026-09-12T00:00:00Z", verification_date="2026-09-12",
+    ))
+    groups, issues = group_manifest_records([a, b])
+    assert issues == []
+    raw = _to_raw(groups[0])
+    provenance = json.loads(raw["source_reference"])
+    evidence_by_id = {e["source_evidence_id"]: e for e in provenance["evidence"]}
+    assert set(evidence_by_id) == {"eva-1", "eva-2"}
+    assert evidence_by_id["eva-1"]["source_url"] == "https://example.invalid/a"
+    assert evidence_by_id["eva-1"]["product_url"] == "https://example.invalid/pa"
+    assert evidence_by_id["eva-1"]["verification_date"] == "2026-09-10"
+    assert evidence_by_id["eva-2"]["source_url"] == "https://example.invalid/b"
+    assert evidence_by_id["eva-2"]["product_url"] == "https://example.invalid/pb"
+    assert evidence_by_id["eva-2"]["verification_date"] == "2026-09-12"
+
+
+def test_single_record_group_still_produces_evidence_array_of_one():
+    record = SourceManifestRecord.model_validate(_manifest_record("solo-1"))
+    raw = _to_raw([record])
+    provenance = json.loads(raw["source_reference"])
+    assert len(provenance["evidence"]) == 1
+    assert provenance["evidence"][0]["source_evidence_id"] == "solo-1"
+
+
+def test_provenance_too_large_still_fails_closed_with_evidence_array():
+    huge_notes_irrelevant_but_many_members = [
+        SourceManifestRecord.model_validate(_manifest_record(
+            f"bulk-{i}", sku=f"SKU-{i}",
+            source_url="https://example.invalid/" + ("x" * 200),
+            product_url="https://example.invalid/" + ("y" * 200),
+        ))
+        for i in range(20)
+    ]
+    with pytest.raises(ManifestRecordError) as exc_info:
+        _to_raw(huge_notes_irrelevant_but_many_members)
+    assert exc_info.value.code == "PROVENANCE_TOO_LARGE"
+
+
+# ---------------------------------------------------------------------------
 # Reserved test-source-name guard
 # ---------------------------------------------------------------------------
 
@@ -267,18 +462,18 @@ def test_non_reserved_names_pass(name):
 
 
 # ---------------------------------------------------------------------------
-# Provenance / no-PII-in-key style checks on the mapped payload
+# Provenance completeness on the mapped payload
 # ---------------------------------------------------------------------------
 
 
 def test_source_reference_is_valid_json_carrying_full_provenance():
     record = SourceManifestRecord.model_validate(_manifest_record())
-    raw = manifest_record_to_raw_import_dict([record], registered_source_type="curated_dataset")
+    raw = _to_raw([record])
     provenance = json.loads(raw["source_reference"])
-    assert provenance["source_name"] == "Unit Test Source"
-    assert provenance["source_url"] == "https://example.invalid/source"
-    assert provenance["source_evidence_id"] == record.source_evidence_id
-    assert provenance["verification_date"] == "2026-09-17"
+    assert provenance["evidence"][0]["source_name"] == REGISTERED_SOURCE_NAME
+    assert provenance["evidence"][0]["source_url"] == "https://example.invalid/source"
+    assert provenance["evidence"][0]["source_evidence_id"] == record.source_evidence_id
+    assert provenance["evidence"][0]["verification_date"] == "2026-09-17"
 
 
 def test_raw_import_dict_never_contains_a_field_normalized_import_record_does_not_declare():
@@ -287,5 +482,5 @@ def test_raw_import_dict_never_contains_a_field_normalized_import_record_does_no
     single Wave 1 record -- this is the sharpest possible test of the
     field-mapping contract."""
     record = SourceManifestRecord.model_validate(_manifest_record())
-    raw = manifest_record_to_raw_import_dict([record], registered_source_type="curated_dataset")
+    raw = _to_raw([record])
     normalize_record(raw)  # raises MalformedRecordError if this contract is ever violated

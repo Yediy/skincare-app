@@ -1,6 +1,11 @@
 """app.domain.catalog_wave_report -- Production Catalog Wave 1's
 deterministic reporting. Real Postgres, through catalog_admin_db_pool,
-same convention as every other catalog-ingestion test."""
+same convention as every other catalog-ingestion test.
+
+Includes independent-review-Blocker-3 regression coverage: a
+byte-identical idempotent reimport must never inflate
+`total_records_supplied`.
+"""
 import json
 
 import pytest
@@ -19,11 +24,13 @@ from app.domain.catalog_wave_report import (
 )
 from app.domain.catalog_wave_service import import_manifest
 
+REGISTERED_SOURCE_NAME = "Wave Report Test Source"
+
 
 def _manifest_record(evidence_id="ev-1", **overrides):
     base = {
         "source_evidence_id": evidence_id,
-        "source_name": "Wave Report Test Source",
+        "source_name": REGISTERED_SOURCE_NAME,
         "source_type": "curated_dataset",
         "source_url": None,
         "retrieved_at": "2026-09-17T00:00:00Z",
@@ -51,7 +58,7 @@ def _jsonl(records):
 @pytest.fixture
 async def source_id(catalog_admin_db_pool, clean_catalog_ingestion):
     from app.db import catalog_admin_repository as repo
-    source = await repo.create_source(catalog_admin_db_pool, name="wave_report_test_source", source_type="curated_dataset")
+    source = await repo.create_source(catalog_admin_db_pool, name=REGISTERED_SOURCE_NAME, source_type="curated_dataset")
     return source["id"]
 
 
@@ -237,3 +244,72 @@ async def test_list_verification_status_reflects_each_record_independently(
     by_id = {s.external_record_id: s.state for s in statuses}
     assert by_id["vs-1"] == VERIFIED
     assert by_id["vs-2"] == INSUFFICIENT_SOURCE_DATA
+
+
+# ---------------------------------------------------------------------------
+# Independent-review Blocker 3: idempotent reimport must not inflate
+# total_records_supplied
+# ---------------------------------------------------------------------------
+
+
+async def test_idempotent_reimport_does_not_inflate_total_records_supplied(source_id, catalog_admin_db_pool):
+    body = _jsonl([_manifest_record("idem-1"), _manifest_record("idem-2")])
+
+    first = await import_manifest(catalog_admin_db_pool, source_id=source_id, file_bytes=body, allow_test_source=True)
+    report_first = await compute_wave_report(catalog_admin_db_pool, source_id=source_id)
+    assert report_first.total_records_supplied == 2
+    assert report_first.imported == 2
+
+    second = await import_manifest(catalog_admin_db_pool, source_id=source_id, file_bytes=body, allow_test_source=True)
+    assert second.import_outcome.batch_is_new is False
+    assert second.import_outcome.batch_id == first.import_outcome.batch_id
+
+    report_second = await compute_wave_report(catalog_admin_db_pool, source_id=source_id)
+    assert report_second.total_records_supplied == 2
+    assert report_second.imported == 2
+
+    # A third, also byte-identical, reimport -- still no inflation.
+    third = await import_manifest(catalog_admin_db_pool, source_id=source_id, file_bytes=body, allow_test_source=True)
+    assert third.import_outcome.batch_is_new is False
+    report_third = await compute_wave_report(catalog_admin_db_pool, source_id=source_id)
+    assert report_third.total_records_supplied == 2
+    assert report_third.imported == 2
+
+    # Exactly two import records exist -- the reimports created none.
+    assert await catalog_admin_db_pool.fetchval("SELECT count(*) FROM catalog_import_records") == 2
+
+    # Audit history is append-only -- never deleted -- but only ONE
+    # wave1-manifest-summary entry exists for this (single, reused)
+    # batch, matching import_manifest()'s own batch_is_new gate.
+    audit_rows = await catalog_admin_db_pool.fetch(
+        "SELECT after_metadata FROM catalog_audit_log WHERE entity_id = $1 AND action = 'IMPORT'",
+        first.import_outcome.batch_id,
+    )
+    wave1_entries = 0
+    for row in audit_rows:
+        meta = row["after_metadata"]
+        if isinstance(meta, str):
+            meta = json.loads(meta)
+        if meta and meta.get("wave1_manifest"):
+            wave1_entries += 1
+    assert wave1_entries == 1
+
+
+async def test_multiple_genuinely_distinct_batches_still_sum_correctly(source_id, catalog_admin_db_pool):
+    batch_one = _jsonl([_manifest_record("multi-a1"), _manifest_record("multi-a2")])
+    batch_two = _jsonl([_manifest_record("multi-b1"), _manifest_record("multi-b2"), _manifest_record("multi-b3")])
+
+    await import_manifest(catalog_admin_db_pool, source_id=source_id, file_bytes=batch_one, allow_test_source=True)
+    await import_manifest(catalog_admin_db_pool, source_id=source_id, file_bytes=batch_two, allow_test_source=True)
+
+    report = await compute_wave_report(catalog_admin_db_pool, source_id=source_id)
+    assert report.total_records_supplied == 5
+    assert report.imported == 5
+
+    # Reimporting the FIRST batch again (idempotent) must not add to
+    # the total the second, genuinely distinct batch already
+    # contributed.
+    await import_manifest(catalog_admin_db_pool, source_id=source_id, file_bytes=batch_one, allow_test_source=True)
+    report_after_reimport = await compute_wave_report(catalog_admin_db_pool, source_id=source_id)
+    assert report_after_reimport.total_records_supplied == 5
+    assert report_after_reimport.imported == 5

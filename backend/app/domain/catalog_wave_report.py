@@ -23,6 +23,7 @@ state, never a parallel bookkeeping mechanism. See
 `classify_import_record_state()`'s own docstring for the exact
 precedence rules.
 """
+import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 from uuid import UUID
@@ -30,6 +31,7 @@ from uuid import UUID
 import asyncpg
 
 from app.db import catalog_wave_repository as wave_repo
+from app.domain.catalog_source_adapter import normalized_payload_has_sufficient_ingredient_evidence
 
 VERIFIED = "VERIFIED"
 REVIEW_REQUIRED = "REVIEW_REQUIRED"
@@ -40,22 +42,6 @@ PUBLISHED = "PUBLISHED"
 PENDING = "PENDING"
 
 _PENDING_STATUSES = frozenset({"RECEIVED", "NORMALIZING", "NORMALIZED"})
-
-
-def normalized_payload_has_sufficient_ingredient_evidence(normalized_payload: Optional[Dict[str, Any]]) -> bool:
-    """The same predicate `app.domain.catalog_source_adapter.
-    manifest_record_has_sufficient_ingredient_evidence` applies before
-    import, re-applied here against whatever actually landed in
-    `catalog_import_records.normalized_payload` -- one canonical rule,
-    checked at two different times, never two independently-maintained
-    copies of it. `normalized_payload` uses `NormalizedImportRecord`'s
-    own field names (`ingredients`, `ingredient_list_complete`), not
-    the Wave 1 manifest's own names -- this function operates on the
-    pipeline's shape, not the manifest's."""
-    if not normalized_payload:
-        return False
-    ingredients = normalized_payload.get("ingredients") or []
-    return len(ingredients) > 0 and normalized_payload.get("ingredient_list_complete") is True
 
 
 def classify_import_record_state(record: Dict[str, Any]) -> str:
@@ -146,27 +132,37 @@ class WaveReport:
 async def _total_records_supplied_for_source(pool: asyncpg.Pool, source_id: UUID, imported_count: int) -> int:
     """Reconstructed from the Wave 1 manifest-level audit entries
     `catalog_wave_service.import_manifest()` writes for every non-dry-
-    run import (`catalog_audit_log`, action='IMPORT', metadata carrying
-    `wave1_manifest_total_records`) -- the one place a manifest's own
-    total record count (including records that failed Wave 1's own
-    schema/grouping checks and never became a `catalog_import_records`
-    row at all) is durably recorded. Falls back to `imported_count`
-    (a safe lower bound) if no such audit entry exists for this source
-    yet -- e.g. every import attempt so far was `dry_run` (writes
-    nothing, by design) or every manifest record failed Wave 1's own
-    checks before any batch was ever created (see
-    `import_manifest()`'s own docstring for this narrow, documented
-    edge case)."""
+    run, genuinely-new-batch import (`catalog_audit_log`,
+    action='IMPORT', metadata carrying `wave1_manifest_total_records`)
+    -- the one place a manifest's own total record count (including
+    records that failed Wave 1's own schema/grouping checks and never
+    became a `catalog_import_records` row at all) is durably recorded.
+    Falls back to `imported_count` (a safe lower bound) if no such
+    audit entry exists for this source yet.
+
+    Independent-review Blocker 3: a byte-identical, idempotent
+    reimport of the same manifest reuses the SAME batch
+    (`catalog_import_batches.content_sha256` unique constraint) but
+    could previously still accumulate a second Wave 1 audit entry for
+    it, double-counting this total. `import_manifest()` itself now
+    only writes this audit entry when the batch is genuinely new
+    (defense layer 1) -- this function additionally deduplicates by
+    `batch_id` here (defense layer 2, `seen_batches`), keeping only the
+    EARLIEST matching audit entry per batch, so even a duplicate entry
+    left over from before that fix (or any other future source of
+    duplication) can never inflate the total. Audit history itself is
+    never deleted or modified -- this is a read-time dedup, not a
+    mutation."""
     rows = await pool.fetch(
         """
-        SELECT a.after_metadata
+        SELECT a.entity_id AS batch_id, a.after_metadata
         FROM catalog_audit_log a
         JOIN catalog_import_batches b ON b.id = a.entity_id
         WHERE b.source_id = $1 AND a.action = 'IMPORT' AND a.entity_type = 'catalog_import_batch'
+        ORDER BY a.created_at
         """,
         source_id,
     )
-    import json
     total = 0
     seen_batches = set()
     for row in rows:
@@ -175,6 +171,10 @@ async def _total_records_supplied_for_source(pool: asyncpg.Pool, source_id: UUID
             meta = json.loads(meta)
         if not meta or not meta.get("wave1_manifest") or "wave1_manifest_total_records" not in meta:
             continue
+        batch_id = row["batch_id"]
+        if batch_id in seen_batches:
+            continue
+        seen_batches.add(batch_id)
         total += meta["wave1_manifest_total_records"]
     return max(total, imported_count)
 

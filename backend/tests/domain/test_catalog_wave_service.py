@@ -6,21 +6,34 @@ through anything but the EXISTING, unmodified
 CatalogPublicationService -- these tests prove Wave 1 feeds it real
 data correctly, not that publication itself works (that's already
 covered by tests/domain/test_catalog_publication_service.py, re-run
-unmodified as part of this pass's own validation)."""
+unmodified as part of this pass's own validation).
+
+Includes independent-review-Blocker-1 regression coverage: a Wave 1
+record with insufficient source data must be rejected DIRECTLY by
+CatalogPublicationService.publish() itself, not merely excluded from
+product matching after the fact.
+"""
 import json
 
 import pytest
 
+from app.db.catalog_repository import list_current_active_formulations_by_category
 from app.domain.catalog_ingestion_service import CatalogIngestionService
-from app.domain.catalog_publication_service import CatalogPublicationService, PublicationError
+from app.domain.catalog_publication_service import (
+    WAVE1_INSUFFICIENT_SOURCE_DATA,
+    CatalogPublicationService,
+    PublicationError,
+)
 from app.domain.catalog_wave_report import classify_import_record_state, compute_wave_report
-from app.domain.catalog_wave_service import WaveManifestRejectedError, import_manifest, validate_manifest_bytes
+from app.domain.catalog_wave_service import WaveManifestRejectedError, import_manifest
+
+REGISTERED_SOURCE_NAME = "Wave Service Test Source"
 
 
 def _manifest_record(evidence_id="ev-1", **overrides):
     base = {
         "source_evidence_id": evidence_id,
-        "source_name": "Wave Service Test Source",
+        "source_name": REGISTERED_SOURCE_NAME,
         "source_type": "curated_dataset",
         "source_url": "https://example.invalid/source",
         "retrieved_at": "2026-09-17T00:00:00Z",
@@ -48,7 +61,7 @@ def _jsonl(records):
 @pytest.fixture
 async def source_id(catalog_admin_db_pool, clean_catalog_ingestion):
     from app.db import catalog_admin_repository as repo
-    source = await repo.create_source(catalog_admin_db_pool, name="wave_prod_test_source", source_type="curated_dataset")
+    source = await repo.create_source(catalog_admin_db_pool, name=REGISTERED_SOURCE_NAME, source_type="curated_dataset")
     return source["id"]
 
 
@@ -136,6 +149,29 @@ async def test_duplicate_product_from_same_source_merges_sku_variants(
     assert sorted(s["sku"] for s in skus) == ["SIZE-30ML", "SIZE-50ML"]
 
 
+async def test_duplicate_product_merge_is_order_independent_end_to_end(
+    source_id, catalog_admin_db_pool, seeded_ingredients,
+):
+    """Independent-review Blocker 2, exercised through the full
+    import_manifest() path (not just the pure adapter function):
+    reversing the two variant records' order in the manifest file must
+    produce an identical outcome."""
+    variant_a = _manifest_record("ord-a", product_name="Order Independent Cleanser", sku="ORD-30ML")
+    variant_b = _manifest_record("ord-b", product_name="Order Independent Cleanser", sku="ORD-50ML")
+
+    forward = await import_manifest(
+        catalog_admin_db_pool, source_id=source_id, file_bytes=_jsonl([variant_a, variant_b]), allow_test_source=True, dry_run=True,
+    )
+    reversed_outcome = await import_manifest(
+        catalog_admin_db_pool, source_id=source_id, file_bytes=_jsonl([variant_b, variant_a]), allow_test_source=True, dry_run=True,
+    )
+    assert forward.manifest_issues == reversed_outcome.manifest_issues == []
+    assert forward.import_outcome.records_total == reversed_outcome.import_outcome.records_total == 1
+    forward_statuses = [r.status for r in forward.import_outcome.records]
+    reversed_statuses = [r.status for r in reversed_outcome.import_outcome.records]
+    assert forward_statuses == reversed_statuses == ["NORMALIZED"]
+
+
 # ---------------------------------------------------------------------------
 # Same product from two sources
 # ---------------------------------------------------------------------------
@@ -146,10 +182,12 @@ async def test_same_product_from_two_sources_second_publish_sees_existing_curren
 ):
     from app.db import catalog_admin_repository as repo
 
-    source_a = await repo.create_source(catalog_admin_db_pool, name="wave_prod_test_source_a", source_type="curated_dataset")
-    source_b = await repo.create_source(catalog_admin_db_pool, name="wave_prod_test_source_b", source_type="curated_dataset")
+    source_a = await repo.create_source(catalog_admin_db_pool, name="Cross Source A", source_type="curated_dataset")
+    source_b = await repo.create_source(catalog_admin_db_pool, name="Cross Source B", source_type="curated_dataset")
 
-    record_a = _manifest_record("a-1", brand="CrossSourceBrand", product_name="Cross Source Cleanser", sku="XSRC-SKU")
+    record_a = _manifest_record(
+        "a-1", source_name="Cross Source A", brand="CrossSourceBrand", product_name="Cross Source Cleanser", sku="XSRC-SKU",
+    )
     outcome_a = await import_manifest(
         catalog_admin_db_pool, source_id=source_a["id"], file_bytes=_jsonl([record_a]), allow_test_source=True,
     )
@@ -163,7 +201,7 @@ async def test_same_product_from_two_sources_second_publish_sees_existing_curren
     # independent claim about the same product) -- the EXISTING publish()
     # logic decides what this means; Wave 1 does not special-case it.
     record_b = _manifest_record(
-        "b-1", brand="CrossSourceBrand", product_name="Cross Source Cleanser",
+        "b-1", source_name="Cross Source B", brand="CrossSourceBrand", product_name="Cross Source Cleanser",
         ingredient_list_raw=["Water", "Niacinamide"], sku="XSRC-SKU-2",
     )
     outcome_b = await import_manifest(
@@ -239,13 +277,13 @@ async def test_source_provenance_persists_through_publish(source_id, catalog_adm
         "SELECT source_reference FROM catalog_formulation_provenance WHERE formulation_id = $1", pub.formulation_id,
     )
     parsed = json.loads(provenance["source_reference"])
-    assert parsed["source_url"] == "https://example.invalid/prov-source"
-    assert parsed["source_evidence_id"] == "prov-1"
+    assert parsed["evidence"][0]["source_url"] == "https://example.invalid/prov-source"
+    assert parsed["evidence"][0]["source_evidence_id"] == "prov-1"
 
     formulation = await catalog_admin_db_pool.fetchrow(
         "SELECT source_reference FROM product_formulations WHERE id = $1", pub.formulation_id,
     )
-    assert json.loads(formulation["source_reference"])["source_evidence_id"] == "prov-1"
+    assert json.loads(formulation["source_reference"])["evidence"][0]["source_evidence_id"] == "prov-1"
 
 
 # ---------------------------------------------------------------------------
@@ -267,29 +305,97 @@ async def test_import_manifest_never_publishes_anything(source_id, catalog_admin
     assert await catalog_admin_db_pool.fetchval("SELECT count(*) FROM product_formulations") == 0
 
 
-async def test_publish_rejects_insufficient_source_data_record_still_status_validated(
-    source_id, catalog_admin_db_pool,
-):
-    """Belt-and-suspenders proof: even if an operator ran `publish`
-    directly against an INSUFFICIENT_SOURCE_DATA record (Wave 1's own
-    tooling never does), the resulting formulation can never reach
-    ingredient_data_status=COMPLETE, so it remains structurally
-    invisible to ProductMatchingService regardless."""
+# ---------------------------------------------------------------------------
+# Independent-review Blocker 1: publication-time backstop
+# ---------------------------------------------------------------------------
+
+
+async def test_wave1_insufficient_record_cannot_publish(source_id, catalog_admin_db_pool):
     record = _manifest_record("insuff-pub-1", ingredient_list_raw=[], ingredient_list_complete=False)
     outcome = await import_manifest(
         catalog_admin_db_pool, source_id=source_id, file_bytes=_jsonl([record]), allow_test_source=True,
     )
     await CatalogIngestionService(catalog_admin_db_pool).validate_batch(outcome.import_outcome.batch_id)
-    pub = await CatalogPublicationService(catalog_admin_db_pool).publish(
-        outcome.import_outcome.records[0].import_record_id, actor="test",
+    import_record_id = outcome.import_outcome.records[0].import_record_id
+
+    with pytest.raises(PublicationError) as exc_info:
+        await CatalogPublicationService(catalog_admin_db_pool).publish(import_record_id, actor="test")
+    assert exc_info.value.code == WAVE1_INSUFFICIENT_SOURCE_DATA
+
+
+async def test_wave1_insufficient_record_publish_creates_no_formulation_row(source_id, catalog_admin_db_pool):
+    record = _manifest_record("insuff-pub-2", ingredient_list_raw=[], ingredient_list_complete=False)
+    outcome = await import_manifest(
+        catalog_admin_db_pool, source_id=source_id, file_bytes=_jsonl([record]), allow_test_source=True,
     )
-    assert pub.ingredient_data_status == "UNKNOWN"
-    candidates = await catalog_admin_db_pool.fetch(
-        "SELECT * FROM product_formulations WHERE id = $1 AND publication_status = 'PUBLISHED' "
-        "AND ingredient_data_status = 'COMPLETE' AND is_current = true",
-        pub.formulation_id,
+    await CatalogIngestionService(catalog_admin_db_pool).validate_batch(outcome.import_outcome.batch_id)
+    import_record_id = outcome.import_outcome.records[0].import_record_id
+
+    with pytest.raises(PublicationError):
+        await CatalogPublicationService(catalog_admin_db_pool).publish(import_record_id, actor="test")
+
+    assert await catalog_admin_db_pool.fetchval("SELECT count(*) FROM product_formulations") == 0
+    assert await catalog_admin_db_pool.fetchval("SELECT count(*) FROM catalog_formulation_provenance") == 0
+
+
+async def test_wave1_insufficient_record_remains_non_published(source_id, catalog_admin_db_pool):
+    record = _manifest_record("insuff-pub-3", ingredient_list_raw=[], ingredient_list_complete=False)
+    outcome = await import_manifest(
+        catalog_admin_db_pool, source_id=source_id, file_bytes=_jsonl([record]), allow_test_source=True,
     )
+    await CatalogIngestionService(catalog_admin_db_pool).validate_batch(outcome.import_outcome.batch_id)
+    import_record_id = outcome.import_outcome.records[0].import_record_id
+
+    with pytest.raises(PublicationError):
+        await CatalogPublicationService(catalog_admin_db_pool).publish(import_record_id, actor="test")
+
+    row = await catalog_admin_db_pool.fetchrow(
+        "SELECT status, formulation_id FROM catalog_import_records WHERE id = $1", import_record_id,
+    )
+    assert row["status"] == "VALIDATED"
+    assert row["formulation_id"] is None
+
+
+async def test_wave1_insufficient_record_rejection_leaves_product_matching_unaffected(
+    source_id, catalog_admin_db_pool,
+):
+    record = _manifest_record("insuff-pub-4", ingredient_list_raw=[], ingredient_list_complete=False)
+    outcome = await import_manifest(
+        catalog_admin_db_pool, source_id=source_id, file_bytes=_jsonl([record]), allow_test_source=True,
+    )
+    await CatalogIngestionService(catalog_admin_db_pool).validate_batch(outcome.import_outcome.batch_id)
+    import_record_id = outcome.import_outcome.records[0].import_record_id
+
+    with pytest.raises(PublicationError):
+        await CatalogPublicationService(catalog_admin_db_pool).publish(import_record_id, actor="test")
+
+    candidates = await list_current_active_formulations_by_category(catalog_admin_db_pool, "cleanser", "us")
     assert candidates == []
+
+
+async def test_wave1_sufficient_verified_record_still_publishes_normally(
+    source_id, catalog_admin_db_pool, seeded_ingredients,
+):
+    """The backstop only fires for genuinely insufficient Wave 1
+    records -- a sufficient, VERIFIED one publishes exactly as before
+    this fix."""
+    record = _manifest_record("sufficient-pub-1")
+    outcome = await import_manifest(
+        catalog_admin_db_pool, source_id=source_id, file_bytes=_jsonl([record]), allow_test_source=True,
+    )
+    await CatalogIngestionService(catalog_admin_db_pool).validate_batch(outcome.import_outcome.batch_id)
+    import_record_id = outcome.import_outcome.records[0].import_record_id
+    assert classify_import_record_state(
+        {"status": "VALIDATED", "normalized_payload": {"ingredients": [{"raw_name": "Water"}], "ingredient_list_complete": True}}
+    ) == "VERIFIED"
+
+    pub = await CatalogPublicationService(catalog_admin_db_pool).publish(import_record_id, actor="test")
+    assert pub.ingredient_data_status == "COMPLETE"
+    row = await catalog_admin_db_pool.fetchrow(
+        "SELECT status, formulation_id FROM catalog_import_records WHERE id = $1", import_record_id,
+    )
+    assert row["status"] == "PUBLISHED"
+    assert row["formulation_id"] == pub.formulation_id
 
 
 # ---------------------------------------------------------------------------
@@ -300,12 +406,13 @@ async def test_publish_rejects_insufficient_source_data_record_still_status_vali
 async def test_inactive_source_is_rejected(catalog_admin_db_pool, clean_catalog_ingestion):
     from app.db import catalog_admin_repository as repo
 
-    source = await repo.create_source(catalog_admin_db_pool, name="wave_prod_inactive_source", source_type="curated_dataset")
+    source = await repo.create_source(catalog_admin_db_pool, name="Wave Prod Inactive Source", source_type="curated_dataset")
     await catalog_admin_db_pool.execute("UPDATE catalog_sources SET active = false WHERE id = $1", source["id"])
 
     with pytest.raises(Exception) as exc_info:
         await import_manifest(
-            catalog_admin_db_pool, source_id=source["id"], file_bytes=_jsonl([_manifest_record("x1")]),
+            catalog_admin_db_pool, source_id=source["id"],
+            file_bytes=_jsonl([_manifest_record("x1", source_name="Wave Prod Inactive Source")]),
             allow_test_source=True,
         )
     assert getattr(exc_info.value, "code", None) == "SOURCE_INACTIVE"
@@ -322,7 +429,8 @@ async def test_reserved_test_source_name_is_refused_by_default(catalog_admin_db_
     source = await repo.create_source(catalog_admin_db_pool, name="test_should_be_refused", source_type="curated_dataset")
     with pytest.raises(WaveManifestRejectedError) as exc_info:
         await import_manifest(
-            catalog_admin_db_pool, source_id=source["id"], file_bytes=_jsonl([_manifest_record("x1")]),
+            catalog_admin_db_pool, source_id=source["id"],
+            file_bytes=_jsonl([_manifest_record("x1", source_name="test_should_be_refused")]),
             # No allow_test_source -- defaults False.
         )
     assert exc_info.value.code == "RESERVED_TEST_SOURCE"
@@ -337,7 +445,8 @@ async def test_reserved_test_source_name_can_be_explicitly_allowed_for_test_code
 
     source = await repo.create_source(catalog_admin_db_pool, name="synthetic_explicitly_allowed", source_type="curated_dataset")
     outcome = await import_manifest(
-        catalog_admin_db_pool, source_id=source["id"], file_bytes=_jsonl([_manifest_record("x1")]),
+        catalog_admin_db_pool, source_id=source["id"],
+        file_bytes=_jsonl([_manifest_record("x1", source_name="synthetic_explicitly_allowed")]),
         allow_test_source=True,
     )
     assert outcome.import_outcome.records_total == 1
@@ -352,18 +461,31 @@ async def test_ordinary_production_source_name_is_not_affected_by_the_guard(sour
 
 
 # ---------------------------------------------------------------------------
-# Source-type cross-check end to end
+# Source-type / source-name cross-check end to end
 # ---------------------------------------------------------------------------
 
 
 async def test_source_type_mismatch_is_isolated_as_manifest_issue(catalog_admin_db_pool, clean_catalog_ingestion):
     from app.db import catalog_admin_repository as repo
 
-    source = await repo.create_source(catalog_admin_db_pool, name="wave_prod_mismatch_source", source_type="regulatory_filing")
-    record = _manifest_record("mismatch-1", source_type="curated_dataset")
+    source = await repo.create_source(catalog_admin_db_pool, name="Wave Prod Mismatch Source", source_type="regulatory_filing")
+    record = _manifest_record("mismatch-1", source_name="Wave Prod Mismatch Source", source_type="curated_dataset")
     outcome = await import_manifest(
         catalog_admin_db_pool, source_id=source["id"], file_bytes=_jsonl([record]), allow_test_source=True,
     )
     assert outcome.import_outcome is None
     codes = {i["code"] for i in outcome.manifest_issues}
     assert "SOURCE_TYPE_MISMATCH" in codes
+
+
+async def test_source_name_mismatch_is_isolated_as_manifest_issue_end_to_end(source_id, catalog_admin_db_pool):
+    record = _manifest_record("name-mismatch-1", source_name="A Completely Different Vendor")
+    outcome = await import_manifest(
+        catalog_admin_db_pool, source_id=source_id, file_bytes=_jsonl([record]), allow_test_source=True,
+    )
+    assert outcome.import_outcome is None
+    codes = {i["code"] for i in outcome.manifest_issues}
+    assert "SOURCE_NAME_MISMATCH" in codes
+    # Nothing was written -- rejected, not silently imported under the
+    # selected source_id anyway.
+    assert await catalog_admin_db_pool.fetchval("SELECT count(*) FROM catalog_import_records") == 0
