@@ -336,7 +336,7 @@ async def clean_database(request):
         conn = await asyncpg.connect(dsn=TEST_DATABASE_URL)
         try:
             await conn.execute(
-                "TRUNCATE TABLE refresh_tokens, user_profiles, consent_events, jobs, analysis_usage, "
+                "TRUNCATE TABLE refresh_tokens, password_reset_tokens, user_profiles, consent_events, jobs, analysis_usage, "
                 "user_ingredient_constraints, analysis_product_recommendations, analysis_measurements, "
                 "analysis_results, analysis_requests, user_entitlements, revenuecat_webhook_events, "
                 "users RESTART IDENTITY CASCADE"

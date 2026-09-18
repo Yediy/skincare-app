@@ -32,3 +32,32 @@ export const API_BASE_URL = assertProductionSafe(rawBaseUrl.replace(/\/+$/, ""))
 export const REQUEST_TIMEOUT_MS = 15_000;
 
 export const APP_VERSION = "1.0.0";
+
+/**
+ * Release URL seams (V1 account recovery / release-foundation pass,
+ * Part 11). Public, non-secret configuration -- unlike
+ * EXPO_PUBLIC_API_BASE_URL, every one of these is OPTIONAL in
+ * development: a screen (Settings) simply omits a link whose URL
+ * isn't configured, rather than throwing at startup. This pass does
+ * not author any privacy policy/terms/support/account-deletion
+ * content -- these are external URLs only; see
+ * ACCOUNT_RECOVERY_ARCHITECTURE.md for what's still required before a
+ * real store release (a production build's config validation is
+ * expected to require all four, in a later pass, not this one).
+ *
+ * Production must use HTTPS if a URL is configured at all -- a
+ * misconfigured non-https production value fails loudly here rather
+ * than silently linking out over an insecure origin.
+ */
+function productionSafeOptionalUrl(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  if (!__DEV__ && !raw.startsWith("https://")) {
+    throw new Error(`Release URL config must be an https:// origin in a production build, got: ${raw}`);
+  }
+  return raw;
+}
+
+export const PRIVACY_POLICY_URL = productionSafeOptionalUrl(process.env.EXPO_PUBLIC_PRIVACY_POLICY_URL);
+export const TERMS_URL = productionSafeOptionalUrl(process.env.EXPO_PUBLIC_TERMS_URL);
+export const SUPPORT_URL = productionSafeOptionalUrl(process.env.EXPO_PUBLIC_SUPPORT_URL);
+export const ACCOUNT_DELETION_URL = productionSafeOptionalUrl(process.env.EXPO_PUBLIC_ACCOUNT_DELETION_URL);

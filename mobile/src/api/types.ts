@@ -11,6 +11,12 @@ export type RefreshResponse = AuthTokens;
 
 export type LogoutInput = { refresh_token: string };
 
+export type ForgotPasswordInput = { email: string };
+export type ForgotPasswordResponse = { message: string };
+
+export type ResetPasswordInput = { token: string; new_password: string };
+export type ResetPasswordResponse = { detail: string };
+
 export type ConsentGrantInput = {
   consent_type?: string;
   policy_version: string;

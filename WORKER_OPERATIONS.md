@@ -22,6 +22,18 @@ The real queue-consuming CV worker. Runs `run_forever()`: claim -> heartbeat alo
 - The structured events it emits (`app/observability/events.py`): `queue_claim` (is it claiming anything at all?), `queue_wait_seconds` (is the queue backing up?), `analysis_processing` (`SUCCESS`/`RETRY`/`DEAD_LETTER` with `duration_seconds`).
 - The `jobs` table's own row counts by `status` — a real, directly queryable operational signal (`pending` count growing without bound means no worker is claiming; `claimed` rows with `claimed_until` far in the past mean a worker died without cleanly failing its job, which the next `claim()` call will still correctly reclaim).
 
+## `python -m app.workers.password_reset_email_worker`
+
+V1 account recovery pass (independent-review timing-enumeration fix). Consumes `password_reset_email` jobs enqueued by `PasswordResetService.request_reset` on the existing `PostgresJobQueue` (`jobs` table, same infrastructure `analysis`/`revenuecat_webhook` already use — no new queue technology). This is the ONLY process that ever calls `TransactionalEmailService.send_password_reset` — `POST /password/forgot` itself performs no outbound provider network I/O, which is exactly what closed the timing side channel; see `ACCOUNT_RECOVERY_ARCHITECTURE.md` section 8.
+
+Same claim → process → acknowledge/fail(retryable) shape as `app/workers/revenuecat_webhook_worker.py`, no heartbeat loop (sending one email is fast, well inside the default 60s claim visibility window). Before decrypting or sending anything, re-checks `password_reset_tokens.used_at`/`expires_at` for the job's `token_hash` and acknowledges as a no-op without sending if the token has since been superseded or expired — never emails a link that can no longer work.
+
+**Deployment**: its own Dokploy service/container, same image as the API, different entrypoint. Requires `DATABASE_URL`, `PASSWORD_RESET_EMAIL_DELIVERY_KEY` (must match the API's own — it decrypts what the API encrypted), and whatever `EMAIL_PROVIDER`/`RESEND_*` settings the deployment uses.
+
+**Security-critical**: this is the only module that ever decrypts a password-reset delivery payload back into a plaintext raw token/reset URL, and only in process memory. A job's payload is redacted (`{"redacted": true}`) once it reaches a terminal state (delivered, or permanently failed after `max_attempts`) so the encrypted ciphertext doesn't linger in `jobs` any longer than the job is still meaningfully pending.
+
+**No `/health/*` endpoint** — monitor via `jobs` row counts filtered to `job_type = 'password_reset_email'` (same pattern as the analysis worker above) and the `password_reset_email_delivery_exhausted` structured event (`app/observability/events.py`), which never carries a user_id/email/token.
+
 ## `python -m app.workers.image_cleanup`
 
 The safety-net sweeper for raw images the primary deletion path (the analysis worker itself, on both success and terminal failure) didn't clean up — a crash, a kill, a network failure between "processing finished" and "delete call completed." See `RAW_IMAGE_LIFECYCLE.md` for the two-path design this is half of.

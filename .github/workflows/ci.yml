@@ -95,6 +95,11 @@ jobs:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/skincare_test
           REDIS_URL: redis://localhost:6379/1
           JWT_SECRET: ci-only-secret-never-used-outside-github-actions-0123456789ab
+          # Protects the password-reset-email delivery job's payload at
+          # rest (app/security/reset_delivery_crypto.py) -- required in
+          # every environment, same treatment as JWT_SECRET above, not
+          # gated behind an opt-in feature flag.
+          PASSWORD_RESET_EMAIL_DELIVERY_KEY: ci-only-delivery-key-never-used-outside-github-actions-0123456789
         run: python -m pytest tests/ -v
 
   dependency-scan:

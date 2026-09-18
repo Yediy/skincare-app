@@ -167,3 +167,13 @@ def rate_limit_denial(*, policy: str, identity_kind: str) -> None:
     carry a real user_id/request_id/analysis_id (correlation data, not
     a metric label -- see module docstring)."""
     _emit("rate_limit_denial", policy=policy, identity_kind=identity_kind)
+
+
+def password_reset_email_delivery_exhausted() -> None:
+    """A password-reset-email delivery job exhausted its retry budget
+    and landed in the terminal 'failed' state -- no user_id/email/token
+    carried here (this event alone can't identify anything sensitive,
+    deliberately, since the whole point of the delivery outbox is to
+    keep those values out of anywhere that isn't the encrypted job
+    payload or the worker's own transient memory)."""
+    _emit("password_reset_email_delivery_exhausted")

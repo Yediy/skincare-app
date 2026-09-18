@@ -83,6 +83,17 @@ ANALYSIS_POLICY = RateLimitPolicy(
 GENERAL_POLICY = RateLimitPolicy(
     "general", settings.rate_limit_general_max, settings.rate_limit_general_window_seconds, fail_open=True,
 )
+# POST /password/forgot's second limiter, keyed by the submitted email
+# rather than by IP or user_id -- see app/config.py's own comment on
+# these two settings. fail_open=False, same reasoning as AUTH_POLICY:
+# a Redis outage must never silently uncap password-reset abuse
+# against one address.
+PASSWORD_RESET_EMAIL_POLICY = RateLimitPolicy(
+    "password_reset_email",
+    settings.rate_limit_password_reset_email_max,
+    settings.rate_limit_password_reset_email_window_seconds,
+    fail_open=False,
+)
 
 
 @dataclass(frozen=True)
@@ -161,6 +172,18 @@ async def _enforce(policy: RateLimitPolicy, identity: str) -> None:
             detail="Too many requests.",
             headers={"Retry-After": str(result.retry_after_seconds)},
         )
+
+
+async def enforce_rate_limit(policy: RateLimitPolicy, identity: str) -> None:
+    """Public entry point for a route that needs to key a check by
+    something only known after parsing its own request body (e.g.
+    POST /password/forgot keying PASSWORD_RESET_EMAIL_POLICY by the
+    submitted email) -- rate_limit_by_ip/rate_limit_by_user below
+    can't express that, since a FastAPI dependency runs before the
+    route body has a chance to derive a custom identity string. Raises
+    the same HTTPException(429/503) _enforce always raises; callers
+    don't need to handle a return value."""
+    await _enforce(policy, identity)
 
 
 def rate_limit_by_ip(policy: RateLimitPolicy):
