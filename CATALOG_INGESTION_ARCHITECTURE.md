@@ -204,12 +204,19 @@ Separately, `dismiss()` — the generic manual-resolution path for non-ingredien
 
 `tests/domain/test_catalog_normalization.py`, `tests/domain/test_catalog_ingestion_service.py`, `tests/domain/test_catalog_publication_service.py`, `tests/domain/test_catalog_review_service.py`, `tests/domain/test_product_matching_publication_gate.py`, `tests/catalog_admin/test_cli.py`, `tests/catalog_admin/test_main_gating.py`, `tests/database/test_catalog_admin_privilege.py`, `tests/database/test_catalog_evidence_immutability.py`, plus additions to `tests/unit/test_config_validation.py`. All run against real Postgres (no mocked DB), through the real restricted `skincare_catalog_admin`/`skincare_app` roles for every privilege-relevant assertion — same convention as every other pass in this repository.
 
+## Production Catalog Wave 1 (`feat/production-catalog-wave-1`) — the deferred "real catalog population" item, partially closed
+
+The item this document's own "What this pass does NOT build" list above named "Real catalog population" is now partially addressed — see `PRODUCTION_CATALOG_WAVE_1.md` for the full detail. Summary, stated precisely so it is not confused with more than it actually is:
+
+- **Closed**: a `CatalogSourceAdapter` boundary (`app/domain/catalog_source_adapter.py`) and a curated JSON/JSONL manifest adapter, a Wave 1 source-manifest schema with full provenance (reusing `source_reference`/`verified_at`/`payload_sha256` — no new migration), deterministic ingredient-content fingerprinting feeding the *exact same, unmodified* reformulation/idempotency comparison `CatalogPublicationService.publish()` already performs, a Wave 1 product-quality-state classification (`VERIFIED`/`REVIEW_REQUIRED`/`INSUFFICIENT_SOURCE_DATA`/`REJECTED`, read-only over existing columns), five new CLI subcommands, and a fully deterministic, database-state-reproducible Wave 1 report.
+- **Still NOT closed**: this document's own adapter seam (`_parse_raw_records`) was not touched, and the pipeline below it — everything this document itself describes — was not modified at all. **No real commercial product data was imported by this pass** (see `PRODUCTION_CATALOG_WAVE_1.md`'s own "What this pass actually shipped vs. what it did not populate" section for exactly why). Web crawler / provider-specific source acquisition remains fully deferred; Wave 1's own manifest adapter still requires bytes an operator already has in hand, same as `import_file()` always has.
+
 ## DEFERRED (tracked in `OPEN_ENGINEERING_ITEMS.md`)
 
-- Web crawler / provider-specific source acquisition.
+- Web crawler / provider-specific source acquisition (a manufacturer-hosted structured-data/API `CatalogSourceAdapter` subclass remains unbuilt — Wave 1's own extension point supports one without touching anything below the adapter seam).
 - HTTP admin route for catalog mutation.
 - Ingredient safety-rule (`ingredient_rules`/`ingredient_interactions`) authoring.
 - Fuzzy-match-based admin *suggestions* (never automatic decisions).
 - A CSV import adapter (the seam exists; the adapter itself does not yet).
-- An explicit `VERIFIED` formulation-table state gate between `validate_batch` and `publish` (the vocabulary exists; this pass's own publish path goes `VALIDATED` -> `PUBLISHED` directly).
-- Real commercial catalog population (a separate, later, controlled data pass).
+- An explicit `VERIFIED` formulation-table state gate between `validate_batch` and `publish` (the vocabulary exists; this pass's own publish path goes `VALIDATED` -> `PUBLISHED` directly). Wave 1's own `VERIFIED` *report* classification is a read-only view over existing columns, not this gate.
+- Real commercial catalog population with actual product data (Wave 1 shipped the infrastructure only — see above).
