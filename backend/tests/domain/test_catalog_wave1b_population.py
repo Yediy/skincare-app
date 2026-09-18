@@ -363,10 +363,19 @@ def _synthetic_manifest_line(*, evidence_id, ingredient_list_raw, ingredient_det
     return json.dumps(record) + "\n"
 
 
-async def test_unresolved_ingredient_prevents_publication(wave1b_source_id, catalog_admin_db_pool, tmp_path):
-    """An ingredient identity that has NO dictionary entry is left as
-    an open, unresolved review item -- the record must stay
-    NEEDS_REVIEW and must never be published, never guessed."""
+async def test_real_run_with_dictionary_gap_mutates_nothing(wave1b_source_id, catalog_admin_db_pool, tmp_path):
+    """Independent-review final blocker: Wave 1B's production-population
+    command is an all-pack preflight operation. A REAL (non-dry-run)
+    invocation whose manifest discloses an ingredient identity the
+    dictionary cannot cover must raise `PREFLIGHT_NOT_READY` and create
+    NOTHING at all -- not a batch, not an import record, not a review
+    item -- never a partial import that leaves a record dangling in
+    NEEDS_REVIEW. (The underlying, shared `CatalogIngestionService`'s
+    own review-gate behavior for an unresolved ingredient is still
+    proven directly and unweakened -- see
+    `tests/domain/test_catalog_acquisition.py::
+    test_real_manifest_import_remains_review_gated` -- this test is
+    specifically about Wave 1B's OWN stricter, dedicated command.)"""
     manifest_bytes = _synthetic_manifest_line(
         evidence_id="synthetic-unknown-ingredient",
         ingredient_list_raw=["Water", "Totally Undictionaried Novel Compound XJ9"],
@@ -375,23 +384,24 @@ async def test_unresolved_ingredient_prevents_publication(wave1b_source_id, cata
         {"canonical_name": "Water", "ingredient_type": None, "inci_name": None, "aliases": []},
     ])
 
-    report = await populate_wave1b(
-        catalog_admin_db_pool, source_id=wave1b_source_id, manifest_bytes=manifest_bytes,
-        dictionary_path=dictionary_path, actor="test",
-    )
-    assert report.records_validated == 0
-    assert report.records_needing_review == 1
-    assert len(report.unresolved_dictionary_gaps) == 1
-    assert "totally undictionaried novel compound xj9" == report.unresolved_dictionary_gaps[0].identity_key
-    assert report.publish_outcomes == []
-    assert await catalog_admin_db_pool.fetchval("SELECT count(*) FROM product_formulations") == 0
+    before = await _table_counts(catalog_admin_db_pool)
+    with pytest.raises(PopulationRejectedError) as exc_info:
+        await populate_wave1b(
+            catalog_admin_db_pool, source_id=wave1b_source_id, manifest_bytes=manifest_bytes,
+            dictionary_path=dictionary_path, actor="test",
+        )
+    assert exc_info.value.code == "PREFLIGHT_NOT_READY"
+    assert "unresolved_dictionary_gap_count=1" in str(exc_info.value)
+    after = await _table_counts(catalog_admin_db_pool)
+    assert before == after
 
 
 async def test_dictionary_matching_is_exact_never_fuzzy(wave1b_source_id, catalog_admin_db_pool, tmp_path):
     """A near-miss spelling (extra whitespace aside, which
     normalize_name already collapses) that is NOT an exact dictionary
     entry must never be silently accepted as a fuzzy match -- it is
-    reported as a genuine dictionary gap."""
+    reported as a genuine dictionary gap, and (per the final blocker
+    above) a real run against it mutates nothing."""
     manifest_bytes = _synthetic_manifest_line(
         evidence_id="synthetic-near-miss",
         ingredient_list_raw=["Glycerine"],  # dictionary only has "Glycerin" (no trailing e)
@@ -400,10 +410,45 @@ async def test_dictionary_matching_is_exact_never_fuzzy(wave1b_source_id, catalo
         {"canonical_name": "Glycerin", "ingredient_type": None, "inci_name": None, "aliases": []},
     ])
 
-    report = await populate_wave1b(
+    before = await _table_counts(catalog_admin_db_pool)
+    with pytest.raises(PopulationRejectedError) as exc_info:
+        await populate_wave1b(
+            catalog_admin_db_pool, source_id=wave1b_source_id, manifest_bytes=manifest_bytes,
+            dictionary_path=dictionary_path, actor="test",
+        )
+    assert exc_info.value.code == "PREFLIGHT_NOT_READY"
+    after = await _table_counts(catalog_admin_db_pool)
+    assert before == after
+
+
+async def test_schema_invalid_production_pack_mutates_nothing(wave1b_source_id, catalog_admin_db_pool, tmp_path):
+    """A manifest with one valid record and one schema-invalid record
+    (missing a required field) must be blocked entirely on a real run
+    -- the valid record's batch/import data must never be created
+    either. Partial production-pack mutation is not acceptable."""
+    valid_record = json.loads(_synthetic_manifest_line(evidence_id="valid-one", ingredient_list_raw=["Water"]))
+    invalid_record = dict(valid_record)
+    invalid_record["source_evidence_id"] = "invalid-one"
+    del invalid_record["ingredient_list_complete"]  # required field -- makes this schema-invalid
+    manifest_bytes = (json.dumps(valid_record) + "\n" + json.dumps(invalid_record) + "\n").encode("utf-8")
+    dictionary_path = _write_dictionary(tmp_path, [{"canonical_name": "Water", "aliases": []}])
+
+    preflight_report = await populate_wave1b(
         catalog_admin_db_pool, source_id=wave1b_source_id, manifest_bytes=manifest_bytes,
-        dictionary_path=dictionary_path, actor="test",
+        dictionary_path=dictionary_path, actor="test", dry_run=True,
     )
-    assert report.records_needing_review == 1
-    assert len(report.unresolved_dictionary_gaps) == 1
-    assert report.publish_outcomes == []
+    assert preflight_report.manifest_total_records == 2
+    assert preflight_report.manifest_schema_valid == 1
+    assert preflight_report.preflight_ready is False
+
+    before = await _table_counts(catalog_admin_db_pool)
+    with pytest.raises(PopulationRejectedError) as exc_info:
+        await populate_wave1b(
+            catalog_admin_db_pool, source_id=wave1b_source_id, manifest_bytes=manifest_bytes,
+            dictionary_path=dictionary_path, actor="test",
+        )
+    assert exc_info.value.code == "PREFLIGHT_NOT_READY"
+    assert "manifest_total_records=2" in str(exc_info.value)
+    assert "manifest_schema_valid=1" in str(exc_info.value)
+    after = await _table_counts(catalog_admin_db_pool)
+    assert before == after

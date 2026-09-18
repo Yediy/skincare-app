@@ -465,8 +465,22 @@ async def populate_wave1b(
        no product, no formulation, no review item, no audit row), and
        the report already reflects the full preflight coverage check,
        never a shortcut that could pass a broken dictionary silently.
-    4. Only past this point does `import_manifest()` -- the first
-       mutating call -- ever run."""
+    4. For a REAL run (`dry_run=False`), `preflight.ready` is enforced
+       HERE, before `import_manifest()` -- the first mutating call --
+       ever runs. Wave 1B's own production-population command is an
+       all-pack operation: a real invocation whose manifest has ANY
+       schema-invalid record, or ANY ingredient identity neither the
+       catalog nor the dictionary can resolve, raises
+       `PopulationRejectedError(code="PREFLIGHT_NOT_READY")` and
+       creates nothing at all -- not even the valid subset of the pack.
+       (This is a policy this module alone enforces; the underlying,
+       shared `CatalogIngestionService`/`import_manifest()` remain
+       unmodified and still support importing a partially-valid
+       manifest for every OTHER caller -- only Wave 1B's own dedicated
+       production-population command is this strict.) A dry run is
+       NEVER subject to this check -- `preflight_ready=False` on a dry
+       run is exactly the useful signal an operator is running one to
+       see, never an exception raised merely for asking."""
     dictionary = load_ingredient_dictionary(dictionary_path)
     preflight = await _run_preflight(pool, manifest_bytes, dictionary)
 
@@ -485,6 +499,17 @@ async def populate_wave1b(
 
     if dry_run:
         return report
+
+    if not preflight.ready:
+        raise PopulationRejectedError(
+            f"Wave 1B production pack is not ready to populate -- manifest_total_records="
+            f"{preflight.manifest_total_records}, manifest_schema_valid={preflight.manifest_schema_valid}, "
+            f"manifest_issue_count={len(preflight.manifest_issues)}, "
+            f"unresolved_dictionary_gap_count={len(preflight.gaps)}. Run with dry_run=True to inspect the "
+            "full coverage report before deciding how to proceed. No batch, import record, ingredient, alias, "
+            "product, formulation, review item, or audit row was created.",
+            code="PREFLIGHT_NOT_READY",
+        )
 
     import_outcome = await import_manifest(
         pool, source_id=source_id, file_bytes=manifest_bytes, file_format="jsonl",
