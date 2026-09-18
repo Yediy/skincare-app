@@ -4,12 +4,18 @@ same convention as every other catalog-ingestion test.
 
 Includes independent-review-Blocker-3 regression coverage: a
 byte-identical idempotent reimport must never inflate
-`total_records_supplied`.
+`total_records_supplied`; and the final durability-blocker regression
+coverage: a transient failure writing the Wave 1 manifest-summary
+audit entry (which happens AFTER CatalogIngestionService.import_file()'s
+own transaction has already committed) must be fully recoverable by a
+plain retry, never stranding a batch without its summary.
 """
 import json
 
+import asyncpg
 import pytest
 
+from app.db import catalog_admin_repository as repo
 from app.domain.catalog_ingestion_service import CatalogIngestionService
 from app.domain.catalog_publication_service import CatalogPublicationService
 from app.domain.catalog_wave_report import (
@@ -313,3 +319,94 @@ async def test_multiple_genuinely_distinct_batches_still_sum_correctly(source_id
     report_after_reimport = await compute_wave_report(catalog_admin_db_pool, source_id=source_id)
     assert report_after_reimport.total_records_supplied == 5
     assert report_after_reimport.imported == 5
+
+
+# ---------------------------------------------------------------------------
+# Final durability blocker: a transient failure writing the Wave 1
+# manifest-summary audit entry (AFTER the catalog import has already
+# committed) must be fully recoverable by a plain retry.
+# ---------------------------------------------------------------------------
+
+
+def _wave1_summary_count(after_metadata) -> bool:
+    meta = after_metadata
+    if isinstance(meta, str):
+        meta = json.loads(meta)
+    return bool(meta and meta.get("wave1_manifest"))
+
+
+async def test_post_commit_wave_summary_failure_is_recoverable_by_retry(
+    source_id, catalog_admin_db_pool, monkeypatch,
+):
+    """Exact scenario from the independent review: the catalog batch
+    and its import record(s) commit successfully inside
+    CatalogIngestionService.import_file()'s own transaction; the
+    SEPARATE Wave 1 manifest-summary audit write that happens after
+    that commit then fails transiently. The caller retries the
+    byte-identical manifest -- the existing batch is reused
+    (batch_is_new=False), no new import records are created, and the
+    previously-missing Wave 1 summary is repaired rather than
+    permanently stranded."""
+    good = _manifest_record("recoverable-1")
+    body = _jsonl([good]) + b"{not valid json\n"  # one valid record, one manifest-level malformed record
+
+    real_write_audit = repo.write_audit
+
+    async def failing_write_audit(
+        conn, *, action, entity_type, entity_id, actor, import_record_id=None,
+        before_metadata=None, after_metadata=None, reason=None,
+    ):
+        if after_metadata and after_metadata.get("wave1_manifest"):
+            raise asyncpg.exceptions.ConnectionDoesNotExistError("simulated transient DB failure")
+        return await real_write_audit(
+            conn, action=action, entity_type=entity_type, entity_id=entity_id, actor=actor,
+            import_record_id=import_record_id, before_metadata=before_metadata,
+            after_metadata=after_metadata, reason=reason,
+        )
+
+    monkeypatch.setattr(repo, "write_audit", failing_write_audit)
+    with pytest.raises(Exception):
+        await import_manifest(catalog_admin_db_pool, source_id=source_id, file_bytes=body, allow_test_source=True)
+    monkeypatch.undo()
+
+    # The catalog import already committed before the failing write --
+    # batch and import record durably exist despite import_manifest()
+    # having raised.
+    batch_count = await catalog_admin_db_pool.fetchval("SELECT count(*) FROM catalog_import_batches")
+    record_count = await catalog_admin_db_pool.fetchval("SELECT count(*) FROM catalog_import_records")
+    assert batch_count == 1
+    assert record_count == 1
+
+    audit_rows = await catalog_admin_db_pool.fetch(
+        "SELECT after_metadata FROM catalog_audit_log WHERE action = 'IMPORT'"
+    )
+    assert not any(_wave1_summary_count(r["after_metadata"]) for r in audit_rows)
+
+    # Retry the byte-identical manifest with normal audit behavior restored.
+    outcome = await import_manifest(catalog_admin_db_pool, source_id=source_id, file_bytes=body, allow_test_source=True)
+    assert outcome.import_outcome.batch_is_new is False
+    assert await catalog_admin_db_pool.fetchval("SELECT count(*) FROM catalog_import_records") == 1
+
+    audit_rows_after_retry = await catalog_admin_db_pool.fetch(
+        "SELECT after_metadata FROM catalog_audit_log WHERE action = 'IMPORT'"
+    )
+    wave1_entries = [r for r in audit_rows_after_retry if _wave1_summary_count(r["after_metadata"])]
+    assert len(wave1_entries) == 1
+
+    report = await compute_wave_report(catalog_admin_db_pool, source_id=source_id)
+    assert report.total_records_supplied == 2
+    assert report.imported == 1
+
+    # A third, sequential attempt must not create a second summary or
+    # change either total.
+    outcome_third = await import_manifest(catalog_admin_db_pool, source_id=source_id, file_bytes=body, allow_test_source=True)
+    assert outcome_third.import_outcome.batch_is_new is False
+    audit_rows_third = await catalog_admin_db_pool.fetch(
+        "SELECT after_metadata FROM catalog_audit_log WHERE action = 'IMPORT'"
+    )
+    wave1_entries_third = [r for r in audit_rows_third if _wave1_summary_count(r["after_metadata"])]
+    assert len(wave1_entries_third) == 1
+
+    report_third = await compute_wave_report(catalog_admin_db_pool, source_id=source_id)
+    assert report_third.total_records_supplied == 2
+    assert report_third.imported == 1

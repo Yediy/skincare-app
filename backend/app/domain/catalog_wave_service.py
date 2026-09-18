@@ -145,6 +145,59 @@ class WaveImportOutcome:
     dry_run: bool = False
 
 
+async def _ensure_wave_manifest_summary(
+    pool: asyncpg.Pool, *, batch_id: UUID, manifest_total_records: int, manifest_issue_count: int,
+) -> None:
+    """Durability fix (independent review, final blocker): the Wave 1
+    manifest-summary audit entry is written AFTER `CatalogIngestionService.
+    import_file()`'s own transaction has already committed the batch
+    and its import records -- a transient failure at THIS step (
+    `repo.write_audit` propagates DB failures, same as every other call
+    in this codebase) must never be allowed to permanently strand a
+    batch without its summary, since `catalog_wave_report.py`'s
+    `total_records_supplied` depends on it existing.
+
+    Repairable and idempotent: called for EVERY successful non-dry-run
+    import with a `batch_id`, regardless of whether the batch was
+    genuinely new this call or reused (`batch_is_new`) -- a prior
+    attempt may have committed the batch and then failed before ever
+    reaching (or while inside) this write. Checks for an existing
+    summary entry first and appends one only if genuinely missing,
+    never updating or deleting anything -- audit history stays
+    append-only. A plain existence check (not `INSERT ... ON CONFLICT`
+    -- `catalog_audit_log` has no natural unique key for this, and none
+    is added just for this) leaves a narrow theoretical race under
+    truly concurrent repair attempts for the same batch; that is
+    accepted deliberately (per this fix's own brief) because
+    `catalog_wave_report._total_records_supplied_for_source`'s own
+    `batch_id` deduplication already makes a duplicate entry harmless
+    at read time -- this function's job is recoverability, not being
+    the only line of defense against double-counting."""
+    existing = await pool.fetch(
+        "SELECT after_metadata FROM catalog_audit_log "
+        "WHERE entity_id = $1 AND entity_type = 'catalog_import_batch' AND action = 'IMPORT'",
+        batch_id,
+    )
+    for row in existing:
+        meta = row["after_metadata"]
+        if isinstance(meta, str):
+            meta = json.loads(meta)
+        if meta and meta.get("wave1_manifest"):
+            return
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await repo.write_audit(
+                conn, action="IMPORT", entity_type="catalog_import_batch", entity_id=batch_id,
+                actor="catalog_admin_cli",
+                after_metadata={
+                    "wave1_manifest": True,
+                    "wave1_manifest_total_records": manifest_total_records,
+                    "wave1_manifest_issues": manifest_issue_count,
+                },
+            )
+
+
 async def import_manifest(
     pool: asyncpg.Pool, *, source_id: UUID, file_bytes: bytes, file_format: str = "jsonl",
     dry_run: bool = False, allow_test_source: bool = False,
@@ -237,38 +290,29 @@ async def import_manifest(
         source_id=source_id, file_bytes=file_bytes_for_pipeline, file_format="jsonl", dry_run=dry_run,
     )
 
-    if not dry_run and import_outcome.batch_id is not None and import_outcome.batch_is_new:
+    if not dry_run and import_outcome.batch_id is not None:
         # Durable record of the manifest's OWN total record count
         # (including records that failed Wave 1's own schema/grouping
         # checks and never reached import_file() at all) -- the one
         # thing catalog_wave_report.py needs to reconstruct "total
-        # records supplied" purely from database state later. A
-        # separate, small, best-effort audit entry after the main
-        # import transaction has already committed -- never a reason
-        # to fail an otherwise-successful import (same "small
-        # structured summary, never load-bearing for correctness"
-        # posture every other write_audit() call in this codebase
-        # already has).
+        # records supplied" purely from database state later.
         #
-        # Independent-review Blocker 3: gated on `batch_is_new` --
-        # writing this on EVERY call (including a byte-identical,
-        # idempotent reimport that reuses the same existing batch)
-        # accumulated a second audit entry for that batch, which
-        # catalog_wave_report.py's own reader would then double-count.
-        # A reused batch already got its one true audit entry the
-        # first time it was genuinely imported; nothing new happened
-        # this time, so nothing new is written.
-        async with pool.acquire() as conn:
-            async with conn.transaction():
-                await repo.write_audit(
-                    conn, action="IMPORT", entity_type="catalog_import_batch", entity_id=import_outcome.batch_id,
-                    actor="catalog_admin_cli",
-                    after_metadata={
-                        "wave1_manifest": True,
-                        "wave1_manifest_total_records": parse_result.total_records,
-                        "wave1_manifest_issues": len(manifest_issues),
-                    },
-                )
+        # Independent-review Blocker 3 (idempotency) and its own
+        # follow-up durability blocker (recoverability): called
+        # unconditionally -- not gated on `batch_is_new` -- because a
+        # PRIOR call may have committed this exact batch via
+        # `import_file()` and then failed before ever writing (or
+        # while writing) this summary, permanently stranding it
+        # without one if this were skipped on a reused batch.
+        # `_ensure_wave_manifest_summary` itself is what makes this
+        # safe to call every time: it checks for an existing summary
+        # first and only ever appends, never duplicating one a prior
+        # call already wrote.
+        await _ensure_wave_manifest_summary(
+            pool, batch_id=import_outcome.batch_id,
+            manifest_total_records=parse_result.total_records,
+            manifest_issue_count=len(manifest_issues),
+        )
 
     return WaveImportOutcome(
         source_id=source_id, manifest_total_records=parse_result.total_records,
