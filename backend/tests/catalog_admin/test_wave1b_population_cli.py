@@ -32,10 +32,10 @@ async def test_populate_wave1b_real_data_cli_end_to_end(catalog_admin_db_pool, c
     ])
     assert code == 0, err
     result = json.loads(out)
+    assert result["preflight_ready"] is True
+    assert result["unresolved_dictionary_gaps"] == []
     assert result["records_needing_review"] == 0
     assert result["records_rejected_or_malformed"] == 0
-    gaps = [o for o in result["review_item_outcomes"] if o["action"] == "UNRESOLVED_DICTIONARY_GAP"]
-    assert gaps == []
     published = [p for p in result["publish_outcomes"] if p["status"] == "PUBLISHED"]
     assert len(published) == result["manifest_total_records"]
 
@@ -52,6 +52,10 @@ async def test_populate_wave1b_real_data_cli_dry_run_writes_nothing(catalog_admi
         "--source-id", str(source["id"]), "--dictionary-path", str(REAL_DICTIONARY), "--dry-run",
     ])
     assert code == 0, err
+    result = json.loads(out)
+    assert result["dry_run"] is True
+    assert result["dictionary_entry_count"] > 0
+    assert result["preflight_ready"] is True
     after = await catalog_admin_db_pool.fetchval("SELECT count(*) FROM catalog_import_batches")
     assert before == after
 
