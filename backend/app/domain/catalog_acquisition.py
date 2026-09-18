@@ -16,11 +16,15 @@ layer further back to the acquisition step itself.
 Domain allowlist (Section "Initial approved manufacturer domains"):
 only `cerave.com`, `laroche-posay.us`, `theordinary.com`,
 `paulaschoice.com` (and their `www.` subdomains) may ever be fetched by
-this module -- checked BEFORE the request is made, and checked AGAIN
-against the final resolved URL after following redirects, so a
-same-domain page that happens to redirect off-domain can never
-silently pull content from an unapproved source under an approved
-URL's name.
+this module. Checked before EVERY request `acquire_url()` issues --
+the original URL and each individual redirect hop alike -- so an
+off-domain destination is never sent a request at all, whether it's
+the URL an operator supplied or one a same-domain page happened to
+redirect to. A redirect must additionally stay on the SAME
+registrable domain as the original request; two independently
+approved manufacturer domains redirecting into each other is refused
+just as an unapproved domain would be (see `acquire_url()`'s own
+docstring for the full rule).
 
 No authentication bypass, no anti-bot circumvention: `acquire_url()`
 sends one plain GET with a standard, honestly-identifying User-Agent
@@ -47,8 +51,8 @@ import html as html_module
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import List, Optional
-from urllib.parse import urlparse
+from typing import List, Optional, Tuple
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -121,53 +125,109 @@ class AcquisitionResult:
     body_bytes: Optional[bytes] = field(default=None, repr=False)
 
 
+MAX_REDIRECTS = 5
+
+_REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
+
+
 async def acquire_url(
     client: httpx.AsyncClient, *, source_evidence_id: str, url: str, timeout_seconds: float = 20.0,
 ) -> AcquisitionResult:
     """Fetches exactly one operator-supplied URL. Rejects outright
     (`AcquisitionRejectedError`, no request made) if `url` itself is
-    not on an approved domain; if the server redirects, the FINAL
-    resolved URL is checked against the same allowlist before the
-    result is trusted (`REDIRECT_LEFT_APPROVED_DOMAIN`) -- a redirect
-    landing back on the SAME approved domain under a different,
-    manufacturer-renamed slug (a real case this pass encountered, see
-    the Wave 1B doc) is fine and expected; a redirect leaving the
-    allowlist entirely is not.
+    not on an approved domain.
+
+    Independent-review Blocker 1: redirects are followed MANUALLY, one
+    hop at a time (`follow_redirects=False` on every request this
+    function issues), with the destination of EVERY hop -- including
+    the very first URL -- validated BEFORE any request to it is ever
+    sent. Passing `follow_redirects=True` to httpx (the prior design)
+    lets httpx complete the ENTIRE redirect chain, including a request
+    to an off-domain destination, before this function ever gets a
+    chance to inspect `response.url` -- by then the prohibited host has
+    already been contacted. That is exactly the mistake this rewrite
+    closes: the off-domain host is never sent a request at all, not
+    merely "the result is discarded afterward."
+
+    Every hop must additionally stay on the SAME registrable domain as
+    the ORIGINAL request -- not merely "some approved domain" (Section
+    "Required architecture"): `cerave.com` redirecting to
+    `theordinary.com` is rejected even though both are independently
+    approved, since nothing about this acquisition ever asked for
+    manufacturer B's content when it requested manufacturer A's page.
+    A same-domain redirect (a manufacturer renaming a product slug,
+    `www.` normalization, a relative `Location` header) is fine and
+    expected -- a real case this pass encountered, see the Wave 1B doc.
+
+    Bounded to `MAX_REDIRECTS` hops (`TOO_MANY_REDIRECTS`) -- an
+    unbounded manual redirect loop would itself be a new failure mode
+    this rewrite must not introduce.
 
     Never raises for an ordinary HTTP-level failure (4xx/5xx, a bot
-    challenge, a timeout) -- those are recorded as `ok=False` results
-    with the real status/error captured, exactly like any other piece
-    of acquisition evidence. `AcquisitionRejectedError` is reserved for
-    the two cases above, where trusting the response at all would be
-    the actual mistake."""
-    if not is_approved_domain(url):
-        raise AcquisitionRejectedError(
-            f"{url!r} is not on an approved manufacturer domain ({sorted(APPROVED_DOMAINS)})",
-            code="DOMAIN_NOT_APPROVED",
-        )
-
+    challenge, a timeout, a redirect status with no usable `Location`)
+    -- those are recorded as `ok=False` results with the real status/
+    error captured, exactly like any other piece of acquisition
+    evidence. `AcquisitionRejectedError` is reserved for the domain-
+    allowlist violations above, where trusting the response at all
+    would be the actual mistake."""
     retrieved_at = datetime.now(timezone.utc)
-    source_domain = _registrable_domain(urlparse(url).netloc)
+    original_domain = _registrable_domain(urlparse(url).netloc)
+    current_url = url
+    hop = 0
 
-    try:
-        response = await client.get(
-            url, headers={"User-Agent": _USER_AGENT, "Accept": "text/html,application/xhtml+xml"},
-            timeout=timeout_seconds, follow_redirects=True,
-        )
-    except httpx.HTTPError as e:
-        return AcquisitionResult(
-            source_evidence_id=source_evidence_id, requested_url=url, final_url=None, http_status=None,
-            retrieved_at=retrieved_at, content_sha256=None, source_domain=source_domain, ok=False,
-            error_code=e.__class__.__name__, error_detail=str(e),
-        )
+    while True:
+        if not is_approved_domain(current_url):
+            if hop == 0:
+                raise AcquisitionRejectedError(
+                    f"{current_url!r} is not on an approved manufacturer domain ({sorted(APPROVED_DOMAINS)})",
+                    code="DOMAIN_NOT_APPROVED",
+                )
+            raise AcquisitionRejectedError(
+                f"request to {url!r} redirected to {current_url!r}, which is off the approved domain allowlist",
+                code="REDIRECT_LEFT_APPROVED_DOMAIN",
+            )
+        current_domain = _registrable_domain(urlparse(current_url).netloc)
+        if current_domain != original_domain:
+            raise AcquisitionRejectedError(
+                f"request to {url!r} redirected to {current_url!r} (domain {current_domain!r}), which "
+                f"leaves the original request's own domain ({original_domain!r}) -- a redirect between "
+                "two INDEPENDENTLY approved manufacturer domains is not the same manufacturer's own "
+                "content and is never followed",
+                code="REDIRECT_LEFT_APPROVED_DOMAIN",
+            )
 
-    final_url = str(response.url)
-    if not is_approved_domain(final_url):
-        raise AcquisitionRejectedError(
-            f"request to {url!r} redirected to {final_url!r}, which is off the approved domain allowlist",
-            code="REDIRECT_LEFT_APPROVED_DOMAIN",
-        )
+        try:
+            response = await client.get(
+                current_url, headers={"User-Agent": _USER_AGENT, "Accept": "text/html,application/xhtml+xml"},
+                timeout=timeout_seconds, follow_redirects=False,
+            )
+        except httpx.HTTPError as e:
+            return AcquisitionResult(
+                source_evidence_id=source_evidence_id, requested_url=url, final_url=None, http_status=None,
+                retrieved_at=retrieved_at, content_sha256=None, source_domain=original_domain, ok=False,
+                error_code=e.__class__.__name__, error_detail=str(e),
+            )
 
+        if response.status_code in _REDIRECT_STATUS_CODES:
+            location = response.headers.get("location")
+            if not location:
+                return AcquisitionResult(
+                    source_evidence_id=source_evidence_id, requested_url=url, final_url=current_url,
+                    http_status=response.status_code, retrieved_at=retrieved_at, content_sha256=None,
+                    source_domain=original_domain, ok=False, error_code="HTTP_ERROR",
+                    error_detail=f"HTTP {response.status_code} redirect with no Location header",
+                )
+            hop += 1
+            if hop > MAX_REDIRECTS:
+                raise AcquisitionRejectedError(
+                    f"request to {url!r} exceeded {MAX_REDIRECTS} redirects", code="TOO_MANY_REDIRECTS",
+                )
+            current_url = urljoin(current_url, location)
+            continue
+
+        break
+
+    final_url = current_url
     body = response.content
     content_sha256 = hashlib.sha256(body).hexdigest()
 
@@ -175,7 +235,7 @@ async def acquire_url(
         return AcquisitionResult(
             source_evidence_id=source_evidence_id, requested_url=url, final_url=final_url,
             http_status=response.status_code, retrieved_at=retrieved_at, content_sha256=content_sha256,
-            source_domain=source_domain, ok=False,
+            source_domain=original_domain, ok=False,
             error_code="HTTP_ERROR" if response.status_code >= 400 else "BOT_CHALLENGE",
             error_detail=f"HTTP {response.status_code}",
         )
@@ -183,7 +243,7 @@ async def acquire_url(
     return AcquisitionResult(
         source_evidence_id=source_evidence_id, requested_url=url, final_url=final_url,
         http_status=response.status_code, retrieved_at=retrieved_at, content_sha256=content_sha256,
-        source_domain=source_domain, ok=True, body_bytes=body,
+        source_domain=original_domain, ok=True, body_bytes=body,
     )
 
 
@@ -197,9 +257,29 @@ async def acquire_url(
 
 
 @dataclass
+class IngredientDetail:
+    """Independent-review Blocker 3: the clean chemical identity
+    (`raw_name`, never concentration-bearing) plus a structured
+    `declared_concentration`/`concentration_unit`, parallel by
+    `position` to `ParsedIngredients.ingredient_list_raw`'s verbatim
+    disclosure text -- see `catalog_source_adapter.IngredientDetail`,
+    the manifest-schema twin of this acquisition-side dataclass (kept
+    as two separate types deliberately: this one is this module's own
+    internal parse result, never a manifest object itself; `run_
+    acquisition.py` converts one into the other)."""
+
+    position: int
+    raw_name: str
+    declared_concentration: Optional[float] = None
+    concentration_unit: Optional[str] = None
+    section: Optional[str] = None  # "active" | "inactive" | None
+
+
+@dataclass
 class ParsedIngredients:
     status: str  # "OK" | "PARSE_FAILED" | "INGREDIENTS_NOT_FOUND" | "UNSUPPORTED_DOMAIN"
     ingredient_list_raw: List[str] = field(default_factory=list)
+    ingredient_details: List[IngredientDetail] = field(default_factory=list)
     ingredient_list_complete: bool = False
     detail: str = ""
 
@@ -248,6 +328,53 @@ def _split_ingredient_list(text: str) -> List[str]:
         cleaned = cleaned[:-1]
     entries = [_WHITESPACE_RE.sub(" ", e).strip() for e in _SPLIT_COMMA_RE.split(cleaned)]
     return [e for e in entries if e]
+
+
+# Independent-review Blocker 3: a manufacturer's own disclosed text
+# sometimes bakes a declared concentration directly into the
+# ingredient string -- both forms observed on real, live-fetched
+# pages this pass acquired: a trailing "NAME N%" (no parentheses,
+# e.g. CeraVe's "SALICYLIC ACID 2%") and a parenthetical "NAME (N%)"
+# (e.g. CeraVe's "HOMOSALATE (10%)"). Both are recognized and split
+# into (clean_name, concentration_value, "%") -- the concentration
+# never stays fused into what becomes an ingredient's own canonical
+# identity one layer up (see catalog_source_adapter.IngredientDetail).
+# An entry with neither shape (the overwhelming majority of any real
+# INCI list) is returned unchanged with concentration=None -- this is
+# a real, narrow pattern match, never a guess.
+_CONCENTRATION_PAREN_RE = re.compile(r"^(.*?)\s*\(\s*(\d+(?:\.\d+)?)\s*%\s*\)\s*$")
+_CONCENTRATION_TRAILING_RE = re.compile(r"^(.*?)\s+(\d+(?:\.\d+)?)\s*%\s*$")
+
+
+def _extract_concentration(entry: str) -> Tuple[str, Optional[float], Optional[str]]:
+    for pattern in (_CONCENTRATION_PAREN_RE, _CONCENTRATION_TRAILING_RE):
+        m = pattern.match(entry)
+        if not m:
+            continue
+        name = m.group(1).strip()
+        if not name:
+            continue
+        try:
+            return name, float(m.group(2)), "%"
+        except ValueError:
+            continue
+    return entry, None, None
+
+
+def _build_plain_details(entries: List[str], *, section: Optional[str] = None, start_position: int = 1) -> List[IngredientDetail]:
+    """Builds parallel `IngredientDetail`s for a flat list of already-
+    split, already-cleaned disclosure entries -- `start_position` lets
+    a caller concatenate an active-section block and an inactive-
+    section block (see `parse_cerave_page`) while keeping one
+    contiguous 1-based position sequence across both."""
+    details = []
+    for i, entry in enumerate(entries):
+        name, concentration, unit = _extract_concentration(entry)
+        details.append(IngredientDetail(
+            position=start_position + i, raw_name=name, declared_concentration=concentration,
+            concentration_unit=unit, section=section,
+        ))
+    return details
 
 
 def parse_cerave_page(html: str) -> ParsedIngredients:
@@ -308,15 +435,37 @@ def parse_cerave_page(html: str) -> ParsedIngredients:
             plain_text = text
 
     if active_text or inactive_text:
-        entries: List[str] = []
-        if active_text:
-            entries.extend(_split_ingredient_list(active_text))
-        if inactive_text:
-            entries.extend(_split_ingredient_list(inactive_text))
-        if not entries:
-            return ParsedIngredients(status="PARSE_FAILED", detail="active/inactive labels found but no entries extracted")
+        # Independent-review Blocker 2: a Drug Facts panel is a single
+        # disclosure with TWO required sections. Finding only one
+        # (a page layout this parser doesn't fully recognize, a
+        # missing paragraph, a future markup change) must never be
+        # reported as a complete ingredient list -- fail closed rather
+        # than silently publishing a half-disclosure as if it were the
+        # whole one.
+        if not (active_text and inactive_text):
+            missing = "Inactive Ingredients" if active_text else "Active Ingredients"
+            return ParsedIngredients(
+                status="PARSE_FAILED",
+                detail=(
+                    f"Drug Facts page markup found only the {'Active' if active_text else 'Inactive'} "
+                    f"Ingredients section (missing {missing}) -- refusing to report a complete ingredient "
+                    "list from a partial Drug Facts disclosure"
+                ),
+            )
+        active_entries = _split_ingredient_list(active_text)
+        inactive_entries = _split_ingredient_list(inactive_text)
+        if not active_entries or not inactive_entries:
+            return ParsedIngredients(
+                status="PARSE_FAILED",
+                detail="active/inactive labels found but no entries extracted from one or both sections",
+            )
+        entries = active_entries + inactive_entries
+        details = (
+            _build_plain_details(active_entries, section="active", start_position=1)
+            + _build_plain_details(inactive_entries, section="inactive", start_position=len(active_entries) + 1)
+        )
         return ParsedIngredients(
-            status="OK", ingredient_list_raw=entries, ingredient_list_complete=True,
+            status="OK", ingredient_list_raw=entries, ingredient_details=details, ingredient_list_complete=True,
             detail="Drug Facts label: active ingredient(s) listed first, then inactive ingredients, per FDA OTC labeling convention.",
         )
 
@@ -324,7 +473,10 @@ def parse_cerave_page(html: str) -> ParsedIngredients:
         entries = _split_ingredient_list(plain_text)
         if not entries:
             return ParsedIngredients(status="PARSE_FAILED", detail="ingredient paragraph found but no entries extracted")
-        return ParsedIngredients(status="OK", ingredient_list_raw=entries, ingredient_list_complete=True, detail="")
+        return ParsedIngredients(
+            status="OK", ingredient_list_raw=entries, ingredient_details=_build_plain_details(entries),
+            ingredient_list_complete=True, detail="",
+        )
 
     return ParsedIngredients(status="INGREDIENTS_NOT_FOUND", detail="keyIngredients block present but no usable paragraph")
 
@@ -346,7 +498,10 @@ def parse_ordinary_page(html: str) -> ParsedIngredients:
     entries = _split_ingredient_list(text)
     if not entries:
         return ParsedIngredients(status="PARSE_FAILED", detail="data-original-ingredients present but no entries extracted")
-    return ParsedIngredients(status="OK", ingredient_list_raw=entries, ingredient_list_complete=True, detail="")
+    return ParsedIngredients(
+        status="OK", ingredient_list_raw=entries, ingredient_details=_build_plain_details(entries),
+        ingredient_list_complete=True, detail="",
+    )
 
 
 def parse_laroche_posay_page(html: str) -> ParsedIngredients:
@@ -379,7 +534,10 @@ def parse_paulaschoice_page(html: str) -> ParsedIngredients:
     if m and m.group(1).strip():
         entries = _split_ingredient_list(m.group(1).strip())
         if entries:
-            return ParsedIngredients(status="OK", ingredient_list_raw=entries, ingredient_list_complete=True, detail="")
+            return ParsedIngredients(
+                status="OK", ingredient_list_raw=entries, ingredient_details=_build_plain_details(entries),
+                ingredient_list_complete=True, detail="",
+            )
     return ParsedIngredients(
         status="INGREDIENTS_NOT_FOUND",
         detail="ingredient disclosure not present in server-rendered HTML (loaded client-side; not fetched by this module)",

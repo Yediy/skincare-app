@@ -129,7 +129,9 @@ async def main() -> None:
                         "source_evidence_id": result.source_evidence_id,
                         "source_name": SOURCE_NAME,
                         "source_type": "curated_dataset",
-                        "source_url": result.final_url,
+                        "source_url": source["url"],
+                        "final_url": result.final_url,
+                        "content_sha256": result.content_sha256,
                         "retrieved_at": result.retrieved_at.isoformat(),
                         "jurisdiction": JURISDICTION,
                         "brand": source["brand"],
@@ -138,6 +140,22 @@ async def main() -> None:
                         "product_url": result.final_url,
                         "formulation_version_evidence": None,
                         "ingredient_list_raw": parsed.ingredient_list_raw,
+                        # Independent-review Blocker 3: the structured,
+                        # concentration-separated companion to
+                        # ingredient_list_raw -- see
+                        # app.domain.catalog_source_adapter.IngredientDetail's
+                        # own docstring for why this is what actually
+                        # drives canonical ingredient identity, never the
+                        # verbatim (possibly concentration-bearing)
+                        # disclosure string.
+                        "ingredient_details": [
+                            {
+                                "position": d.position, "raw_name": d.raw_name,
+                                "declared_concentration": d.declared_concentration,
+                                "concentration_unit": d.concentration_unit, "section": d.section,
+                            }
+                            for d in parsed.ingredient_details
+                        ],
                         "ingredient_list_complete": True,
                         "ingredient_source": _manifest_ingredient_source(result.source_domain),
                         "verification_date": date.today().isoformat(),

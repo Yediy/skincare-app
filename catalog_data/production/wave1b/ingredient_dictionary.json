@@ -1,0 +1,733 @@
+{
+  "_comment": "Wave 1B canonical ingredient dictionary (independent-review Blocker 4, PRODUCTION_CATALOG_WAVE_1B_REAL_DATA.md). Reviewable, committed, operator-curated structured data -- NOT reconstructed ad hoc from every raw manifest string at runtime. One entry per distinct chemical identity that appears anywhere in catalog_data/production/wave1b/manifest.jsonl (as ingredient_details[].raw_name, the concentration-stripped clean identity -- see app.domain.catalog_source_adapter.IngredientDetail). Generated once, deterministically, by grouping the manifest's own distinct normalized (lowercase/whitespace-collapsed) ingredient identities and picking one representative spelling per group; reviewed and committed here rather than re-derived at import time. 'aliases' lists every OTHER verbatim raw spelling this exact chemical identity was disclosed under across the acquired products -- the only ingredient genuinely needing this is plain Water, disclosed three different ways across CeraVe ('AQUA / WATER / EAU', or 'WATER' alone on Drug Facts-labeled pages) and The Ordinary ('Aqua (Water)'); a botanical extract like 'Aloe Barbadensis Leaf Water' or 'Rosa Damascena Flower Water' is never folded into this group -- those are chemically distinct ingredients that merely share the word 'water'. Every other entry has an empty alias list: its one observed raw spelling (modulo case, which resolve_ingredient() already normalizes) is its own canonical name. 'ingredient_type'/'inci_name' are left null throughout -- this pass does not fabricate a taxonomic classification it was never given by the source; a later, separately-reviewed pass may fill these in deliberately. app/domain/catalog_wave1b_population.py is the ONLY code that reads this file, and it performs exact (never fuzzy) normalized-string matching against it -- an ingredient identity encountered during population that has NO entry here is left as an open, unresolved review item, never guessed.",
+  "entries": [
+    {
+      "canonical_name": "Water",
+      "ingredient_type": null,
+      "inci_name": "Aqua",
+      "aliases": [
+        "AQUA / WATER / EAU",
+        "Aqua (Water)",
+        "Aqua / Water / Eau"
+      ]
+    },
+    {
+      "canonical_name": "1,2-Hexanediol",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Alanine",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "ALCOHOL DENAT.",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Aloe Barbadensis Leaf Water",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "ALUMINUM STARCH OCTENYLSUCCINATE",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Aminomethyl Propanol",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "AMMONIUM POLYACRYLOYLDIMETHYL TAURATE",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Arginine",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "ASCORBIC ACID",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Aspartic Acid",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Behentrimonium Methosulfate",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": [
+        "BEHENTRIMONIUM METHOSULFATE"
+      ]
+    },
+    {
+      "canonical_name": "BENZOIC ACID",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "BHT",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "CALCIUM GLUCONATE",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "CAPRYLIC/CAPRIC TRIGLYCERIDE",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Caprylyl Glycol",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": [
+        "CAPRYLYL GLYCOL"
+      ]
+    },
+    {
+      "canonical_name": "Carbomer",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": [
+        "CARBOMER"
+      ]
+    },
+    {
+      "canonical_name": "Centaurea Cyanus Flower Water",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Ceramide AP",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": [
+        "CERAMIDE AP"
+      ]
+    },
+    {
+      "canonical_name": "Ceramide EOP",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": [
+        "CERAMIDE EOP"
+      ]
+    },
+    {
+      "canonical_name": "Ceramide NP",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": [
+        "CERAMIDE NP"
+      ]
+    },
+    {
+      "canonical_name": "CETEARETH-20",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Cetearyl Alcohol",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": [
+        "CETEARYL ALCOHOL"
+      ]
+    },
+    {
+      "canonical_name": "CETEARYL ETHYLHEXANOATE",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Cetyl Alcohol",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": [
+        "CETYL ALCOHOL"
+      ]
+    },
+    {
+      "canonical_name": "Chlorphenesin",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": [
+        "CHLORPHENESIN"
+      ]
+    },
+    {
+      "canonical_name": "Cholesterol",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": [
+        "CHOLESTEROL"
+      ]
+    },
+    {
+      "canonical_name": "Citric Acid",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": [
+        "CITRIC ACID"
+      ]
+    },
+    {
+      "canonical_name": "COCAMIDOPROPYL HYDROXYSULTAINE",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Dextrin",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "DIMETHICONE",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Dimethyl Isosorbide",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Dipotassium Phosphate",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": [
+        "DIPOTASSIUM PHOSPHATE"
+      ]
+    },
+    {
+      "canonical_name": "Disodium EDTA",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": [
+        "DISODIUM EDTA"
+      ]
+    },
+    {
+      "canonical_name": "Ethoxydiglycol",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Ethylhexylglycerin",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": [
+        "ETHYLHEXYLGLYCERIN"
+      ]
+    },
+    {
+      "canonical_name": "Fructose",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Gellan Gum",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "GLUCONOLACTONE",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Glucose",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Glutamic Acid",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Glycerin",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": [
+        "GLYCERIN"
+      ]
+    },
+    {
+      "canonical_name": "Glyceryl Stearate",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Glycine",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Glycolic Acid",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": [
+        "GLYCOLIC ACID"
+      ]
+    },
+    {
+      "canonical_name": "HECTORITE",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Hexyl Nicotinate",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Hexylene Glycol",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Histidine",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "HOMOSALATE",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "HYDROLYZED HYALURONIC ACID",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "HYDROXYACETOPHENONE",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "HYDROXYETHYLCELLULOSE",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "HYDROXYPROPYL GUAR",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Isoceteth-20",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Isoleucine",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "ISOPROPYL MYRISTATE",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "LACTIC ACID",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "METHYLPARABEN",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Niacinamide",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": [
+        "NIACINAMIDE"
+      ]
+    },
+    {
+      "canonical_name": "OCTINOXATE",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "OCTOCRYLENE",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Panax Ginseng Root Extract",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "PANTHENOL",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Pca",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "PEG-150 PENTAERYTHRITYL TETRASTEARATE",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Peg-40 Stearate",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "PEG-6 CAPRYLIC/CAPRIC GLYCERIDES",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Pentylene Glycol",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "PETROLATUM",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Phenoxyethanol",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": [
+        "PHENOXYETHANOL"
+      ]
+    },
+    {
+      "canonical_name": "Phenylalanine",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Phytosphingosine",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": [
+        "PHYTOSPHINGOSINE"
+      ]
+    },
+    {
+      "canonical_name": "POLYGLYCERYL-3 DIISOSTEARATE",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Polysorbate 20",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": [
+        "POLYSORBATE 20"
+      ]
+    },
+    {
+      "canonical_name": "Potassium Phosphate",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": [
+        "POTASSIUM PHOSPHATE"
+      ]
+    },
+    {
+      "canonical_name": "Potassium Sorbate",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Proline",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Propanediol",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": [
+        "PROPANEDIOL"
+      ]
+    },
+    {
+      "canonical_name": "PROPYLENE GLYCOL",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "PROPYLPARABEN",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Rosa Damascena Flower Water",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "SALICYLIC ACID",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Serine",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Sodium Benzoate",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": [
+        "SODIUM BENZOATE"
+      ]
+    },
+    {
+      "canonical_name": "Sodium Chloride",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": [
+        "SODIUM CHLORIDE"
+      ]
+    },
+    {
+      "canonical_name": "Sodium Hyaluronate",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": [
+        "SODIUM HYALURONATE"
+      ]
+    },
+    {
+      "canonical_name": "SODIUM HYDROXIDE",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Sodium Lactate",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Sodium Lauroyl Lactylate",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": [
+        "SODIUM LAUROYL LACTYLATE"
+      ]
+    },
+    {
+      "canonical_name": "SODIUM LAUROYL SARCOSINATE",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "SODIUM METHYL COCOYL TAURATE",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Sodium Pca",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Stearyl Alcohol",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Sucrose",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Tamarindus Indica Seed Gum",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Tasmannia Lanceolata Fruit/Leaf Extract",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "TETRASODIUM EDTA",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Threonine",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Tocopherol",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": [
+        "TOCOPHEROL"
+      ]
+    },
+    {
+      "canonical_name": "TOCOPHERYL ACETATE",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Triethanolamine",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "TRIETHOXYCAPRYLYLSILANE",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "TRIETHYL CITRATE",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Trisodium Ethylenediamine Disuccinate",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": [
+        "TRISODIUM ETHYLENEDIAMINE DISUCCINATE"
+      ]
+    },
+    {
+      "canonical_name": "Urea",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Valine",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Xanthan Gum",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": [
+        "XANTHAN GUM"
+      ]
+    },
+    {
+      "canonical_name": "ZINC OXIDE",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    },
+    {
+      "canonical_name": "Zinc PCA",
+      "ingredient_type": null,
+      "inci_name": null,
+      "aliases": []
+    }
+  ]
+}

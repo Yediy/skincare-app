@@ -78,10 +78,20 @@ async def test_acquire_url_rejects_unapproved_domain_before_any_request():
     assert exc_info.value.code == "DOMAIN_NOT_APPROVED"
 
 
-async def test_acquire_url_rejects_redirect_that_leaves_approved_domain():
+async def test_acquire_url_rejects_off_domain_redirect_and_never_contacts_it():
+    """Independent-review Blocker 1: the prior design let httpx complete
+    the WHOLE redirect chain (`follow_redirects=True`) before this
+    module ever inspected the final URL -- an off-domain host could
+    already have been sent a request by the time REDIRECT_LEFT_
+    APPROVED_DOMAIN was raised. Proven here directly: the prohibited
+    handler branch increments a counter that must stay at zero."""
+    contacted_prohibited_host = 0
+
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal contacted_prohibited_host
         if "cerave.com" in str(request.url):
             return httpx.Response(302, headers={"Location": "https://www.evil-tracker.example/"})
+        contacted_prohibited_host += 1
         return httpx.Response(200, text="should never be reached")
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
@@ -90,11 +100,51 @@ async def test_acquire_url_rejects_redirect_that_leaves_approved_domain():
                 client, source_evidence_id="x", url="https://www.cerave.com/skincare/cleansers/foaming-facial-cleanser",
             )
     assert exc_info.value.code == "REDIRECT_LEFT_APPROVED_DOMAIN"
+    assert contacted_prohibited_host == 0
+
+
+async def test_acquire_url_rejects_redirect_between_two_independently_approved_domains():
+    """`cerave.com` redirecting to `theordinary.com` must be rejected
+    even though BOTH are independently on the allowlist -- a redirect
+    must stay on the SAME manufacturer's own domain as the original
+    request, never hop to a different approved manufacturer entirely.
+    The prohibited domain's own handler branch must never run."""
+    contacted_the_ordinary = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal contacted_the_ordinary
+        if "cerave.com" in str(request.url):
+            return httpx.Response(302, headers={"Location": "https://theordinary.com/en-us/some-product.html"})
+        contacted_the_ordinary += 1
+        return httpx.Response(200, text="should never be reached")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(AcquisitionRejectedError) as exc_info:
+            await acquire_url(client, source_evidence_id="x", url="https://www.cerave.com/skincare/some-product")
+    assert exc_info.value.code == "REDIRECT_LEFT_APPROVED_DOMAIN"
+    assert contacted_the_ordinary == 0
+
+
+async def test_acquire_url_follows_same_domain_relative_redirect():
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        if str(request.url) == "https://www.cerave.com/old-slug":
+            return httpx.Response(301, headers={"Location": "/new-slug"})
+        return httpx.Response(200, text="<html>real content</html>")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await acquire_url(client, source_evidence_id="x", url="https://www.cerave.com/old-slug")
+    assert result.ok is True
+    assert result.final_url == "https://www.cerave.com/new-slug"
+    assert calls == ["https://www.cerave.com/old-slug", "https://www.cerave.com/new-slug"]
 
 
 async def test_acquire_url_allows_redirect_that_stays_on_the_same_approved_domain():
     """The real, observed Paula's Choice case: a product page redirects
-    to a renamed slug on the SAME approved domain -- must succeed."""
+    to a renamed slug (absolute URL) on the SAME approved domain --
+    must succeed."""
     def handler(request: httpx.Request) -> httpx.Response:
         if str(request.url).endswith("/old-name/620.html"):
             return httpx.Response(301, headers={"Location": "https://www.paulaschoice.com/new-name/620.html"})
@@ -106,6 +156,21 @@ async def test_acquire_url_allows_redirect_that_stays_on_the_same_approved_domai
         )
     assert result.ok is True
     assert result.final_url == "https://www.paulaschoice.com/new-name/620.html"
+
+
+async def test_acquire_url_bounds_the_redirect_chain_length():
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        n = int(str(request.url).rsplit("hop", 1)[-1])
+        return httpx.Response(302, headers={"Location": f"/hop{n + 1}"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(AcquisitionRejectedError) as exc_info:
+            await acquire_url(client, source_evidence_id="x", url="https://www.cerave.com/hop0")
+    assert exc_info.value.code == "TOO_MANY_REDIRECTS"
+    assert len(calls) <= 10  # bounded, never an infinite loop
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +254,46 @@ def test_cerave_drug_product_preserves_active_before_inactive():
     assert "active" in result.detail.lower() and "inactive" in result.detail.lower()
     # Everything after the active ingredient is from the inactive list.
     assert "WATER" in result.ingredient_list_raw[1:]
+    # Independent-review Blocker 3: the structured companion separates
+    # concentration from identity and records the exact section
+    # boundary -- never reconstructable from prose alone.
+    active_details = [d for d in result.ingredient_details if d.section == "active"]
+    inactive_details = [d for d in result.ingredient_details if d.section == "inactive"]
+    assert [d.raw_name for d in active_details] == ["SALICYLIC ACID"]
+    assert active_details[0].declared_concentration == 2.0
+    assert active_details[0].concentration_unit == "%"
+    assert len(inactive_details) == len(result.ingredient_list_raw) - 1
+    assert all(d.declared_concentration is None for d in inactive_details)
+
+
+def test_cerave_drug_facts_active_only_is_incomplete():
+    """Independent-review Blocker 2: a Drug Facts panel with only the
+    Active Ingredients section present (Inactive missing -- a page
+    layout this parser doesn't fully recognize) must never be reported
+    as a complete ingredient list."""
+    html = (
+        '<div class="richtext keyIngredients-details__content">'
+        '<p><strong>Active Ingredients</strong>: HOMOSALATE (10%), ZINC OXIDE (8%)</p>'
+        "</div>"
+    )
+    result = parse_for_domain("cerave.com", html)
+    assert result.status == "PARSE_FAILED"
+    assert result.ingredient_list_complete is False
+    assert result.ingredient_list_raw == []
+    assert "active" in result.detail.lower()
+
+
+def test_cerave_drug_facts_inactive_only_is_incomplete():
+    html = (
+        '<div class="richtext keyIngredients-details__content">'
+        '<p><strong>Inactive Ingredients</strong>: WATER, GLYCERIN, NIACINAMIDE</p>'
+        "</div>"
+    )
+    result = parse_for_domain("cerave.com", html)
+    assert result.status == "PARSE_FAILED"
+    assert result.ingredient_list_complete is False
+    assert result.ingredient_list_raw == []
+    assert "inactive" in result.detail.lower()
 
 
 def test_cerave_nbsp_entities_are_decoded_not_leaked():
@@ -196,6 +301,16 @@ def test_cerave_nbsp_entities_are_decoded_not_leaked():
     assert result.status == "OK"
     assert not any("nbsp" in entry.lower() for entry in result.ingredient_list_raw)
     assert "ZINC OXIDE (8%)" in result.ingredient_list_raw
+    # Independent-review Blocker 3: four sunscreen actives, each with
+    # its OWN parenthetical concentration, each separated from its
+    # clean chemical identity.
+    actives = {d.raw_name: (d.declared_concentration, d.concentration_unit) for d in result.ingredient_details if d.section == "active"}
+    assert actives == {
+        "HOMOSALATE": (10.0, "%"),
+        "OCTINOXATE": (5.0, "%"),
+        "OCTOCRYLENE": (2.0, "%"),
+        "ZINC OXIDE": (8.0, "%"),
+    }
 
 
 def test_cerave_trailing_batch_code_is_stripped():
@@ -455,13 +570,16 @@ async def test_wave1b_shaped_insufficient_record_cannot_publish(wave1b_source_id
 
 async def test_published_real_record_retains_full_provenance(wave1b_source_id, catalog_admin_db_pool):
     """Imports and publishes ONE real Wave 1B manifest record end to
-    end and proves its provenance answers: source URL, retrieval time,
+    end and proves its provenance answers: source URL, final (post-
+    redirect) URL, retrieval time, acquisition content SHA-256,
     ingredient evidence classification, and the raw formulation text
-    actually seen -- all reconstructible from the published row. Every
-    one of the product's own real, disclosed ingredients is seeded as
-    a canonical ingredient first (exact-match, same normalize_name()
-    rule the real resolution pipeline uses) so this exercises the
-    actual publish path rather than stopping at human review."""
+    actually seen -- all reconstructible from the published row
+    (independent-review "Provenance hardening"). Every one of the
+    product's own real, disclosed ingredients (the CLEAN identity from
+    `ingredient_details`, matching what the real resolution pipeline
+    actually keys off of -- see independent-review Blocker 3) is seeded
+    as a canonical ingredient first so this exercises the actual
+    publish path rather than stopping at human review."""
     from app.db.catalog_repository import normalize_name
     from app.domain.catalog_ingestion_service import CatalogIngestionService
     from app.domain.catalog_publication_service import CatalogPublicationService
@@ -469,13 +587,14 @@ async def test_published_real_record_retains_full_provenance(wave1b_source_id, c
     body = (WAVE1B_DATA / "manifest.jsonl").read_bytes()
     first_record = json.loads(body.splitlines()[0])
     first_line = body.splitlines()[0] + b"\n"
+    assert first_record["content_sha256"], "expected the real manifest record to carry an acquisition content hash"
 
     async with catalog_admin_db_pool.acquire() as conn:
-        for raw_name in first_record["ingredient_list_raw"]:
+        for detail in first_record["ingredient_details"]:
             await conn.execute(
                 "INSERT INTO ingredients (canonical_name, normalized_name) VALUES ($1, $2) "
                 "ON CONFLICT DO NOTHING",
-                raw_name, normalize_name(raw_name),
+                detail["raw_name"], normalize_name(detail["raw_name"]),
             )
 
     outcome = await import_manifest(
@@ -497,6 +616,70 @@ async def test_published_real_record_retains_full_provenance(wave1b_source_id, c
         pub.formulation_id,
     )
     parsed_reference = json.loads(provenance["source_reference"])
-    assert parsed_reference["evidence"][0]["source_url"] == first_record["source_url"]
-    assert parsed_reference["evidence"][0]["source_evidence_id"] == first_record["source_evidence_id"]
+    evidence = parsed_reference["evidence"][0]
+    assert evidence["source_url"] == first_record["source_url"]
+    assert evidence["final_url"] == first_record["final_url"]
+    assert evidence["content_sha256"] == first_record["content_sha256"]
+    assert evidence["source_evidence_id"] == first_record["source_evidence_id"]
     assert provenance["verified_at"] is not None
+
+    # The full, verbatim as-disclosed ingredient list (including
+    # concentration text, where the source disclosed one) is durably
+    # reconstructible one hop away via import_record_id -- never lost
+    # just because canonical identity is now concentration-free.
+    import_record = await catalog_admin_db_pool.fetchrow(
+        "SELECT raw_payload FROM catalog_import_records WHERE id = $1", outcome.import_outcome.records[0].import_record_id,
+    )
+    raw_payload = json.loads(import_record["raw_payload"]) if isinstance(import_record["raw_payload"], str) else import_record["raw_payload"]
+    assert [i["raw_name"] for i in raw_payload["ingredients"]] == [d["raw_name"] for d in first_record["ingredient_details"]]
+
+
+async def test_published_drug_facts_record_preserves_concentration_and_section_durably(
+    wave1b_source_id, catalog_admin_db_pool,
+):
+    """A real Wave 1B Drug Facts product (a sunscreen, with FDA active
+    ingredients each carrying its own declared concentration) publishes
+    with its concentrations AND its active/inactive section boundary
+    durably on `formulation_ingredients` itself -- not merely
+    reconstructible via a generic prose note (independent-review
+    "Provenance hardening": 'a generic note...is not enough to
+    reconstruct the split')."""
+    from app.db.catalog_repository import normalize_name
+    from app.domain.catalog_ingestion_service import CatalogIngestionService
+    from app.domain.catalog_publication_service import CatalogPublicationService
+
+    lines = [l for l in (WAVE1B_DATA / "manifest.jsonl").read_text().splitlines() if l.strip()]
+    drug_facts_record = next(
+        json.loads(l) for l in lines if any(d["declared_concentration"] is not None for d in json.loads(l)["ingredient_details"])
+    )
+    line = json.dumps(drug_facts_record).encode("utf-8") + b"\n"
+
+    async with catalog_admin_db_pool.acquire() as conn:
+        for detail in drug_facts_record["ingredient_details"]:
+            await conn.execute(
+                "INSERT INTO ingredients (canonical_name, normalized_name) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                detail["raw_name"], normalize_name(detail["raw_name"]),
+            )
+
+    outcome = await import_manifest(
+        catalog_admin_db_pool, source_id=wave1b_source_id, file_bytes=line, allow_test_source=True,
+    )
+    await CatalogIngestionService(catalog_admin_db_pool).validate_batch(outcome.import_outcome.batch_id)
+    pub = await CatalogPublicationService(catalog_admin_db_pool).publish(
+        outcome.import_outcome.records[0].import_record_id, actor="test",
+    )
+
+    rows = await catalog_admin_db_pool.fetch(
+        """
+        SELECT i.canonical_name, fi.declared_concentration, fi.concentration_unit, fi.notes
+        FROM formulation_ingredients fi JOIN ingredients i ON i.id = fi.ingredient_id
+        WHERE fi.formulation_id = $1 AND fi.declared_concentration IS NOT NULL
+        """,
+        pub.formulation_id,
+    )
+    active_details = [d for d in drug_facts_record["ingredient_details"] if d["declared_concentration"] is not None]
+    assert len(rows) == len(active_details)
+    for row in rows:
+        assert row["notes"] is not None and "active ingredient" in row["notes"].lower()
+        assert float(row["declared_concentration"]) in {d["declared_concentration"] for d in active_details}
+        assert row["concentration_unit"] == "%"
