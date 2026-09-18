@@ -194,15 +194,28 @@ tests.
 - `MAX_FREQUENCY`/`BARRIER_RECOVERY` `ingredient_rules` are supported by
   the evaluation code but have no seeded fixture data exercising them —
   `PARTIALLY_IMPLEMENTED`.
-- No catalog-administration route (create/update a brand/product/
-  formulation/ingredient/rule via HTTP) exists — population is
-  migration/fixture-only this pass, deliberately (see "Access control"
-  above).
-- No product-matching/ranking step connects `PlanService`'s recommended
-  categories to real catalog products/formulations — `NOT_IMPLEMENTED`,
-  explicitly out of scope for this pass (affiliate ranking is a later,
-  separate pass per the brief).
+- No catalog-administration **HTTP route** (create/update a brand/product/
+  formulation/ingredient/rule) exists — deliberately: catalog mutation is
+  CLI-only (`python -m app.catalog_admin`), see `CATALOG_INGESTION_ARCHITECTURE.md`.
+- **Superseded — corrected, stale claim removed.** An earlier version of
+  this document stated no product-matching/ranking step existed at all.
+  That is no longer true: `app/domain/product_matching_service.py`'s
+  `ProductMatchingService` is real, `VERIFIED_IMPLEMENTED`, and connects
+  `PlanService`'s recommended categories to concrete, safety-evaluated
+  catalog products in the real production path (`app.domain.
+  recommendation_service.apply_product_matching_and_routine_safety()`,
+  both `/analyze` and the async worker) — see `PRODUCT_RECOMMENDATION_PIPELINE.md`
+  and `SECURITY_AND_SAFETY_NOTES.md`'s own "commercial-override invariant"
+  section for the full detail this document previously omitted.
+  Affiliate/sponsored ranking remains `NOT_IMPLEMENTED` and out of scope,
+  unchanged.
 - `PHOTOSENSITIVITY`/`IRRITATION` `ingredient_rules` are recorded as an
   advisory `restrictions["advisory_rule_types"]` list rather than a
   dedicated top-level reason code — there is no such code in this pass's
   brief, so one was not fabricated.
+- **Production Catalog Wave 1** (`PRODUCTION_CATALOG_WAVE_1.md`) built a
+  controlled acquisition/verification/reformulation pipeline on top of
+  this exact schema, reusing it unmodified (no migration) — but shipped
+  **zero real commercial product records**. This schema, as of this
+  document, still contains only synthetic/test data outside of whatever
+  an operator has separately imported.
