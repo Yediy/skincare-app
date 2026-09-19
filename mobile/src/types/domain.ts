@@ -176,3 +176,24 @@ export type AnalysisSubmitResponse = {
   request_id: string;
   status: AnalysisRequestStatus;
 };
+
+/** GET /api/v2/analyses (Mobile C3 -- history) response item --
+ * mirrors app/api/v2/analyses.py::AnalysisHistoryItemOut exactly. A
+ * summary row only, never the full result/plan -- see
+ * AnalysisStatusResponse for that. */
+export type AnalysisHistoryItem = {
+  analysis_id: string;
+  request_id: string;
+  status: AnalysisRequestStatus;
+  error_code?: string | null;
+  created_at: string;
+  completed_at?: string | null;
+};
+
+/** GET /api/v2/analyses response. `next_cursor` is opaque -- echoed
+ * back verbatim as `?cursor=...` to fetch the next page; null/absent
+ * means there is no next page. */
+export type AnalysisHistoryResponse = {
+  items: AnalysisHistoryItem[];
+  next_cursor?: string | null;
+};

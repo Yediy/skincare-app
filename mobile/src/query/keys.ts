@@ -9,4 +9,7 @@ export const queryKeys = {
    * them (e.g. a fresh "Analyze again") never shows the previous
    * attempt's stale result. */
   analysis: (analysisId: string) => ["analysis", analysisId] as const,
+  /** Mobile C3 -- the paginated history list, one key for the whole
+   * infinite query regardless of how many pages are loaded. */
+  analysisHistory: ["analysisHistory"] as const,
 };

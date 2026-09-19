@@ -102,6 +102,53 @@ async def get_request_by_id(pool: asyncpg.Pool, user_id: UUID, analysis_request_
     return dict(row) if row is not None else None
 
 
+async def list_requests_by_user(
+    pool: asyncpg.Pool,
+    user_id: UUID,
+    *,
+    limit: int,
+    before_created_at: Optional[datetime] = None,
+    before_id: Optional[UUID] = None,
+) -> List[Dict[str, Any]]:
+    """Mobile C3 (history): keyset pagination on (created_at, id) DESC
+    -- never a naive OFFSET, which would skip/duplicate rows if a new
+    analysis is created between two page fetches. No explicit
+    `WHERE user_id = ...`, same as every other function in this module
+    -- RLS (analysis_requests_isolation) is what actually scopes every
+    row to app.current_user_id, set below; this is proven directly by
+    test (another user's rows never appear regardless of what caller
+    code does or doesn't filter). `(created_at, id) < (cursor)` is a
+    strict tuple comparison, so it excludes the cursor row itself and
+    is stable even when two rows share the same created_at timestamp
+    (id is always unique). Caller passes `limit + 1` to detect
+    `has_more` without a separate COUNT query."""
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.current_user_id', $1, true)", str(user_id))
+            if before_created_at is not None and before_id is not None:
+                rows = await conn.fetch(
+                    """
+                    SELECT id, request_id, status, error_code, created_at, completed_at
+                    FROM analysis_requests
+                    WHERE (created_at, id) < ($2, $3)
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT $1
+                    """,
+                    limit, before_created_at, before_id,
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT id, request_id, status, error_code, created_at, completed_at
+                    FROM analysis_requests
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT $1
+                    """,
+                    limit,
+                )
+    return [dict(row) for row in rows]
+
+
 async def get_request_by_request_id(pool: asyncpg.Pool, user_id: UUID, request_id: str) -> Optional[Dict[str, Any]]:
     async with pool.acquire() as conn:
         async with conn.transaction():
