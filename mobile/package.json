@@ -51,7 +51,9 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "jest",
-    "test:watch": "jest --watch"
+    "test:watch": "jest --watch",
+    "test:release": "node --test scripts/release-readiness.test.mjs",
+    "release:check": "node scripts/release-readiness.mjs"
   },
   "jest": {
     "preset": "jest-expo",
