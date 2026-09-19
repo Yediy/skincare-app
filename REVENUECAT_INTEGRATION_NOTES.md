@@ -346,6 +346,11 @@ genuine, successful "durable receipt only" outcome, distinct from
 | Sandbox never grants production access | `user_entitlements` scoped by `environment`; `RevenueCatEntitlementService` filters by the running environment |
 | Reconciliation against RevenueCat's real, paginated active-entitlements endpoint | `app/domain/revenuecat_reconciliation_service.py` |
 | Ordinary runtime role (`skincare_app`) cannot write billing truth at all -- only the dedicated `skincare_billing` role can | migration `9815eb266923`, see `BILLING_ARCHITECTURE.md`'s "Database privilege boundary" |
+| Mobile client requests server-triggered reconciliation (Mobile C2) -- still never a per-request path; only reachable via an authenticated, rate-limited, explicit client action | `app/api/v2/billing.py::sync_billing_status`, see `BILLING_ARCHITECTURE.md`'s "Mobile client integration (C2)" |
 
 See `BILLING_ARCHITECTURE.md` for the end-to-end flow and
 `ENTITLEMENT_STATE_MACHINE.md` for the full state-transition table.
+
+## 8. Note on section 5's "never on the request path"
+
+`POST /api/v2/billing/sync` (Mobile C2, `MOBILE_C2_REVENUECAT.md`) is now reachable from an authenticated mobile-triggered route, not only from a future batch job. Section 5's title still holds in spirit: this is not called on *every* request, only on an explicit, rate-limited, operator-bounded client action (immediately after a purchase/restore, or when a user opens Customer Center) -- `reconcile_batch()`'s own automatic-scheduling gap (`OPEN_ENGINEERING_ITEMS.md` item 4a) remains genuinely open; this is a different, narrower, client-initiated trigger, not that scheduling.

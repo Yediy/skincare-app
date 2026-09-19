@@ -184,13 +184,113 @@ async def get_entitlement(
     provider: str,
     environment: str,
 ) -> Optional[asyncpg.Record]:
+    """`row_version` (the row's Postgres system `xmin` column, cast to
+    text) is included alongside every ordinary column so a caller that
+    is about to perform a slow operation (a network call) before
+    writing back can capture it as a compare-and-set token -- see
+    `apply_reconciliation_projection_if_unchanged()`'s own docstring
+    for why this exists and why it is not just another timestamp.
+    `xmin` is a Postgres system column (not part of `SELECT *`), so
+    adding it here cannot collide with or shadow any real column."""
     async with pool.acquire() as conn:
         async with conn.transaction():
             await conn.execute("SELECT set_config('app.current_user_id', $1, true)", str(user_id))
             return await conn.fetchrow(
                 """
-                SELECT * FROM user_entitlements
+                SELECT *, xmin::text AS row_version FROM user_entitlements
                 WHERE user_id = $1 AND entitlement_identifier = $2 AND provider = $3 AND environment = $4
                 """,
                 user_id, entitlement_identifier, provider, environment,
             )
+
+
+async def apply_reconciliation_projection_if_unchanged(
+    pool: asyncpg.Pool,
+    *,
+    user_id: UUID,
+    entitlement_identifier: str,
+    provider: str,
+    status: str,
+    effective_at: datetime,
+    expires_at: Optional[datetime],
+    will_renew: bool,
+    environment: str,
+    provider_customer_id: str,
+    last_provider_event_at: datetime,
+    expected_row_version: Optional[str],
+) -> EntitlementProjection:
+    """Reconciliation-only compare-and-set write. NEVER used by the
+    webhook path -- `apply_entitlement_projection()` above is
+    unchanged and remains the sole writer for real RevenueCat events;
+    this function exists because reconciliation's own write is
+    fundamentally different in kind: it is based on a snapshot read
+    *before* a slow, unlocked network call (RevenueCat's API), so an
+    ordinary event's own real timestamp cannot serialize it the way it
+    correctly serializes two webhook deliveries against each other.
+
+    `expected_row_version` must be the `row_version` a prior
+    `get_entitlement()` call returned (or `None` if that call found no
+    row at all), captured *before* the network call that produced the
+    `status`/`expires_at`/etc. being written here. It is compared
+    against the row's *current* Postgres `xmin` system column -- the
+    id of the transaction that last wrote the row, which changes on
+    every single UPDATE and can never collide between two genuinely
+    distinct writes (unlike a wall-clock timestamp, which can tie or
+    even run backwards relative to a slow caller). If ANY writer --
+    a webhook, another reconciliation attempt, any future legitimate
+    entitlement writer -- touched this row since the snapshot was
+    taken, `xmin` will have changed, and this call applies nothing.
+
+    `expected_row_version=None` means the caller observed no local row
+    before the network call: an `INSERT ... ON CONFLICT DO NOTHING` is
+    used instead of an `UPDATE`, so a row a concurrent writer created
+    in the meantime is left exactly as that writer made it, rather
+    than being silently overwritten. This is symmetric with the
+    UPDATE branch below: `applied=False` means "something else holds
+    this row now" in exactly the same way in both branches.
+
+    Both branches ALSO keep `last_provider_event_at <=` as a second,
+    redundant-in-the-common-case guard -- this never weakens or
+    replaces `apply_entitlement_projection()`'s own use of that same
+    column; it is simply always true here too (reconciliation's own
+    `now()` cannot be earlier than whatever was true when it read the
+    row), kept only as defense in depth.
+
+    Returns `EntitlementProjection(applied=False)` on ANY compare-and-
+    set failure -- the caller (`RevenueCatReconciliationService.
+    reconcile_user`) decides what that means; this function never
+    retries and never falls back to an unconditional write."""
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.current_user_id', $1, true)", str(user_id))
+            if expected_row_version is None:
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO user_entitlements
+                        (user_id, entitlement_identifier, provider, status, effective_at, expires_at,
+                         will_renew, environment, source_event_id, provider_customer_id, last_provider_event_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, $9, $10)
+                    ON CONFLICT (user_id, entitlement_identifier, provider, environment) DO NOTHING
+                    RETURNING id, status
+                    """,
+                    user_id, entitlement_identifier, provider, status, effective_at, expires_at,
+                    will_renew, environment, provider_customer_id, last_provider_event_at,
+                )
+            else:
+                row = await conn.fetchrow(
+                    """
+                    UPDATE user_entitlements
+                    SET status = $4, effective_at = $5, expires_at = $6, will_renew = $7,
+                        provider_customer_id = $9, last_provider_event_at = $10, updated_at = now()
+                    WHERE user_id = $1 AND entitlement_identifier = $2 AND provider = $3 AND environment = $8
+                      AND xmin::text = $11
+                      AND last_provider_event_at <= $10
+                    RETURNING id, status
+                    """,
+                    user_id, entitlement_identifier, provider, status, effective_at, expires_at,
+                    will_renew, environment, provider_customer_id, last_provider_event_at,
+                    expected_row_version,
+                )
+    if row is None:
+        return EntitlementProjection(applied=False)
+    return EntitlementProjection(applied=True, status=row["status"])

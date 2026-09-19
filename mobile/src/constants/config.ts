@@ -61,3 +61,21 @@ export const PRIVACY_POLICY_URL = productionSafeOptionalUrl(process.env.EXPO_PUB
 export const TERMS_URL = productionSafeOptionalUrl(process.env.EXPO_PUBLIC_TERMS_URL);
 export const SUPPORT_URL = productionSafeOptionalUrl(process.env.EXPO_PUBLIC_SUPPORT_URL);
 export const ACCOUNT_DELETION_URL = productionSafeOptionalUrl(process.env.EXPO_PUBLIC_ACCOUNT_DELETION_URL);
+
+/**
+ * RevenueCat mobile configuration (Mobile C2). Every value here is a
+ * PUBLIC RevenueCat mobile SDK key -- RevenueCat's own documented
+ * distinction is that these are meant to ship inside a client binary,
+ * unlike the backend-only secret REVENUECAT_API_KEY/
+ * REVENUECAT_WEBHOOK_AUTH/REVENUECAT_WEBHOOK_SIGNING_SECRET (never
+ * read by this app, never present in any EXPO_PUBLIC_* variable). All
+ * optional, same posture as the release URLs above: an unconfigured
+ * deployment (no key set, or REVENUECAT_ENABLED unset/false) must
+ * still run normally -- C2's billing UI simply reports itself
+ * unavailable rather than throwing at startup (see
+ * src/billing/revenuecat-context.tsx).
+ */
+export const REVENUECAT_ENABLED = process.env.EXPO_PUBLIC_REVENUECAT_ENABLED === "true";
+export const REVENUECAT_IOS_API_KEY = process.env.EXPO_PUBLIC_REVENUECAT_IOS_API_KEY;
+export const REVENUECAT_ANDROID_API_KEY = process.env.EXPO_PUBLIC_REVENUECAT_ANDROID_API_KEY;
+export const REVENUECAT_ENTITLEMENT_ID = process.env.EXPO_PUBLIC_REVENUECAT_ENTITLEMENT_ID || "premium";
