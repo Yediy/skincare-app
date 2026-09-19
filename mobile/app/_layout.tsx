@@ -3,6 +3,7 @@ import { Slot } from "expo-router";
 import React, { useState } from "react";
 
 import { SessionProvider } from "@/auth/session-context";
+import { RevenueCatProvider } from "@/billing/revenuecat-context";
 import { createAppQueryClient } from "@/query/query-client";
 import { ThemeProvider } from "@/theme/theme-provider";
 
@@ -20,7 +21,9 @@ export default function RootLayout() {
     <ThemeProvider>
       <QueryClientProvider client={queryClient}>
         <SessionProvider>
-          <Slot />
+          <RevenueCatProvider>
+            <Slot />
+          </RevenueCatProvider>
         </SessionProvider>
       </QueryClientProvider>
     </ThemeProvider>

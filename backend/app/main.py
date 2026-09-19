@@ -12,6 +12,7 @@ from pydantic import BaseModel, EmailStr, Field, field_validator
 from redis.exceptions import RedisError
 
 from app.api.v2.analyses import router as analyses_v2_router
+from app.api.v2.billing import router as billing_v2_router
 from app.api.v2.webhooks import router as webhooks_v2_router
 from app.config import settings
 from app.domain.priorities import PRIORITIES
@@ -99,6 +100,7 @@ app.add_middleware(
 )
 
 app.include_router(analyses_v2_router)
+app.include_router(billing_v2_router)
 app.include_router(webhooks_v2_router)
 
 

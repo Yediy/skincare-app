@@ -52,6 +52,7 @@ export default function Settings() {
 
       <Section>
         <Button label="Profile" variant="secondary" onPress={() => router.push("/(app)/profile")} />
+        <Button label="Subscription" variant="secondary" onPress={() => router.push("/(app)/subscription")} />
       </Section>
 
       <Section title="Privacy">

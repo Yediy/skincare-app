@@ -94,6 +94,16 @@ PASSWORD_RESET_EMAIL_POLICY = RateLimitPolicy(
     settings.rate_limit_password_reset_email_window_seconds,
     fail_open=False,
 )
+# POST /api/v2/billing/sync (Mobile C2, PRODUCTION_CATALOG-unrelated --
+# see BILLING_ARCHITECTURE.md's "Mobile client integration" section):
+# a dedicated, bounded per-user policy, never GENERAL_POLICY, because
+# this route makes an outbound call to RevenueCat's own API on the
+# caller's behalf and must never become an unlimited authenticated
+# proxy to an external provider.
+BILLING_SYNC_POLICY = RateLimitPolicy(
+    "billing_sync", settings.rate_limit_billing_sync_max, settings.rate_limit_billing_sync_window_seconds,
+    fail_open=False,
+)
 
 
 @dataclass(frozen=True)

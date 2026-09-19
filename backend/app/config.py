@@ -106,6 +106,16 @@ class Settings(BaseSettings):
     rate_limit_password_reset_email_max: int = 5
     rate_limit_password_reset_email_window_seconds: int = 3600
 
+    # POST /api/v2/billing/sync (Mobile C2): this route calls out to
+    # RevenueCat's own REST API on the caller's behalf -- a bounded,
+    # per-user limiter, not the general-purpose GENERAL_POLICY, so it
+    # can never become an unlimited authenticated proxy to an external
+    # provider. fail_open=False, same reasoning as AUTH_POLICY: an
+    # unverifiable Redis outage must not let an expensive external call
+    # through uncapped.
+    rate_limit_billing_sync_max: int = 10
+    rate_limit_billing_sync_window_seconds: int = 3600
+
     # Only X-Forwarded-For values relayed by a listed, trusted
     # reverse-proxy peer IP are honored for IP-based rate-limit keying
     # -- otherwise any client could simply forge the header to any

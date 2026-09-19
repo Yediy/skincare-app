@@ -184,6 +184,27 @@ async def reserve(
             return Reservation(id=row["id"], status=row["status"], replay=False, attempt_count=row["attempt_count"])
 
 
+async def get_current_period_usage_count(pool: asyncpg.Pool, user_id: UUID, period_key: str) -> int:
+    """Read-only: counts RESERVED + CONSUMED rows for this user/period --
+    the exact same predicate `reserve()` itself uses to decide DENIED,
+    reused here verbatim (never a second, differently-worded count
+    query that could drift out of sync with the real enforcement
+    logic). Never mutates anything -- safe to call from a status-only
+    endpoint (Mobile C2's `GET /api/v2/billing/status`) with no risk of
+    reserving, consuming, or releasing a slot merely by looking."""
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.current_user_id', $1, true)", str(user_id))
+            count = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM analysis_usage
+                WHERE user_id = $1 AND period_key = $2 AND status IN ('RESERVED', 'CONSUMED')
+                """,
+                user_id, period_key,
+            )
+            return int(count)
+
+
 async def consume(pool: asyncpg.Pool, user_id: UUID, reservation_id: UUID) -> None:
     """Marks a RESERVED reservation CONSUMED after the analysis it
     gated actually succeeded. A no-op (not an error) if the
