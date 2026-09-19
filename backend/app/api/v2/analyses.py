@@ -8,10 +8,12 @@ stack trace or internal exception text to the client.
 See ASYNC_ANALYSIS_ARCHITECTURE.md for the full request lifecycle this
 sits in front of.
 """
+import base64
 import uuid
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.config import settings
@@ -238,3 +240,86 @@ async def get_analysis(
         response.error_code = raw_code if raw_code in _SAFE_ERROR_CODES else "ANALYSIS_FAILED"
 
     return response
+
+
+# Mobile C3 (history/progress) -- read-only list of the calling user's
+# own past analyses. Deliberately never includes the full result/plan
+# payload (that's what GET /{analysis_id} is for) -- a summary row
+# only, so a large history stays cheap to page through.
+_HISTORY_DEFAULT_LIMIT = 20
+_HISTORY_MAX_LIMIT = 50
+
+
+class AnalysisHistoryItemOut(BaseModel):
+    analysis_id: str
+    request_id: str
+    status: str
+    error_code: Optional[str] = None
+    created_at: str
+    completed_at: Optional[str] = None
+
+
+class AnalysisHistoryResponse(BaseModel):
+    items: List[AnalysisHistoryItemOut]
+    # Opaque -- echo back verbatim as ?cursor=... to fetch the next
+    # page. Absent/null means there is no next page.
+    next_cursor: Optional[str] = None
+
+
+def _encode_history_cursor(created_at: datetime, request_id: uuid.UUID) -> str:
+    raw = f"{created_at.isoformat()}|{request_id}"
+    return base64.urlsafe_b64encode(raw.encode()).decode()
+
+
+def _decode_history_cursor(cursor: str) -> tuple[datetime, uuid.UUID]:
+    try:
+        raw = base64.urlsafe_b64decode(cursor.encode()).decode()
+        created_at_str, id_str = raw.split("|", 1)
+        return datetime.fromisoformat(created_at_str), uuid.UUID(id_str)
+    except (ValueError, UnicodeDecodeError):
+        # Never leak WHY decoding failed -- a malformed/tampered
+        # client-supplied cursor is indistinguishable from any other
+        # malformed one.
+        raise HTTPException(status_code=400, detail="Invalid cursor")
+
+
+@router.get("", response_model=AnalysisHistoryResponse)
+async def list_analyses(
+    limit: int = Query(default=_HISTORY_DEFAULT_LIMIT, ge=1, le=_HISTORY_MAX_LIMIT),
+    cursor: Optional[str] = None,
+    user_id: str = Depends(rate_limit_by_user(GENERAL_POLICY)),
+):
+    pool = get_db_pool()
+    user_uuid = uuid.UUID(user_id)
+
+    before_created_at: Optional[datetime] = None
+    before_id: Optional[uuid.UUID] = None
+    if cursor:
+        before_created_at, before_id = _decode_history_cursor(cursor)
+
+    # Fetch one extra row to learn whether another page exists without
+    # a separate COUNT(*) query.
+    rows = await analysis_repository.list_requests_by_user(
+        pool, user_uuid, limit=limit + 1, before_created_at=before_created_at, before_id=before_id,
+    )
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+
+    items = [
+        AnalysisHistoryItemOut(
+            analysis_id=str(row["id"]),
+            request_id=row["request_id"],
+            status=row["status"],
+            error_code=(
+                (row["error_code"] if row["error_code"] in _SAFE_ERROR_CODES else "ANALYSIS_FAILED")
+                if row["error_code"]
+                else None
+            ),
+            created_at=row["created_at"].isoformat(),
+            completed_at=row["completed_at"].isoformat() if row["completed_at"] else None,
+        )
+        for row in rows
+    ]
+    next_cursor = _encode_history_cursor(rows[-1]["created_at"], rows[-1]["id"]) if has_more and rows else None
+
+    return AnalysisHistoryResponse(items=items, next_cursor=next_cursor)

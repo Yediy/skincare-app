@@ -430,3 +430,146 @@ async def test_post_rejection_releases_the_usage_reservation(client, db_pool):
         headers=headers,
     )
     assert retry.status_code == 202
+
+
+# GET /api/v2/analyses (Mobile C3 -- history). No consent needed to
+# just *read* history -- consent gates submitting a NEW analysis
+# (POST), not looking at ones that already exist -- so these tests use
+# a plain signup+login where a scenario needs a second, unrelated user.
+
+
+async def test_history_requires_authentication(client):
+    resp = await client.get("/api/v2/analyses")
+    assert resp.status_code == 401
+
+
+async def test_history_is_empty_for_a_new_user(client):
+    headers = await _signup_login_consent(client, "v2-history-empty@test.com")
+    resp = await client.get("/api/v2/analyses", headers=headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["items"] == []
+    assert body["next_cursor"] is None
+
+
+async def test_history_only_returns_the_authenticated_users_own_analyses(client):
+    """The exact ownership-isolation property BLOCKER 1 exists to
+    guarantee, verified again here for the new list route specifically
+    -- a list endpoint is a fresh surface an IDOR could hide in even
+    when the single-record GET is provably safe."""
+    owner_headers = await _signup_login_consent(client, "v2-history-owner@test.com")
+    await client.post(
+        "/api/v2/analyses", json={"image_base64": IMAGE_B64, "request_id": str(uuid.uuid4())}, headers=owner_headers,
+    )
+    await client.post(
+        "/api/v2/analyses", json={"image_base64": IMAGE_B64, "request_id": str(uuid.uuid4())}, headers=owner_headers,
+    )
+
+    other_headers = await _signup_login_consent(client, "v2-history-other@test.com")
+    await client.post(
+        "/api/v2/analyses", json={"image_base64": IMAGE_B64, "request_id": str(uuid.uuid4())}, headers=other_headers,
+    )
+
+    owner_resp = await client.get("/api/v2/analyses", headers=owner_headers)
+    other_resp = await client.get("/api/v2/analyses", headers=other_headers)
+
+    assert len(owner_resp.json()["items"]) == 2
+    assert len(other_resp.json()["items"]) == 1
+    owner_ids = {item["analysis_id"] for item in owner_resp.json()["items"]}
+    other_ids = {item["analysis_id"] for item in other_resp.json()["items"]}
+    assert owner_ids.isdisjoint(other_ids)
+
+
+async def test_history_orders_newest_first(client):
+    headers = await _signup_login_consent(client, "v2-history-order@test.com")
+    first = await client.post(
+        "/api/v2/analyses", json={"image_base64": IMAGE_B64, "request_id": str(uuid.uuid4())}, headers=headers,
+    )
+    second = await client.post(
+        "/api/v2/analyses", json={"image_base64": IMAGE_B64, "request_id": str(uuid.uuid4())}, headers=headers,
+    )
+
+    resp = await client.get("/api/v2/analyses", headers=headers)
+    ids = [item["analysis_id"] for item in resp.json()["items"]]
+    assert ids == [second.json()["analysis_id"], first.json()["analysis_id"]]
+
+
+async def test_history_pagination_covers_every_row_exactly_once_no_duplicates_no_gaps(client, db_pool, app_db_pool):
+    """Rows are created directly via the repository (bypassing usage
+    quota/POST) since this test needs more rows than the free-tier
+    monthly allowance permits, and quota enforcement is irrelevant to
+    the pagination logic under test here."""
+    from app.db import analysis_repository
+
+    headers = await _signup_login_consent(client, "v2-history-paginate@test.com")
+    user_row = await db_pool.fetchrow("SELECT id FROM users WHERE email = $1", "v2-history-paginate@test.com")
+    user_id = user_row["id"]
+
+    submitted_ids = []
+    for _ in range(5):
+        req = await analysis_repository.create_request(app_db_pool, user_id, str(uuid.uuid4()))
+        submitted_ids.append(str(req["id"]))
+
+    collected: list[str] = []
+    cursor = None
+    pages_fetched = 0
+    while True:
+        params = {"limit": 2}
+        if cursor:
+            params["cursor"] = cursor
+        resp = await client.get("/api/v2/analyses", params=params, headers=headers)
+        assert resp.status_code == 200
+        body = resp.json()
+        collected.extend(item["analysis_id"] for item in body["items"])
+        pages_fetched += 1
+        assert pages_fetched <= 10, "pagination did not terminate -- likely a cursor bug"
+        if body["next_cursor"] is None:
+            break
+        cursor = body["next_cursor"]
+
+    # Every submitted id appears in the paginated walk exactly once,
+    # newest-first overall.
+    assert collected == list(reversed(submitted_ids))
+
+
+async def test_history_invalid_cursor_returns_400(client):
+    headers = await _signup_login_consent(client, "v2-history-badcursor@test.com")
+    resp = await client.get("/api/v2/analyses", params={"cursor": "not-a-real-cursor!!"}, headers=headers)
+    assert resp.status_code == 400
+
+
+async def test_history_limit_bounds_are_enforced(client):
+    headers = await _signup_login_consent(client, "v2-history-limit@test.com")
+    too_small = await client.get("/api/v2/analyses", params={"limit": 0}, headers=headers)
+    too_large = await client.get("/api/v2/analyses", params={"limit": 51}, headers=headers)
+    assert too_small.status_code == 422
+    assert too_large.status_code == 422
+
+
+async def test_history_masks_unsafe_error_codes_same_as_the_single_record_route(client, db_pool, app_db_pool):
+    from app.db import analysis_repository
+
+    headers = await _signup_login_consent(client, "v2-history-errorcode@test.com")
+    user_row = await db_pool.fetchrow("SELECT id FROM users WHERE email = $1", "v2-history-errorcode@test.com")
+    user_id = user_row["id"]
+
+    req = await analysis_repository.create_request(app_db_pool, user_id, str(uuid.uuid4()))
+    await analysis_repository.mark_failed(app_db_pool, user_id, req["id"], "INTERNAL_DB_CONSTRAINT_VIOLATION")
+
+    resp = await client.get("/api/v2/analyses", headers=headers)
+    assert resp.status_code == 200
+    item = resp.json()["items"][0]
+    assert item["status"] == "FAILED"
+    assert item["error_code"] == "ANALYSIS_FAILED"
+    assert "INTERNAL_DB_CONSTRAINT_VIOLATION" not in resp.text
+
+
+async def test_history_completed_at_is_null_until_completion(client):
+    headers = await _signup_login_consent(client, "v2-history-completedat@test.com")
+    await client.post(
+        "/api/v2/analyses", json={"image_base64": IMAGE_B64, "request_id": str(uuid.uuid4())}, headers=headers,
+    )
+    resp = await client.get("/api/v2/analyses", headers=headers)
+    item = resp.json()["items"][0]
+    assert item["completed_at"] is None
+    assert item["created_at"]

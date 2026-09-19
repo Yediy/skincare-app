@@ -1,5 +1,5 @@
 import { authorizedRequest } from "@/auth/auth-client-singleton";
-import type { AnalysisStatusResponse, AnalysisSubmitResponse } from "@/types/domain";
+import type { AnalysisHistoryResponse, AnalysisStatusResponse, AnalysisSubmitResponse } from "@/types/domain";
 
 export type SubmitAnalysisInput = {
   /** Base64-encoded JPEG. Never persisted, never logged, never placed
@@ -27,4 +27,13 @@ export function submitAnalysis(input: SubmitAnalysisInput): Promise<AnalysisSubm
  * every subsequent poll (src/analysis/use-analysis-polling.ts). */
 export function getAnalysis(analysisId: string): Promise<AnalysisStatusResponse> {
   return authorizedRequest<AnalysisStatusResponse>(`/api/v2/analyses/${analysisId}`);
+}
+
+/** GET /api/v2/analyses -- Mobile C3 (history): a paginated summary
+ * list of the caller's own past analyses, newest first. `cursor` is
+ * the opaque `next_cursor` a previous page returned; omit for the
+ * first page. */
+export function getAnalysisHistory(params: { cursor?: string | null } = {}): Promise<AnalysisHistoryResponse> {
+  const query = params.cursor ? `?cursor=${encodeURIComponent(params.cursor)}` : "";
+  return authorizedRequest<AnalysisHistoryResponse>(`/api/v2/analyses${query}`);
 }
