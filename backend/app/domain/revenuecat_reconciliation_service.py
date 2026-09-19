@@ -8,12 +8,36 @@ webhook that failed to process, an alias/transfer discrepancy) -- see
 BILLING_ARCHITECTURE.md's "Provider failure / staleness policy"
 section for the acceptable-staleness contract this implies.
 
-Not wired into any HTTP route this pass (Section 13: "do not reconcile
-every user on every request"). `reconcile_user` is single-user,
-`reconcile_batch` is a bounded batch suitable for a future scheduled
-job (cron/worker) -- neither is invoked automatically by this pass;
-that scheduling wiring is deliberately left for whoever operates this
-in production, tracked as DEFERRED in OPEN_ENGINEERING_ITEMS.md.
+`reconcile_user` is single-user, `reconcile_batch` is a bounded batch
+suitable for a scheduled job (cron/worker) -- neither runs itself on a
+schedule; that wiring is left for whoever operates this in production
+(see `OPEN_ENGINEERING_ITEMS.md`). `reconcile_user` IS reachable from
+`POST /api/v2/billing/sync` (Mobile C2, `app/api/v2/billing.py`), on
+an authenticated user's own explicit request.
+
+**Concurrency safety (independent-review fix).** `reconcile_user`
+reads the local projection, then makes an unlocked network call to
+RevenueCat, then writes -- between the read and the write, ANY other
+writer (a webhook, another concurrent reconciliation attempt) can
+legitimately mutate the same row, and that mutation is by definition
+newer information than what this call's own network response reflects.
+The write is therefore never unconditional: it is a database-enforced
+compare-and-set against the row's Postgres `xmin` system column,
+captured at the read above and carried unchanged through the network
+call (`app/db/revenuecat_repository.py::
+apply_reconciliation_projection_if_unchanged`). `xmin` changes on
+every UPDATE and can never collide between two genuinely distinct
+writes -- unlike `last_provider_event_at`/wall-clock time: reconciliation's
+own `now()` will almost always appear "newer" than a real webhook
+event's own (often seconds- or minutes-old, by the time it is
+processed) timestamp, regardless of how stale reconciliation's actual
+snapshot was. That property is exactly what let a stale reconciliation
+result overwrite a newer webhook-derived projection before this fix.
+A lost compare-and-set is reported back
+(`ReconciliationOutcome.stale_snapshot=True`) and
+this method neither retries nor falls back to an unconditional write --
+see `reconcile_user`'s own docstring. No database transaction or lock
+is held across the RevenueCat call at any point.
 
 Uses RevenueCat's documented v2 "list a customer's active entitlements"
 resource (`GET /projects/{project_id}/customers/{customer_id}/
@@ -225,6 +249,16 @@ class ReconciliationOutcome:
     corrected: bool
     remote_active: bool
     local_status: Optional[str]
+    # True only when a mismatch was found AND this attempt's own
+    # compare-and-set write lost to a concurrent writer (a webhook, or
+    # another reconciliation attempt) that changed the row between the
+    # local read and this attempt's write -- see reconcile_user()'s
+    # own docstring. `corrected` is always False when this is True:
+    # nothing from THIS attempt was applied. The row's current state
+    # (whatever the concurrent writer left it as) is authoritative;
+    # callers should read it fresh rather than trust anything about
+    # `remote_active`/`local_status` above as the row's current truth.
+    stale_snapshot: bool = False
 
 
 class RevenueCatReconciliationService:
@@ -242,11 +276,34 @@ class RevenueCatReconciliationService:
         self._environment = environment
 
     async def reconcile_user(self, user_id: UUID) -> ReconciliationOutcome:
+        """Concurrency-safe by construction (independent-review fix):
+        no database transaction or lock is held across the RevenueCat
+        network call below -- `local` is read and its connection
+        released BEFORE that call starts, and the eventual write is a
+        single, separately-connected, database-enforced compare-and-set
+        (`apply_reconciliation_projection_if_unchanged`), never a
+        read-then-write pair guarded only in application code.
+
+        `local["row_version"]` (the row's Postgres `xmin` at read time,
+        or `None` if no row existed) is captured here and carried
+        through the network call untouched -- this is the version this
+        method's own eventual write is conditioned on. If ANY writer
+        (a webhook, another concurrent reconciliation attempt, or any
+        future legitimate entitlement writer) changes this row between
+        this read and that write, the compare-and-set fails and this
+        method's own decision is discarded rather than applied -- see
+        `stale_snapshot` on the returned outcome. This method never
+        retries and never falls back to an unconditional write: a lost
+        race means some other, more current writer holds this row now,
+        and the next caller of `get_entitlement`/`GET /billing/status`
+        (or a future reconciliation attempt) sees ITS state, never a
+        stale one this method almost overwrote it with."""
         local = await revenuecat_repository.get_entitlement(
             self._pool, user_id, self._entitlement_identifier, "revenuecat", self._environment,
         )
         local_status = local["status"] if local is not None else None
         local_active = local_status in ("ACTIVE", "GRACE_PERIOD")
+        expected_row_version = local["row_version"] if local is not None else None
 
         try:
             items = await self._api_client.get_active_entitlements(str(user_id))
@@ -282,20 +339,32 @@ class RevenueCatReconciliationService:
             # pass wanting authoritative renewal state should query a
             # documented subscription resource, not synthesize one here.
             preserved_will_renew = local["will_renew"] if local is not None else True
-            await revenuecat_repository.apply_entitlement_projection(
+            result = await revenuecat_repository.apply_reconciliation_projection_if_unchanged(
                 self._pool, user_id=user_id, entitlement_identifier=self._entitlement_identifier,
                 provider="revenuecat", status=revenuecat_repository.ACTIVE, effective_at=now,
                 expires_at=_remote_expires_at(remote_entitlement or {}),
                 will_renew=preserved_will_renew,
-                environment=self._environment, source_event_id=None, provider_customer_id=str(user_id),
-                last_provider_event_at=now,
+                environment=self._environment, provider_customer_id=str(user_id),
+                last_provider_event_at=now, expected_row_version=expected_row_version,
             )
         else:
-            await revenuecat_repository.apply_entitlement_projection(
+            result = await revenuecat_repository.apply_reconciliation_projection_if_unchanged(
                 self._pool, user_id=user_id, entitlement_identifier=self._entitlement_identifier,
                 provider="revenuecat", status=revenuecat_repository.EXPIRED, effective_at=now,
-                expires_at=now, will_renew=False, environment=self._environment, source_event_id=None,
+                expires_at=now, will_renew=False, environment=self._environment,
                 provider_customer_id=str(user_id), last_provider_event_at=now,
+                expected_row_version=expected_row_version,
+            )
+
+        if not result.applied:
+            # Lost the compare-and-set: some other writer changed this
+            # row since `local` was read above. Deliberately do NOT
+            # retry and do NOT fall back to an unconditional write --
+            # see this method's own docstring and the module docstring.
+            observability_events.reconciliation_success(user_id=str(user_id), mismatch_found=True)
+            return ReconciliationOutcome(
+                user_id=user_id, mismatch_found=True, corrected=False,
+                remote_active=remote_active, local_status=local_status, stale_snapshot=True,
             )
 
         observability_events.reconciliation_success(user_id=str(user_id), mismatch_found=True)

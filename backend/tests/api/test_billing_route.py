@@ -303,6 +303,61 @@ async def test_sync_revenuecat_failure_leaves_existing_local_entitlement_unchang
     assert status_response.json()["has_premium_access"] is True
 
 
+async def test_sync_reflects_current_db_state_even_when_reconciliation_loses_the_cas_race(
+    client, monkeypatch, billing_db_pool,
+):
+    """Independent-review concurrency fix, re-audited at the route
+    level: if reconcile_user()'s own compare-and-set write loses to a
+    concurrent writer (simulated here from inside the fake API
+    client's call, exactly like the domain-level race tests in
+    test_revenuecat_reconciliation_service.py), the route's response
+    must still reflect the CURRENT database projection -- the
+    concurrent writer's state -- never a stale value derived from
+    variables captured before the RevenueCat call."""
+    _enable_billing(monkeypatch, paid_allowance=100)
+    headers = await _signup_login(client, "billing-sync-stale-race@test.com")
+    user_id = await _user_id_for(client, headers)
+    await _seed_entitlement(billing_db_pool, user_id, status="ACTIVE")
+
+    class RacingFakeAPIClient:
+        """The fake API call's own side effect simulates a concurrent
+        RENEWAL webhook landing while this sync's "network request" is
+        in flight -- reconciliation's own snapshot (remote says NOT
+        active, since items=[]) would otherwise expire the user."""
+
+        def __init__(self):
+            self.calls = []
+
+        async def get_active_entitlements(self, app_user_id: str):
+            self.calls.append(app_user_id)
+            from datetime import datetime, timedelta, timezone
+            concurrent_expires = datetime.now(timezone.utc) + timedelta(days=90)
+            await revenuecat_repository.apply_entitlement_projection(
+                billing_db_pool, user_id=user_id, entitlement_identifier=ENTITLEMENT_ID, provider="revenuecat",
+                status="ACTIVE", effective_at=datetime.now(timezone.utc), expires_at=concurrent_expires,
+                will_renew=True, environment="SANDBOX", source_event_id=None,
+                provider_customer_id=str(user_id), last_provider_event_at=datetime.now(timezone.utc),
+            )
+            return []  # reconciliation's own (stale-by-the-time-it-returns) remote snapshot
+
+    fake = RacingFakeAPIClient()
+    _patch_fake_api_client(monkeypatch, fake)
+
+    response = await client.post("/api/v2/billing/sync", headers=headers)
+    assert response.status_code == 200
+    body = response.json()
+
+    # The concurrent writer's state -- premium access preserved --
+    # never the stale "expire this user" decision reconciliation's own
+    # (now-rejected) snapshot would have produced.
+    assert body["has_premium_access"] is True
+    assert body["projection_status"] == "ACTIVE"
+    assert body["corrected"] is False  # reconciliation's own write did not land
+
+    row = await revenuecat_repository.get_entitlement(billing_db_pool, user_id, ENTITLEMENT_ID, "revenuecat", "SANDBOX")
+    assert row["status"] == "ACTIVE"
+
+
 async def test_sync_uses_a_dedicated_bounded_policy_distinct_from_general(redis_client):
     """BILLING_SYNC_POLICY is its own named policy (never GENERAL_
     POLICY's unlimited-feeling per-user budget) -- proven directly at

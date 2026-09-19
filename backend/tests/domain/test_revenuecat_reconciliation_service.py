@@ -160,3 +160,167 @@ async def test_reconcile_batch_continues_past_one_users_api_failure(db_pool, bil
 
     assert len(outcomes) == 1
     assert outcomes[0].user_id == good_user
+
+
+# ---------------------------------------------------------------------------
+# Concurrency / compare-and-set race regressions (independent-review fix).
+#
+# Each `RacingAPIClient` below performs a CONCURRENT mutation of the
+# same row from INSIDE `get_active_entitlements()` -- i.e. exactly at
+# the point in `reconcile_user()` representing "the network call is
+# in flight" -- deterministically, with no sleep/timing involved. This
+# reproduces the exact failure sequence the review described: the
+# concurrent writer's change happens strictly between reconciliation's
+# own local read (which captured a `row_version` before this call) and
+# reconciliation's own write (which is attempted only after this call
+# returns).
+# ---------------------------------------------------------------------------
+
+
+class RacingAPIClient:
+    """Wraps a real write (`side_effect`, typically a direct
+    `apply_entitlement_projection()` call simulating a webhook, or a
+    nested `reconcile_user()` call simulating a second concurrent
+    reconciliation attempt) that runs BEFORE this fake client returns
+    its own (possibly stale-relative-to-that-write) response."""
+
+    def __init__(self, items, side_effect):
+        self._items = items
+        self._side_effect = side_effect
+        self.calls = 0
+
+    async def get_active_entitlements(self, app_user_id: str):
+        self.calls += 1
+        await self._side_effect()
+        return self._items
+
+
+async def test_case1_active_snapshot_cannot_overwrite_newer_expiration_webhook(db_pool, billing_db_pool):
+    """Local starts EXPIRED. Reconciliation's remote check says ACTIVE
+    (a mismatch it intends to correct). While its network call is "in
+    flight", a real EXPIRATION-confirming webhook re-applies EXPIRED
+    with a fresh timestamp (bumping the row's version). Reconciliation
+    must not restore ACTIVE over that newer webhook state."""
+    user_id = await _create_user(db_pool, "recon-case1@test.com")
+    await _seed_entitlement(billing_db_pool, user_id, status="EXPIRED")
+
+    async def concurrent_expiration_webhook():
+        await revenuecat_repository.apply_entitlement_projection(
+            billing_db_pool, user_id=user_id, entitlement_identifier=ENTITLEMENT_ID, provider="revenuecat",
+            status="EXPIRED", effective_at=T0 + timedelta(minutes=5), expires_at=T0 + timedelta(minutes=5),
+            will_renew=False, environment="PRODUCTION", source_event_id=None,
+            provider_customer_id=str(user_id), last_provider_event_at=T0 + timedelta(minutes=5),
+        )
+
+    api_client = RacingAPIClient(
+        items=[_active_entitlement_item(T0 + timedelta(days=30))], side_effect=concurrent_expiration_webhook,
+    )
+
+    outcome = await _service(billing_db_pool, api_client).reconcile_user(user_id)
+
+    assert outcome.mismatch_found is True
+    assert outcome.corrected is False
+    assert outcome.stale_snapshot is True
+
+    row = await revenuecat_repository.get_entitlement(billing_db_pool, user_id, ENTITLEMENT_ID, "revenuecat", "PRODUCTION")
+    assert row["status"] == "EXPIRED"  # the webhook's state, never restored to ACTIVE
+
+
+async def test_case2_expired_snapshot_cannot_overwrite_newer_purchase_or_renewal(db_pool, billing_db_pool):
+    """Local starts ACTIVE. Reconciliation's remote check says NOT
+    active (a mismatch it intends to correct to EXPIRED). While its
+    network call is "in flight", a real RENEWAL webhook re-confirms
+    ACTIVE with a fresh timestamp and a new expiration. Reconciliation
+    must not expire that newer, paid state."""
+    user_id = await _create_user(db_pool, "recon-case2@test.com")
+    await _seed_entitlement(billing_db_pool, user_id, status="ACTIVE")
+    renewed_expires = T0 + timedelta(days=60)
+
+    async def concurrent_renewal_webhook():
+        await revenuecat_repository.apply_entitlement_projection(
+            billing_db_pool, user_id=user_id, entitlement_identifier=ENTITLEMENT_ID, provider="revenuecat",
+            status="ACTIVE", effective_at=T0 + timedelta(minutes=5), expires_at=renewed_expires,
+            will_renew=True, environment="PRODUCTION", source_event_id=None,
+            provider_customer_id=str(user_id), last_provider_event_at=T0 + timedelta(minutes=5),
+        )
+
+    api_client = RacingAPIClient(items=[], side_effect=concurrent_renewal_webhook)
+
+    outcome = await _service(billing_db_pool, api_client).reconcile_user(user_id)
+
+    assert outcome.mismatch_found is True
+    assert outcome.corrected is False
+    assert outcome.stale_snapshot is True
+
+    row = await revenuecat_repository.get_entitlement(billing_db_pool, user_id, ENTITLEMENT_ID, "revenuecat", "PRODUCTION")
+    assert row["status"] == "ACTIVE"  # the renewal's state, never expired by the stale reconciliation
+    assert row["expires_at"] == renewed_expires
+
+
+async def test_case3_no_local_row_race_cannot_overwrite_concurrently_created_row(db_pool, billing_db_pool):
+    """Reconciliation observes NO local entitlement row. While its
+    network call is "in flight" (remote says ACTIVE), a webhook
+    creates the row as EXPIRED (e.g. an immediate refund/revocation).
+    Reconciliation must not overwrite that newly-created row."""
+    user_id = await _create_user(db_pool, "recon-case3@test.com")
+
+    async def concurrent_webhook_creates_row():
+        await revenuecat_repository.apply_entitlement_projection(
+            billing_db_pool, user_id=user_id, entitlement_identifier=ENTITLEMENT_ID, provider="revenuecat",
+            status="EXPIRED", effective_at=T0, expires_at=T0, will_renew=False,
+            environment="PRODUCTION", source_event_id=None,
+            provider_customer_id=str(user_id), last_provider_event_at=T0,
+        )
+
+    api_client = RacingAPIClient(
+        items=[_active_entitlement_item(T0 + timedelta(days=30))], side_effect=concurrent_webhook_creates_row,
+    )
+
+    outcome = await _service(billing_db_pool, api_client).reconcile_user(user_id)
+
+    assert outcome.mismatch_found is True
+    assert outcome.corrected is False
+    assert outcome.stale_snapshot is True
+
+    row = await revenuecat_repository.get_entitlement(billing_db_pool, user_id, ENTITLEMENT_ID, "revenuecat", "PRODUCTION")
+    assert row is not None
+    assert row["status"] == "EXPIRED"  # the webhook's newly-created row, never overwritten to ACTIVE
+
+
+async def test_case6_concurrent_reconciliation_attempts_do_not_clobber_each_other(db_pool, billing_db_pool):
+    """Two reconciliation attempts for the same user race. The
+    "inner" one fully completes (read, remote call, CAS write) from
+    INSIDE the "outer" one's own network call, so it wins the write
+    race despite starting after the outer one's own local read. The
+    outer attempt's own write, based on its now-stale read, must lose
+    the compare-and-set rather than clobber the inner attempt's
+    result -- proven by using a distinguishable `expires_at` per
+    attempt, so a silent last-write-wins bug would be directly
+    observable in the final row."""
+    user_id = await _create_user(db_pool, "recon-case6@test.com")
+    await _seed_entitlement(billing_db_pool, user_id, status="EXPIRED")
+
+    inner_expires = T0 + timedelta(days=99)
+    outer_expires = T0 + timedelta(days=10)
+    inner_outcome_holder: dict = {}
+
+    async def run_inner_reconciliation():
+        inner_client = FakeAPIClient(items=[_active_entitlement_item(inner_expires)])
+        inner_service = _service(billing_db_pool, inner_client)
+        inner_outcome_holder["outcome"] = await inner_service.reconcile_user(user_id)
+
+    outer_api_client = RacingAPIClient(
+        items=[_active_entitlement_item(outer_expires)], side_effect=run_inner_reconciliation,
+    )
+
+    outer_outcome = await _service(billing_db_pool, outer_api_client).reconcile_user(user_id)
+    inner_outcome = inner_outcome_holder["outcome"]
+
+    assert inner_outcome.corrected is True
+    assert outer_outcome.corrected is False
+    assert outer_outcome.stale_snapshot is True
+
+    row = await revenuecat_repository.get_entitlement(billing_db_pool, user_id, ENTITLEMENT_ID, "revenuecat", "PRODUCTION")
+    assert row["status"] == "ACTIVE"
+    assert row["expires_at"] == inner_expires  # the attempt that actually won the write race
+    assert row["expires_at"] != outer_expires  # the outer attempt's stale write never landed
