@@ -145,6 +145,8 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm run lint
+      - name: Release readiness validator unit tests
+        run: npm run test:release
       - run: npm test -- --ci
       # System Integrity Gate V1: release/build-integrity gates, not
       # informational steps -- neither has continue-on-error. expo-doctor
