@@ -1,4 +1,4 @@
-import type { CustomerInfo, CustomerInfoListener, RevenueCatAdapter } from "@/billing/revenuecat-adapter";
+import type { CustomerInfo, RevenueCatAdapter } from "@/billing/revenuecat-adapter";
 import { PAYWALL_RESULT } from "@/billing/revenuecat-adapter";
 
 /**
@@ -32,30 +32,32 @@ export function createFakeCustomerInfo(overrides: Partial<CustomerInfo> = {}): C
 export type FakeAdapterState = {
   configureCalls: { apiKey: string; appUserID: string }[];
   logInCalls: string[];
-  logOutCalls: number;
   restoreCalls: number;
   presentPaywallCalls: number;
   presentCustomerCenterCalls: number;
   isConfiguredValue: boolean;
-  customerInfo: CustomerInfo;
-  listeners: CustomerInfoListener[];
   presentPaywallResult: PAYWALL_RESULT;
   restoreResult: CustomerInfo | Error;
+  /** Set to an Error to make the next logIn() call(s) reject --
+   * simulates a failed account switch (independent-review Blocker 1). */
+  logInError: Error | null;
+  /** Set to an Error to make the next presentCustomerCenter() call
+   * reject. */
+  presentCustomerCenterError: Error | null;
 };
 
 export function createFakeRevenueCatAdapter(): { adapter: RevenueCatAdapter; state: FakeAdapterState } {
   const state: FakeAdapterState = {
     configureCalls: [],
     logInCalls: [],
-    logOutCalls: 0,
     restoreCalls: 0,
     presentPaywallCalls: 0,
     presentCustomerCenterCalls: 0,
     isConfiguredValue: false,
-    customerInfo: createFakeCustomerInfo(),
-    listeners: [],
     presentPaywallResult: PAYWALL_RESULT.CANCELLED,
     restoreResult: createFakeCustomerInfo(),
+    logInError: null,
+    presentCustomerCenterError: null,
   };
 
   const adapter: RevenueCatAdapter = {
@@ -68,10 +70,8 @@ export function createFakeRevenueCatAdapter(): { adapter: RevenueCatAdapter; sta
     },
     async logIn(appUserID) {
       state.logInCalls.push(appUserID);
-      return state.customerInfo;
-    },
-    async getCustomerInfo() {
-      return state.customerInfo;
+      if (state.logInError) throw state.logInError;
+      return createFakeCustomerInfo({ originalAppUserId: appUserID });
     },
     async restorePurchases() {
       state.restoreCalls += 1;
@@ -84,12 +84,7 @@ export function createFakeRevenueCatAdapter(): { adapter: RevenueCatAdapter; sta
     },
     async presentCustomerCenter() {
       state.presentCustomerCenterCalls += 1;
-    },
-    addCustomerInfoUpdateListener(listener) {
-      state.listeners.push(listener);
-    },
-    removeCustomerInfoUpdateListener(listener) {
-      state.listeners = state.listeners.filter((l) => l !== listener);
+      if (state.presentCustomerCenterError) throw state.presentCustomerCenterError;
     },
   };
 

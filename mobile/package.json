@@ -50,7 +50,7 @@
     "web": "expo start --web",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "test": "jest --forceExit",
+    "test": "jest",
     "test:watch": "jest --watch"
   },
   "jest": {

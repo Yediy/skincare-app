@@ -2,6 +2,7 @@ import React, { useState } from "react";
 import { Platform, Text, View } from "react-native";
 
 import { PAYWALL_RESULT } from "@/billing/revenuecat-adapter";
+import { computeBillingActionReadiness } from "@/billing/billing-action-readiness";
 import { useRevenueCat } from "@/billing/revenuecat-context";
 import { classifyPurchaseError, purchaseErrorMessage, type PurchaseErrorCategory } from "@/billing/purchase-error";
 import { Button } from "@/components/button";
@@ -14,9 +15,20 @@ import { logger } from "@/utils/logger";
 /**
  * Mobile C2 Part 11. Server billing status (`useBillingStatusQuery`)
  * is the ONLY source of truth this screen renders premium/allowance
- * state from -- RevenueCat's `customerInfo` is used only to decide
- * when to show a paywall/trigger a sync, never to flip `hasPremium`
+ * state from -- RevenueCat local state is used only to decide when to
+ * present a paywall/trigger a sync, never to flip `hasPremium`
  * directly (Part 12).
+ *
+ * Purchase-action readiness (independent-review Blocker 2):
+ * `computeBillingActionReadiness` additionally requires the SERVER to
+ * agree that billing is enabled for this exact identified user and
+ * entitlement before any native purchase action becomes reachable --
+ * native availability (`revenueCat.availability === "READY"`) alone
+ * is not sufficient, since the mobile SDK can be configured while the
+ * server has billing disabled, or while server/mobile identity or
+ * entitlement configuration disagree. An existing server-granted
+ * entitlement is always displayed regardless of this gate -- only the
+ * ability to start a NEW purchase action is gated.
  */
 export default function Subscription() {
   const theme = useTheme();
@@ -27,6 +39,7 @@ export default function Subscription() {
   const [purchaseSyncing, setPurchaseSyncing] = useState(false);
   const [purchaseErrorCategory, setPurchaseErrorCategory] = useState<PurchaseErrorCategory | null>(null);
   const [restoreErrorCategory, setRestoreErrorCategory] = useState<PurchaseErrorCategory | null>(null);
+  const [customerCenterErrorCategory, setCustomerCenterErrorCategory] = useState<PurchaseErrorCategory | null>(null);
 
   async function afterLocalPurchaseSignal() {
     setPurchaseSyncing(true);
@@ -46,8 +59,19 @@ export default function Subscription() {
     setPurchaseErrorCategory(null);
     try {
       const result = await revenueCat.presentPaywall();
-      if (result === PAYWALL_RESULT.CANCELLED || result === PAYWALL_RESULT.NOT_PRESENTED || result === null) {
-        return; // user cancellation is not an error
+      if (result === PAYWALL_RESULT.CANCELLED || result === null) {
+        return; // true user cancellation -- not an error, no sync.
+      }
+      if (result === PAYWALL_RESULT.NOT_PRESENTED) {
+        // The server already told this screen the user is not
+        // premium (this button is only reachable in that state), yet
+        // the SDK suppressed the paywall -- meaning ITS local
+        // entitlement cache already disagrees with the server. That
+        // disagreement is exactly what /billing/sync exists to
+        // resolve; NOT_PRESENTED must never be treated like
+        // cancellation (independent-review Blocker 3).
+        await afterLocalPurchaseSignal();
+        return;
       }
       if (result === PAYWALL_RESULT.ERROR) {
         setPurchaseErrorCategory("GENERIC_FAILURE");
@@ -71,7 +95,16 @@ export default function Subscription() {
   }
 
   async function handleManageSubscription() {
-    await revenueCat.presentCustomerCenter();
+    setCustomerCenterErrorCategory(null);
+    try {
+      await revenueCat.presentCustomerCenter();
+    } catch (err) {
+      // Customer Center never successfully opened/closed -- do not
+      // sync (nothing could have changed) and never render/log the
+      // raw RevenueCat error object.
+      setCustomerCenterErrorCategory(classifyPurchaseError(err));
+      return;
+    }
     // Part 14: after Customer Center closes, trigger backend
     // reconciliation and refresh -- never assume anything changed,
     // just re-check with the server.
@@ -111,7 +144,14 @@ export default function Subscription() {
   const status = statusQuery.data;
   const isPremium = status.has_premium_access;
   const isGracePeriod = status.projection_status === "GRACE_PERIOD";
-  const revenueCatUnavailable = revenueCat.availability !== "READY";
+
+  const readiness = computeBillingActionReadiness({
+    mobileAvailability: revenueCat.availability,
+    configuredUserId: revenueCat.configuredUserId,
+    mobileEntitlementId: revenueCat.entitlementId,
+    serverStatus: status,
+  });
+  const actionsReady = readiness === "READY";
 
   return (
     <Screen>
@@ -142,11 +182,12 @@ export default function Subscription() {
         </Section>
       )}
 
-      {revenueCatUnavailable ? (
+      {!actionsReady ? (
         <Section title="Purchases unavailable">
-          <Text style={[theme.typography.body, { color: theme.colors.muted }]}>
-            {unavailableMessage(revenueCat.availability)}
-          </Text>
+          <Text style={[theme.typography.body, { color: theme.colors.muted }]}>{readinessMessage(readiness)}</Text>
+          {readiness === "IDENTITY_NOT_CONFIGURED" ? (
+            <Button label="Retry" variant="secondary" onPress={() => revenueCat.retryIdentification()} />
+          ) : null}
         </Section>
       ) : (
         <Section>
@@ -192,18 +233,31 @@ export default function Subscription() {
           </Text>
         </Section>
       ) : null}
+
+      {customerCenterErrorCategory ? (
+        <Section>
+          <Text style={[theme.typography.body, { color: theme.colors.danger }]}>
+            {purchaseErrorMessage(customerCenterErrorCategory)}
+          </Text>
+        </Section>
+      ) : null}
     </Screen>
   );
 }
 
-function unavailableMessage(availability: string): string {
-  switch (availability) {
-    case "DISABLED":
-      return "Subscriptions aren't enabled in this build.";
-    case "WEB_UNSUPPORTED":
-      return "Subscriptions aren't available on web.";
-    case "MISSING_KEY":
+function readinessMessage(reason: ReturnType<typeof computeBillingActionReadiness>): string {
+  switch (reason) {
+    case "MOBILE_UNAVAILABLE":
       return "Subscriptions are temporarily unavailable. Please try again later.";
+    case "SERVER_STATUS_UNAVAILABLE":
+      return "We couldn't load your subscription status. Please try again.";
+    case "BACKEND_DISABLED":
+      return "Subscriptions aren't enabled yet.";
+    case "IDENTITY_NOT_CONFIGURED":
+      return "Setting up your account for purchases…";
+    case "IDENTITY_MISMATCH":
+    case "ENTITLEMENT_MISMATCH":
+      return "We're having trouble verifying your account for purchases. Please try again later.";
     default:
       return "Subscriptions are temporarily unavailable. Please try again later.";
   }

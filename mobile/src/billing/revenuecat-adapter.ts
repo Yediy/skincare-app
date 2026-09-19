@@ -17,6 +17,18 @@ import RevenueCatUI, { PAYWALL_RESULT } from "react-native-purchases-ui";
  * during ordinary application sign-out (it would create an unwanted
  * anonymous `$RCAnonymousID` customer).
  *
+ * Also deliberately has no CustomerInfo-update-listener surface: an
+ * independent review of this file found a prior version registered
+ * `addCustomerInfoUpdateListener` but nothing ever consumed the
+ * CustomerInfo it captured (the subscription screen renders
+ * exclusively from server billing status, never from CustomerInfo --
+ * see app/(app)/subscription.tsx). Purchase, restore, and Customer
+ * Center already explicitly trigger a backend sync on their own; a
+ * passive listener added no real behavior, only a misleading
+ * pseudo-integration. If a genuine need for CustomerInfo push updates
+ * arises later, add it back with an explicit, bounded,
+ * coalesced-sync consumer -- not as a dangling side effect.
+ *
  * Every method signature here is exactly what the installed SDK's own
  * TypeScript definitions declare (node_modules/react-native-purchases
  * /dist/purchases.d.ts, node_modules/react-native-purchases-ui/src/
@@ -25,8 +37,6 @@ import RevenueCatUI, { PAYWALL_RESULT } from "react-native-purchases-ui";
  */
 export type { CustomerInfo };
 export { PAYWALL_RESULT, PURCHASES_ERROR_CODE };
-
-export type CustomerInfoListener = (info: CustomerInfo) => void;
 
 export interface RevenueCatAdapter {
   /** Whether Purchases.configure() has already been called in this
@@ -45,7 +55,6 @@ export interface RevenueCatAdapter {
    * custom-ID-only model (Part 8). Returns the new user's
    * CustomerInfo. */
   logIn(appUserID: string): Promise<CustomerInfo>;
-  getCustomerInfo(): Promise<CustomerInfo>;
   restorePurchases(): Promise<CustomerInfo>;
   /** Presents RevenueCat's dashboard-configured paywall for the
    * CURRENT/default Offering (no `offering` override passed here --
@@ -58,8 +67,6 @@ export interface RevenueCatAdapter {
    * re-sync backend billing status, never as proof of any specific
    * outcome. */
   presentCustomerCenter(): Promise<void>;
-  addCustomerInfoUpdateListener(listener: CustomerInfoListener): void;
-  removeCustomerInfoUpdateListener(listener: CustomerInfoListener): void;
 }
 
 export function createRevenueCatAdapter(): RevenueCatAdapter {
@@ -72,14 +79,9 @@ export function createRevenueCatAdapter(): RevenueCatAdapter {
       const result = await Purchases.logIn(appUserID);
       return result.customerInfo;
     },
-    getCustomerInfo: () => Purchases.getCustomerInfo(),
     restorePurchases: () => Purchases.restorePurchases(),
     presentPaywall: ({ requiredEntitlementIdentifier }) =>
       RevenueCatUI.presentPaywallIfNeeded({ requiredEntitlementIdentifier }),
     presentCustomerCenter: () => RevenueCatUI.presentCustomerCenter(),
-    addCustomerInfoUpdateListener: (listener) => Purchases.addCustomerInfoUpdateListener(listener),
-    removeCustomerInfoUpdateListener: (listener) => {
-      Purchases.removeCustomerInfoUpdateListener(listener);
-    },
   };
 }

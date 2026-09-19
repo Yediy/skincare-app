@@ -19,16 +19,19 @@ const mockRestorePurchases = jest.fn();
 const mockPresentCustomerCenter = jest.fn();
 let mockAvailability = "READY";
 
+let mockConfiguredUserId: string | null = "11111111-1111-1111-1111-111111111111";
+let mockEntitlementId = "premium";
+const mockRetryIdentification = jest.fn();
+
 jest.mock("@/billing/revenuecat-context", () => ({
   useRevenueCat: () => ({
     availability: mockAvailability,
-    entitlementId: "premium",
-    configuredUserId: "11111111-1111-1111-1111-111111111111",
-    customerInfo: null,
-    refreshCustomerInfo: jest.fn(),
+    entitlementId: mockEntitlementId,
+    configuredUserId: mockConfiguredUserId,
     presentPaywall: () => mockPresentPaywall(),
     restorePurchases: () => mockRestorePurchases(),
     presentCustomerCenter: () => mockPresentCustomerCenter(),
+    retryIdentification: () => mockRetryIdentification(),
   }),
 }));
 
@@ -85,9 +88,12 @@ async function renderScreen() {
 
 beforeEach(() => {
   mockAvailability = "READY";
+  mockConfiguredUserId = "11111111-1111-1111-1111-111111111111";
+  mockEntitlementId = "premium";
   mockPresentPaywall.mockReset();
   mockRestorePurchases.mockReset();
   mockPresentCustomerCenter.mockReset().mockResolvedValue(undefined);
+  mockRetryIdentification.mockReset();
   mockRefetch.mockReset();
   mockMutateAsync.mockReset().mockResolvedValue(undefined);
   mockStatusQuery = { isPending: true, isError: false, error: undefined, data: undefined, refetch: mockRefetch };
@@ -213,5 +219,113 @@ describe("Subscription screen", () => {
 
     await waitFor(() => expect(mockPresentCustomerCenter).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(mockMutateAsync).toHaveBeenCalledTimes(1));
+  });
+
+  it("Customer Center failing shows a bounded error, does not sync, and does not change premium state", async () => {
+    mockStatusQuery = { isPending: false, isError: false, error: undefined, data: PREMIUM_STATUS(), refetch: mockRefetch };
+    mockPresentCustomerCenter.mockRejectedValue(new Error("Customer Center failed"));
+    const { getByText } = await renderScreen();
+
+    fireEvent.press(getByText("Manage subscription"));
+
+    await waitFor(() => expect(mockPresentCustomerCenter).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(getByText(/Something went wrong with your purchase/i)).toBeTruthy());
+    // Customer Center never successfully closed -- no sync attempted.
+    expect(mockMutateAsync).not.toHaveBeenCalled();
+    // Still premium (unchanged) -- a Customer Center failure never
+    // revokes or alters displayed access.
+    expect(getByText("You have premium access.")).toBeTruthy();
+  });
+
+  it("independent-review Blocker 3: paywall NOT_PRESENTED is treated as evidence of stale local state, not cancellation -- triggers a backend sync", async () => {
+    mockStatusQuery = { isPending: false, isError: false, error: undefined, data: FREE_STATUS(), refetch: mockRefetch };
+    mockPresentPaywall.mockResolvedValue(PAYWALL_RESULT.NOT_PRESENTED);
+    const { getByText } = await renderScreen();
+
+    fireEvent.press(getByText("Upgrade to Premium"));
+
+    await waitFor(() => expect(mockPresentPaywall).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(mockMutateAsync).toHaveBeenCalledTimes(1));
+    // Server status remains the sole authority -- the mocked query
+    // still says free, so the screen still renders free-tier UI.
+    expect(getByText("Upgrade to Premium")).toBeTruthy();
+  });
+
+  it("true user cancellation (CANCELLED) never triggers a sync, unlike NOT_PRESENTED", async () => {
+    mockStatusQuery = { isPending: false, isError: false, error: undefined, data: FREE_STATUS(), refetch: mockRefetch };
+    mockPresentPaywall.mockResolvedValue(PAYWALL_RESULT.CANCELLED);
+    const { getByText } = await renderScreen();
+
+    fireEvent.press(getByText("Upgrade to Premium"));
+
+    await waitFor(() => expect(mockPresentPaywall).toHaveBeenCalledTimes(1));
+    expect(mockMutateAsync).not.toHaveBeenCalled();
+  });
+
+  describe("independent-review Blocker 2: purchase-action readiness gate", () => {
+    it("hides purchase actions when the server reports billing disabled, even though mobile is READY", async () => {
+      mockStatusQuery = {
+        isPending: false, isError: false, error: undefined, refetch: mockRefetch,
+        data: FREE_STATUS({ billing_enabled: false }),
+      };
+      const { getByText, queryByText } = await renderScreen();
+
+      expect(getByText(/2 of 3 free analyses remaining/i)).toBeTruthy();
+      expect(queryByText("Upgrade to Premium")).toBeNull();
+      expect(queryByText("Restore purchases")).toBeNull();
+      expect(getByText(/Purchases unavailable/i)).toBeTruthy();
+    });
+
+    it("hides purchase actions when the configured RevenueCat user differs from the server's app_user_id", async () => {
+      mockConfiguredUserId = "99999999-9999-9999-9999-999999999999";
+      mockStatusQuery = { isPending: false, isError: false, error: undefined, data: FREE_STATUS(), refetch: mockRefetch };
+      const { getByText, queryByText } = await renderScreen();
+
+      expect(queryByText("Upgrade to Premium")).toBeNull();
+      expect(queryByText("Restore purchases")).toBeNull();
+      expect(getByText(/Purchases unavailable/i)).toBeTruthy();
+      expect(mockPresentPaywall).not.toHaveBeenCalled();
+    });
+
+    it("hides purchase actions when the mobile and server entitlement identifiers disagree", async () => {
+      mockEntitlementId = "gold";
+      mockStatusQuery = {
+        isPending: false, isError: false, error: undefined, refetch: mockRefetch,
+        data: FREE_STATUS({ entitlement_identifier: "premium" }),
+      };
+      const { getByText, queryByText } = await renderScreen();
+
+      expect(queryByText("Upgrade to Premium")).toBeNull();
+      expect(getByText(/Purchases unavailable/i)).toBeTruthy();
+    });
+
+    it("offers a Retry action when RevenueCat identification hasn't completed yet, wired to retryIdentification()", async () => {
+      mockConfiguredUserId = null;
+      mockStatusQuery = { isPending: false, isError: false, error: undefined, data: FREE_STATUS(), refetch: mockRefetch };
+      const { getByText } = await renderScreen();
+
+      expect(getByText(/Purchases unavailable/i)).toBeTruthy();
+      fireEvent.press(getByText("Retry"));
+      expect(mockRetryIdentification).toHaveBeenCalledTimes(1);
+    });
+
+    it("existing premium access is always displayed even when purchase actions are unavailable", async () => {
+      mockStatusQuery = {
+        isPending: false, isError: false, error: undefined, refetch: mockRefetch,
+        data: PREMIUM_STATUS({ billing_enabled: false }),
+      };
+      const { getByText, queryByText } = await renderScreen();
+
+      expect(getByText("You have premium access.")).toBeTruthy();
+      expect(queryByText("Manage subscription")).toBeNull();
+    });
+
+    it("enables ordinary purchase actions when mobile availability, identity, and entitlement all match the server", async () => {
+      mockStatusQuery = { isPending: false, isError: false, error: undefined, data: FREE_STATUS(), refetch: mockRefetch };
+      const { getByText } = await renderScreen();
+
+      expect(getByText("Upgrade to Premium")).toBeTruthy();
+      expect(getByText("Restore purchases")).toBeTruthy();
+    });
   });
 });

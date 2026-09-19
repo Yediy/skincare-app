@@ -18,8 +18,8 @@
  * runs -- `jest.mock()` calls, unlike plain statements, ARE specially
  * hoisted by babel-plugin-jest-hoist, which is why this works).
  */
-import { act, render, waitFor } from "@testing-library/react-native";
-import React from "react";
+import { act, fireEvent, render, waitFor } from "@testing-library/react-native";
+import React, { useEffect } from "react";
 import { Text } from "react-native";
 
 jest.mock("@/constants/config", () => ({
@@ -60,12 +60,20 @@ import { SessionProvider } from "@/auth/session-context";
 // eslint-disable-next-line import/first
 import { __resetRevenueCatSingletonForTests, RevenueCatProvider, useRevenueCat } from "@/billing/revenuecat-context";
 
+let capturedContext: ReturnType<typeof useRevenueCat> | null = null;
+
 function Probe() {
   const rc = useRevenueCat();
+  useEffect(() => {
+    capturedContext = rc;
+  });
   return (
     <>
       <Text testID="availability">{rc.availability}</Text>
       <Text testID="configuredUserId">{rc.configuredUserId ?? "none"}</Text>
+      <Text testID="retry" onPress={() => rc.retryIdentification()}>
+        retry
+      </Text>
     </>
   );
 }
@@ -83,6 +91,7 @@ async function renderWithProviders(adapter: ReturnType<typeof createFakeRevenueC
 beforeEach(() => {
   __resetRevenueCatSingletonForTests();
   mockMe.mockReset();
+  capturedContext = null;
 });
 
 describe("RevenueCatProvider", () => {
@@ -202,5 +211,74 @@ describe("RevenueCatProvider", () => {
     // configure() was called exactly once, ever (for user A) -- user
     // B's transition used logIn, never a second configure().
     expect(state.configureCalls).toHaveLength(1);
+  });
+
+  it("independent-review Blocker 1: a failed account switch fails closed -- never exposes the previous user's id to the new session, never logs out, and a successful retry recovers", async () => {
+    const { adapter, state } = createFakeRevenueCatAdapter();
+    mockMe.mockResolvedValueOnce({ user_id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" });
+    const { getByTestId } = await renderWithProviders(adapter);
+
+    // User A configures successfully.
+    await act(() => {
+      setSessionStatusExternally("AUTHENTICATED");
+    });
+    await waitFor(() => expect(getByTestId("configuredUserId").props.children).toBe(
+      "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    ));
+    expect(state.configureCalls).toHaveLength(1);
+
+    // Sign out.
+    await act(() => {
+      setSessionStatusExternally("SIGNED_OUT");
+    });
+    await waitFor(() => expect(getByTestId("configuredUserId").props.children).toBe("none"));
+
+    // User B signs in, but the SDK's logIn(B) throws.
+    state.logInError = new Error("network error during logIn");
+    mockMe.mockResolvedValueOnce({ user_id: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb" });
+    await act(() => {
+      setSessionStatusExternally("AUTHENTICATED");
+    });
+
+    await waitFor(() => expect(state.logInCalls).toEqual(["bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"]));
+    // Fail-closed: configuredUserId must be null, NEVER user A's id,
+    // even though the SDK's own last-successful user is still A.
+    expect(getByTestId("configuredUserId").props.children).toBe("none");
+    // No logOut-equivalent call exists on this adapter at all (see
+    // its own docstring) -- nothing to assert beyond configureCalls
+    // staying at exactly the one call ever made, for user A.
+    expect(state.configureCalls).toHaveLength(1);
+
+    // While fail-closed, no purchase/restore/Customer-Center action
+    // for B can execute.
+    await act(async () => {
+      await capturedContext!.presentPaywall();
+      await capturedContext!.restorePurchases();
+      await capturedContext!.presentCustomerCenter();
+    });
+    expect(state.presentPaywallCalls).toBe(0);
+    expect(state.restoreCalls).toBe(0);
+    expect(state.presentCustomerCenterCalls).toBe(0);
+
+    // Retry succeeds this time.
+    state.logInError = null;
+    mockMe.mockResolvedValueOnce({ user_id: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb" });
+    await act(() => {
+      fireEvent.press(getByTestId("retry"));
+    });
+
+    await waitFor(() => expect(getByTestId("configuredUserId").props.children).toBe(
+      "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+    ));
+    expect(state.logInCalls).toEqual([
+      "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+    ]);
+
+    // B is now configured -- actions become available.
+    await act(async () => {
+      await capturedContext!.presentPaywall();
+    });
+    expect(state.presentPaywallCalls).toBe(1);
   });
 });
