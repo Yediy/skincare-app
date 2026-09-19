@@ -144,3 +144,19 @@ export function describeAnalysisErrorCode(errorCode: string | null | undefined):
 export function isRetakeableError(errorCode: string | null | undefined): boolean {
   return errorCode === "NO_FACE_DETECTED" || errorCode === "CAPTURE_QUALITY_FAILED" || errorCode === "INVALID_IMAGE";
 }
+
+const REQUEST_STATUS_COPY: Record<string, string> = {
+  RECEIVED: "Starting…",
+  QUEUED: "Waiting to start…",
+  PROCESSING: "Analyzing…",
+  COMPLETED: "Complete",
+  FAILED: "Didn't complete",
+  CANCELLED: "Cancelled",
+};
+
+/** Mobile C3 (history): a short, user-facing label for one
+ * `analysis_requests.status` value -- never the raw backend status
+ * string verbatim in the UI. */
+export function describeAnalysisRequestStatus(status: string): string {
+  return REQUEST_STATUS_COPY[status] ?? "Unknown";
+}

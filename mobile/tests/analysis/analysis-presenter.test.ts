@@ -1,6 +1,7 @@
 import {
   deriveAnalysisQualityLabel,
   describeAnalysisErrorCode,
+  describeAnalysisRequestStatus,
   describeCaptureFailureReason,
   describeMetricStatus,
   formatMetricValueForDisplay,
@@ -140,5 +141,20 @@ describe("isRetakeableError", () => {
     expect(isRetakeableError("IMAGE_STORAGE_UNAVAILABLE")).toBe(false);
     expect(isRetakeableError("PROCESSING_FAILED")).toBe(false);
     expect(isRetakeableError(null)).toBe(false);
+  });
+});
+
+describe("describeAnalysisRequestStatus", () => {
+  it("maps every known analysis_requests.status value to a distinct label", () => {
+    const known = ["RECEIVED", "QUEUED", "PROCESSING", "COMPLETED", "FAILED", "CANCELLED"];
+    const labels = known.map(describeAnalysisRequestStatus);
+    expect(new Set(labels).size).toBe(known.length);
+    for (const label of labels) {
+      expect(label).not.toBe("Unknown");
+    }
+  });
+
+  it("falls back to a safe label for an unrecognized status rather than rendering the raw value", () => {
+    expect(describeAnalysisRequestStatus("SOME_FUTURE_STATUS")).toBe("Unknown");
   });
 });

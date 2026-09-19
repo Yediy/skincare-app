@@ -1,5 +1,5 @@
 import { ApiError } from "@/api/errors";
-import { getAnalysis, submitAnalysis } from "@/api/analysis-api";
+import { getAnalysis, getAnalysisHistory, submitAnalysis } from "@/api/analysis-api";
 import { authorizedRequest } from "@/auth/auth-client-singleton";
 
 jest.mock("@/auth/auth-client-singleton");
@@ -54,5 +54,28 @@ describe("analysis-api", () => {
     mockAuthorizedRequest.mockRejectedValue(error);
 
     await expect(getAnalysis("missing")).rejects.toBe(error);
+  });
+
+  it("getAnalysisHistory() reads GET /api/v2/analyses with no query string on the first page", async () => {
+    const response = { items: [], next_cursor: null };
+    mockAuthorizedRequest.mockResolvedValue(response);
+
+    await expect(getAnalysisHistory()).resolves.toEqual(response);
+    expect(mockAuthorizedRequest).toHaveBeenCalledWith("/api/v2/analyses");
+  });
+
+  it("getAnalysisHistory() echoes an opaque cursor back verbatim, URL-encoded", async () => {
+    const response = { items: [], next_cursor: null };
+    mockAuthorizedRequest.mockResolvedValue(response);
+
+    await getAnalysisHistory({ cursor: "abc+def/==" });
+    expect(mockAuthorizedRequest).toHaveBeenCalledWith(`/api/v2/analyses?cursor=${encodeURIComponent("abc+def/==")}`);
+  });
+
+  it("getAnalysisHistory() propagates a backend error untouched", async () => {
+    const error = new ApiError({ status: 400, code: "VALIDATION_ERROR", message: "Invalid cursor", retryable: false });
+    mockAuthorizedRequest.mockRejectedValue(error);
+
+    await expect(getAnalysisHistory({ cursor: "bad" })).rejects.toBe(error);
   });
 });

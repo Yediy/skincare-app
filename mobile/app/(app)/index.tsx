@@ -9,11 +9,11 @@ import { useProfileQuery } from "@/profile/queries";
 import { useTheme } from "@/theme/theme-provider";
 
 /**
- * Home stays intentionally simple through Phase C1: an entry point
- * into skin analysis plus account status, nothing else. Per this
- * phase's own scope boundary, no subscription/paywall, progress
- * charts, purchase UI, history, or notifications belong here yet
- * (Phase C2/C3) -- this screen never fakes any of those or seeds a
+ * Home stays intentionally simple: an entry point into skin analysis,
+ * account status, and (Mobile C3) the user's own analysis history --
+ * nothing else. No subscription/paywall, progress charts/trend
+ * analytics, purchase UI, or notifications belong here yet (Phase
+ * C2/rest of C3) -- this screen never fakes any of those or seeds a
  * placeholder into a real data path.
  */
 export default function AppHome() {
@@ -44,6 +44,7 @@ export default function AppHome() {
         <Button label="Start skin analysis" onPress={() => router.push("/(app)/analysis")} />
       </Card>
 
+      <Button label="History" variant="secondary" onPress={() => router.push("/(app)/history")} />
       <Button label="Settings" variant="secondary" onPress={() => router.push("/(app)/settings")} />
     </Screen>
   );
