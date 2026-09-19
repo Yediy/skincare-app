@@ -17,6 +17,7 @@ from pydantic import ValidationError
 from app.domain.catalog_normalization import normalize_record
 from app.domain.catalog_source_adapter import (
     CuratedManifestSourceAdapter,
+    IngredientDetail,
     ManifestRecordError,
     SourceManifestRecord,
     compute_ingredient_fingerprint,
@@ -484,3 +485,128 @@ def test_raw_import_dict_never_contains_a_field_normalized_import_record_does_no
     record = SourceManifestRecord.model_validate(_manifest_record())
     raw = _to_raw([record])
     normalize_record(raw)  # raises MalformedRecordError if this contract is ever violated
+
+
+# ---------------------------------------------------------------------------
+# Independent-review Blocker 3: concentration separated from canonical
+# ingredient identity (`ingredient_details` -- optional, backward-
+# compatible companion to `ingredient_list_raw`).
+# ---------------------------------------------------------------------------
+
+
+def test_manifest_without_ingredient_details_is_unaffected_backward_compatibility():
+    """Every manifest predating this field (every Wave 1A test fixture,
+    every hand-authored curated manifest) has no `ingredient_details`
+    at all -- `raw_name` must still be the verbatim `ingredient_list_raw`
+    entry, exactly as before this field existed."""
+    record = SourceManifestRecord.model_validate(_manifest_record())
+    assert record.ingredient_details is None
+    raw = _to_raw([record])
+    assert raw["ingredients"] == [
+        {"raw_name": "Water", "position": 1},
+        {"raw_name": "Glycerin", "position": 2},
+        {"raw_name": "Sodium Chloride", "position": 3},
+    ]
+
+
+def test_ingredient_details_length_must_match_ingredient_list_raw():
+    with pytest.raises(ValidationError):
+        SourceManifestRecord.model_validate(_manifest_record(
+            ingredient_list_raw=["Salicylic Acid 2%", "Water"],
+            ingredient_details=[{"position": 1, "raw_name": "Salicylic Acid", "declared_concentration": 2, "concentration_unit": "%"}],
+        ))
+
+
+def test_ingredient_details_positions_must_be_contiguous_from_one():
+    with pytest.raises(ValidationError):
+        SourceManifestRecord.model_validate(_manifest_record(
+            ingredient_list_raw=["Salicylic Acid 2%", "Water"],
+            ingredient_details=[
+                {"position": 1, "raw_name": "Salicylic Acid", "declared_concentration": 2, "concentration_unit": "%"},
+                {"position": 3, "raw_name": "Water"},
+            ],
+        ))
+
+
+def test_ingredient_detail_section_must_be_active_or_inactive():
+    with pytest.raises(ValidationError):
+        IngredientDetail.model_validate({"position": 1, "raw_name": "Salicylic Acid", "section": "bogus"})
+
+
+def test_concentration_separated_from_canonical_identity_salicylic_acid_resolves_clean():
+    """The core Blocker 3 fix: `raw_name` in the mapped output is the
+    clean chemical identity -- never `"Salicylic Acid 2%"` -- with
+    `declared_concentration`/`concentration_unit` carried as their own
+    structured fields, matching `NormalizedIngredient`'s own existing
+    contract exactly."""
+    record = SourceManifestRecord.model_validate(_manifest_record(
+        ingredient_list_raw=["SALICYLIC ACID 2%", "Water", "Glycerin"],
+        ingredient_details=[
+            {"position": 1, "raw_name": "Salicylic Acid", "declared_concentration": 2, "concentration_unit": "%", "section": "active"},
+            {"position": 2, "raw_name": "Water", "section": "inactive"},
+            {"position": 3, "raw_name": "Glycerin", "section": "inactive"},
+        ],
+    ))
+    raw = _to_raw([record])
+    acid = raw["ingredients"][0]
+    assert acid["raw_name"] == "Salicylic Acid"
+    assert acid["declared_concentration"] == 2
+    assert acid["concentration_unit"] == "%"
+    assert "SALICYLIC ACID 2%" in acid["notes"]
+    assert "active" in acid["notes"].lower()
+    # normalize_record() must accept this shape -- it is exactly what
+    # NormalizedIngredient already declares.
+    normalize_record(raw)
+
+
+def test_two_different_concentrations_of_the_same_ingredient_share_canonical_raw_name():
+    """Two formulations disclosing the SAME chemical at two DIFFERENT
+    declared concentrations must map to the identical clean `raw_name`
+    -- this is what lets `resolve_ingredient()` treat them as one
+    canonical ingredient regardless of formulation-specific
+    concentration (never a separate ingredient per concentration)."""
+    low = SourceManifestRecord.model_validate(_manifest_record(
+        evidence_id="ev-low", ingredient_list_raw=["Retinol 0.3%", "Water"],
+        ingredient_details=[
+            {"position": 1, "raw_name": "Retinol", "declared_concentration": 0.3, "concentration_unit": "%"},
+            {"position": 2, "raw_name": "Water"},
+        ],
+    ))
+    high = SourceManifestRecord.model_validate(_manifest_record(
+        evidence_id="ev-high", ingredient_list_raw=["Retinol 1%", "Water"],
+        ingredient_details=[
+            {"position": 1, "raw_name": "Retinol", "declared_concentration": 1, "concentration_unit": "%"},
+            {"position": 2, "raw_name": "Water"},
+        ],
+    ))
+    low_raw = _to_raw([low])
+    high_raw = _to_raw([high])
+    assert low_raw["ingredients"][0]["raw_name"] == high_raw["ingredients"][0]["raw_name"] == "Retinol"
+    assert low_raw["ingredients"][0]["declared_concentration"] == 0.3
+    assert high_raw["ingredients"][0]["declared_concentration"] == 1
+    # Formulation version/fingerprint still differs (different verbatim
+    # disclosure) -- these remain two genuinely different formulations,
+    # only their INGREDIENT IDENTITY is unified.
+    assert low_raw["formulation_version"] != high_raw["formulation_version"]
+
+
+def test_ingredient_details_disagreement_across_group_is_a_trust_conflict():
+    a = SourceManifestRecord.model_validate(_manifest_record(
+        evidence_id="ev-a", formulation_version_evidence="v1",
+        ingredient_list_raw=["Salicylic Acid 2%", "Water"],
+        ingredient_details=[
+            {"position": 1, "raw_name": "Salicylic Acid", "declared_concentration": 2, "concentration_unit": "%"},
+            {"position": 2, "raw_name": "Water"},
+        ],
+    ))
+    b = SourceManifestRecord.model_validate(_manifest_record(
+        evidence_id="ev-b", formulation_version_evidence="v1",
+        ingredient_list_raw=["Salicylic Acid 2%", "Water"],
+        ingredient_details=[
+            {"position": 1, "raw_name": "Salicylic Acid", "declared_concentration": 0.5, "concentration_unit": "%"},
+            {"position": 2, "raw_name": "Water"},
+        ],
+    ))
+    groups, issues = group_manifest_records([a, b])
+    assert groups == []
+    assert any(i.code == "CONFLICTING_FORMULATION_EVIDENCE" for i in issues)

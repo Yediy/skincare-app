@@ -77,6 +77,20 @@ class NormalizedIngredient(BaseModel):
     # own NUMERIC(6, 3) precision/range (migration d70e5fc90775).
     declared_concentration: Optional[float] = Field(default=None, ge=0, le=100)
     concentration_unit: Optional[str] = Field(default=None, max_length=20)
+    # Independent-review Blocker 3 (Wave 1B repair): `raw_name` is the
+    # canonical CHEMICAL IDENTITY only (never a concentration-bearing
+    # string like "SALICYLIC ACID 2%" -- that would fragment one real
+    # ingredient into a separate canonical row per formulation's own
+    # concentration). `notes` is where a source's own verbatim
+    # disclosure text and/or an FDA Drug Facts active/inactive section
+    # label lives when it differs from the clean identity -- forwarded
+    # verbatim into formulation_ingredients.notes (an existing column,
+    # migration d70e5fc90775; see app/db/catalog_admin_repository.
+    # attach_formulation_ingredients, which already accepts it) so this
+    # evidence is durable on the published row itself, not only inside
+    # the immutable raw_payload/normalized_payload one hop away via
+    # import_record_id.
+    notes: Optional[str] = Field(default=None, max_length=MAX_LONG_STRING)
 
 
 class NormalizedSku(BaseModel):

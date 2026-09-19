@@ -23,6 +23,7 @@ from app.db import catalog_admin_repository as repo
 from app.domain.catalog_ingestion_service import CatalogIngestionService, ImportRejectedError
 from app.domain.catalog_publication_service import CatalogPublicationService, PublicationError
 from app.domain.catalog_review_service import CatalogReviewService, ReviewError
+from app.domain.catalog_wave1b_population import PopulationRejectedError, populate_wave1b
 from app.domain.catalog_wave_report import compute_wave_report, list_review_required_for_source, list_verification_status_for_source
 from app.domain.catalog_wave_service import WaveManifestRejectedError, import_manifest, validate_manifest_bytes
 
@@ -127,6 +128,22 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("report-verification-status", help="Wave 1: per-record VERIFIED/REVIEW_REQUIRED/INSUFFICIENT_SOURCE_DATA/REJECTED state for one source")
     p.add_argument("--source-id", required=True)
 
+    # -- Production Catalog Wave 1B (PRODUCTION_CATALOG_WAVE_1B_REAL_DATA.md) --
+    p = sub.add_parser(
+        "populate-wave1b-real-data",
+        help="Wave 1B: reproducible, idempotent, dry-run-capable population of real manufacturer data "
+             "(import -> interleaved validate/resolve against the committed ingredient dictionary -> publish)",
+    )
+    p.add_argument("manifest_path")
+    p.add_argument("--source-id", required=True)
+    p.add_argument("--dictionary-path", required=True, help="Path to the committed ingredient_dictionary.json")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument(
+        "--allow-test-source", action="store_true",
+        help="Required to import into a source whose registered name looks like a test fixture (test_/synthetic_/wave1_test_ prefix)",
+    )
+    p.add_argument("--actor", default=None)
+
     return parser
 
 
@@ -227,12 +244,21 @@ async def run(argv: List[str], pool: asyncpg.Pool, *, out=sys.stdout, err=sys.st
             statuses = await list_verification_status_for_source(pool, UUID(args.source_id))
             _print(statuses, out=out)
 
+        elif args.command == "populate-wave1b-real-data":
+            manifest_bytes = Path(args.manifest_path).read_bytes()
+            report = await populate_wave1b(
+                pool, source_id=UUID(args.source_id), manifest_bytes=manifest_bytes,
+                dictionary_path=Path(args.dictionary_path), actor=actor, dry_run=args.dry_run,
+                allow_test_source=args.allow_test_source,
+            )
+            _print(report, out=out)
+
         else:
             print(f"unknown command: {args.command}", file=err)
             return 1
         return 0
 
-    except (ImportRejectedError, PublicationError, ReviewError, WaveManifestRejectedError) as e:
+    except (ImportRejectedError, PublicationError, ReviewError, WaveManifestRejectedError, PopulationRejectedError) as e:
         print(f"error [{e.code}]: {e}", file=err)
         return 1
     except FileNotFoundError as e:

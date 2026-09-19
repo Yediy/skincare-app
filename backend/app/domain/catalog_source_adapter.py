@@ -180,6 +180,52 @@ class ManifestRecordError(ValueError):
         self.source_evidence_id = source_evidence_id
 
 
+class IngredientDetail(BaseModel):
+    """Independent-review Blocker 3 (Wave 1B repair): an OPTIONAL,
+    backward-compatible structured companion to `ingredient_list_raw`
+    -- keyed by 1-based `position` against that same list -- that
+    separates a formulation's *chemical identity* (`raw_name`, e.g.
+    `"Salicylic Acid"`) from its *declared concentration*
+    (`declared_concentration`/`concentration_unit`, e.g. `2`/`"%"`).
+    Without this, a manifest whose only ingredient representation is a
+    concentration-bearing string (`"SALICYLIC ACID 2%"`) would force
+    that whole string to become `ingredients.canonical_name` one layer
+    down, fragmenting one real chemical ingredient into a separate
+    canonical row per formulation's own concentration -- `resolve_
+    ingredient()`, every ingredient rule, and every user avoid/allergy
+    check all key off canonical identity, so that fragmentation would
+    silently break cross-product ingredient-level reasoning.
+
+    A manifest supplying no `ingredient_details` at all (every Wave 1A
+    manifest predating this field, and every synthetic test fixture
+    that has no reason to exercise it) is completely unaffected --
+    `manifest_record_to_raw_import_dict` falls back to its original
+    behavior (`raw_name` = the verbatim `ingredient_list_raw` entry)
+    exactly as before this field existed.
+
+    `section` is the FDA Drug Facts active/inactive boundary
+    (`"active"` | `"inactive"` | omitted for an ordinary cosmetic
+    ingredient) -- durable, structured evidence of exactly which
+    ingredients were disclosed as active vs. inactive, never
+    reconstructable from a bare prose note alone.
+    """
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    position: int = Field(ge=1)
+    raw_name: str = Field(min_length=1, max_length=MAX_SHORT_STRING)
+    declared_concentration: Optional[float] = Field(default=None, ge=0, le=100)
+    concentration_unit: Optional[str] = Field(default=None, max_length=20)
+    section: Optional[str] = Field(default=None, max_length=20)
+
+    @field_validator("section")
+    @classmethod
+    def _section_known(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in ("active", "inactive"):
+            raise ValueError(f"section {v!r} must be 'active', 'inactive', or omitted")
+        return v
+
+
 class SourceManifestRecord(BaseModel):
     """One row of a Wave 1 curated source manifest -- the schema this
     pass's brief asks for verbatim (source_name/source_type/source_url/
@@ -204,6 +250,17 @@ class SourceManifestRecord(BaseModel):
     source_name: str = Field(min_length=1, max_length=MAX_SHORT_STRING)
     source_type: str
     source_url: Optional[str] = Field(default=None, max_length=MAX_LONG_STRING)
+    # Provenance hardening (independent review): the FINAL resolved URL
+    # (post-redirect) and the acquisition content's own SHA-256 --
+    # both optional (a hand-curated/non-fetched manifest record has
+    # neither), both flow through to the durable published
+    # source_reference (`_build_evidence_entry`) so a published Wave 1B
+    # formulation's provenance can answer "what exact bytes, from what
+    # exact final URL, were behind this disclosure" without relying on
+    # the (separate, not-committed-for-every-record) acquisition
+    # ledger still existing.
+    final_url: Optional[str] = Field(default=None, max_length=MAX_LONG_STRING)
+    content_sha256: Optional[str] = Field(default=None, min_length=64, max_length=64)
     retrieved_at: datetime
     jurisdiction: Optional[str] = Field(default=None, max_length=50)
 
@@ -216,6 +273,13 @@ class SourceManifestRecord(BaseModel):
     # -- formulation evidence --
     formulation_version_evidence: Optional[str] = Field(default=None, max_length=50)
     ingredient_list_raw: List[str] = Field(default_factory=list)
+    # Optional, backward-compatible -- see IngredientDetail's own
+    # docstring. When present, MUST cover exactly the same positions
+    # (1..len(ingredient_list_raw), contiguous, no gaps/duplicates) as
+    # ingredient_list_raw -- validated below, since these two lists
+    # describing the same disclosure at different granularity must
+    # never silently drift apart in length.
+    ingredient_details: Optional[List[IngredientDetail]] = None
     ingredient_list_complete: bool
     ingredient_source: str
     verification_date: date
@@ -258,6 +322,24 @@ class SourceManifestRecord(BaseModel):
         for entry in v:
             if not entry or not entry.strip():
                 raise ValueError("ingredient_list_raw entries must be non-blank -- an empty placeholder is never a real ingredient")
+        return v
+
+    @field_validator("ingredient_details")
+    @classmethod
+    def _ingredient_details_matches_raw_list(
+        cls, v: Optional[List[IngredientDetail]], info,
+    ) -> Optional[List[IngredientDetail]]:
+        if v is None:
+            return v
+        raw_list = info.data.get("ingredient_list_raw") or []
+        if len(v) != len(raw_list):
+            raise ValueError(
+                f"ingredient_details has {len(v)} entries but ingredient_list_raw has {len(raw_list)} -- "
+                "the two must describe the same disclosure 1:1 by position"
+            )
+        positions = sorted(d.position for d in v)
+        if positions != list(range(1, len(v) + 1)):
+            raise ValueError(f"ingredient_details positions must be contiguous starting at 1 -- got {positions}")
         return v
 
 
@@ -404,6 +486,15 @@ def _describe_trust_conflicts(group: List[SourceManifestRecord]) -> List[str]:
         conflicts.append("ingredient_source differs")
     if len({r.formulation_version_evidence for r in group}) > 1:
         conflicts.append("formulation_version_evidence differs")
+    detail_shapes = {
+        tuple(
+            (d.position, d.raw_name, d.declared_concentration, d.concentration_unit, d.section)
+            for d in (r.ingredient_details or [])
+        )
+        for r in group
+    }
+    if len(detail_shapes) > 1:
+        conflicts.append("ingredient_details differs")
     return conflicts
 
 
@@ -484,10 +575,12 @@ def _build_evidence_entry(record: SourceManifestRecord) -> Dict[str, Any]:
         "source_evidence_id": record.source_evidence_id,
         "source_name": record.source_name,
         "source_url": record.source_url,
+        "final_url": record.final_url,
         "product_url": record.product_url,
         "retrieved_at": record.retrieved_at.isoformat(),
         "verification_date": record.verification_date.isoformat(),
         "ingredient_source": record.ingredient_source,
+        "content_sha256": record.content_sha256,
     }
 
 
@@ -582,11 +675,52 @@ def manifest_record_to_raw_import_dict(
         "source_type": formulation_source_type,
         "source_reference": source_reference,
         "ingredient_list_complete": record.ingredient_list_complete,
-        "ingredients": [
-            {"raw_name": name, "position": i + 1} for i, name in enumerate(record.ingredient_list_raw)
-        ],
+        "ingredients": _build_ingredient_dicts(record),
         "skus": skus,
     }
+
+
+def _build_ingredient_dicts(record: SourceManifestRecord) -> List[Dict[str, Any]]:
+    """Independent-review Blocker 3: when `ingredient_details` is
+    present, `raw_name` becomes the CLEAN chemical identity
+    (`detail.raw_name`, e.g. `"Salicylic Acid"`) -- never a
+    concentration-bearing string -- so `resolve_ingredient()` and every
+    downstream ingredient-identity lookup treats "Salicylic Acid 2%"
+    and a hypothetical "Salicylic Acid 0.5%" as the SAME canonical
+    ingredient, exactly as they chemically are. The verbatim disclosure
+    (`ingredient_list_raw[i]`, e.g. `"SALICYLIC ACID 2%"`) is never
+    discarded -- when it differs from the clean identity (case/
+    whitespace-insensitively), it survives in `notes`, alongside an FDA
+    Drug Facts active/inactive section label when the source declared
+    one. `notes` flows through normalize_record() ->
+    CatalogPublicationService.publish() ->
+    attach_formulation_ingredients(), landing durably on
+    formulation_ingredients.notes (an existing column) -- see
+    NormalizedIngredient.notes' own docstring.
+
+    Falls back to the original behavior (raw_name = the verbatim
+    ingredient_list_raw entry, no notes) when `ingredient_details` is
+    absent -- every manifest predating this field is unaffected."""
+    if not record.ingredient_details:
+        return [{"raw_name": name, "position": i + 1} for i, name in enumerate(record.ingredient_list_raw)]
+
+    raw_by_position = {i + 1: name for i, name in enumerate(record.ingredient_list_raw)}
+    ingredients: List[Dict[str, Any]] = []
+    for detail in sorted(record.ingredient_details, key=lambda d: d.position):
+        disclosed = raw_by_position.get(detail.position)
+        note_parts: List[str] = []
+        if disclosed is not None and normalize_name(disclosed) != normalize_name(detail.raw_name):
+            note_parts.append(f"disclosed as {disclosed!r}")
+        if detail.section:
+            note_parts.append(f"FDA Drug Facts {detail.section} ingredient")
+        ingredients.append({
+            "raw_name": detail.raw_name,
+            "position": detail.position,
+            "declared_concentration": detail.declared_concentration,
+            "concentration_unit": detail.concentration_unit,
+            "notes": "; ".join(note_parts) or None,
+        })
+    return ingredients
 
 
 @dataclass

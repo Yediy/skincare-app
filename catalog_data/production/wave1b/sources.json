@@ -1,0 +1,115 @@
+{
+  "_comment": "Production Catalog Wave 1B -- the exact, explicitly enumerated set of manufacturer product page URLs this pass was authorized to fetch. No other URL was ever requested by app.domain.catalog_acquisition.acquire_url() during this pass. This file is the single source of truth for 'which exact pages were approved' -- see PRODUCTION_CATALOG_WAVE_1B_REAL_DATA.md for the full acquisition record (outcome, HTTP status, content hash) of every entry below, both successful and not.",
+  "approved_domains": ["cerave.com", "laroche-posay.us", "theordinary.com", "paulaschoice.com"],
+  "sources": [
+    {
+      "source_evidence_id": "cerave-foaming-facial-cleanser",
+      "brand": "CeraVe",
+      "product_name": "Foaming Facial Cleanser",
+      "category": "cleanser",
+      "url": "https://www.cerave.com/skincare/cleansers/foaming-facial-cleanser"
+    },
+    {
+      "source_evidence_id": "cerave-hydrating-facial-cleanser",
+      "brand": "CeraVe",
+      "product_name": "Hydrating Facial Cleanser",
+      "category": "cleanser",
+      "url": "https://www.cerave.com/skincare/cleansers/hydrating-facial-cleanser"
+    },
+    {
+      "source_evidence_id": "cerave-pm-facial-moisturizing-lotion",
+      "brand": "CeraVe",
+      "product_name": "PM Facial Moisturizing Lotion",
+      "category": "moisturizer",
+      "url": "https://www.cerave.com/skincare/moisturizers/pm-facial-moisturizing-lotion"
+    },
+    {
+      "source_evidence_id": "cerave-daily-moisturizing-lotion",
+      "brand": "CeraVe",
+      "product_name": "Daily Moisturizing Lotion",
+      "category": "moisturizer",
+      "url": "https://www.cerave.com/skincare/moisturizers/daily-moisturizing-lotion"
+    },
+    {
+      "source_evidence_id": "cerave-moisturizing-cream",
+      "brand": "CeraVe",
+      "product_name": "Moisturizing Cream",
+      "category": "barrier_repair",
+      "url": "https://www.cerave.com/skincare/moisturizers/moisturizing-cream"
+    },
+    {
+      "source_evidence_id": "cerave-am-facial-moisturizing-lotion-spf30",
+      "brand": "CeraVe",
+      "product_name": "AM Facial Moisturizing Lotion SPF 30",
+      "category": "sunscreen",
+      "url": "https://www.cerave.com/skincare/moisturizers/am-facial-moisturizing-lotion-with-sunscreen"
+    },
+    {
+      "source_evidence_id": "cerave-acne-control-gel",
+      "brand": "CeraVe",
+      "product_name": "Acne Control Gel",
+      "category": "acne_treatment",
+      "url": "https://www.cerave.com/skincare/acne/acne-control-gel"
+    },
+    {
+      "source_evidence_id": "cerave-acne-control-cleanser",
+      "brand": "CeraVe",
+      "product_name": "Acne Control Cleanser",
+      "category": "acne_treatment",
+      "url": "https://www.cerave.com/skincare/cleansers/acne-salicylic-acid-cleanser"
+    },
+    {
+      "source_evidence_id": "cerave-skin-renewing-vitamin-c-serum",
+      "brand": "CeraVe",
+      "product_name": "Skin Renewing Vitamin C Serum",
+      "category": "serum",
+      "url": "https://www.cerave.com/skincare/facial-serums/skin-renewing-vitamin-c-serum"
+    },
+    {
+      "source_evidence_id": "ordinary-niacinamide-10-zinc-1",
+      "brand": "The Ordinary",
+      "product_name": "Niacinamide 10% + Zinc 1% Oil Control Serum",
+      "category": "serum",
+      "url": "https://theordinary.com/en-us/niacinamide-10-zinc-1-serum-100436.html"
+    },
+    {
+      "source_evidence_id": "ordinary-glycolic-acid-7-toner",
+      "brand": "The Ordinary",
+      "product_name": "Glycolic Acid 7% Exfoliating Toner",
+      "category": "exfoliant",
+      "url": "https://theordinary.com/en-us/glycolic-acid-7-exfoliating-toner-100418.html"
+    },
+    {
+      "source_evidence_id": "lrp-cicaplast-balm-b5",
+      "brand": "La Roche-Posay",
+      "product_name": "Cicaplast Balm B5+",
+      "category": "barrier_repair",
+      "url": "https://www.laroche-posay.us/skin-care/cicaplast-balm-b5-multi-purpose-soothing-balm/29115LRP.html",
+      "_note": "Attempted per this pass's own candidate list. laroche-posay.us returned an active Cloudflare bot challenge for every request during acquisition, including the plain homepage -- never acquired. See PRODUCTION_CATALOG_WAVE_1B_REAL_DATA.md."
+    },
+    {
+      "source_evidence_id": "lrp-toleriane-double-repair",
+      "brand": "La Roche-Posay",
+      "product_name": "Toleriane Double Repair Face Moisturizer",
+      "category": "moisturizer",
+      "url": "https://www.laroche-posay.us/skin-care/toleriane-double-repair-face-moisturizer/16350LRP.html",
+      "_note": "Same laroche-posay.us Cloudflare bot-challenge blocker -- never acquired."
+    },
+    {
+      "source_evidence_id": "pc-clear-bha-exfoliant",
+      "brand": "Paula's Choice",
+      "product_name": "Skin Perfecting 2% BHA Liquid Exfoliant",
+      "category": "exfoliant",
+      "url": "https://www.paulaschoice.com/skin-perfecting-2pct-bha-liquid-exfoliant/620.html",
+      "_note": "Page fetched successfully (redirected to the product's current name, 'Clear Regular Strength Anti-Redness Exfoliating Solution with 2% Salicylic Acid') but the ingredient disclosure is loaded client-side by JavaScript this module does not execute -- not present in the server-rendered HTML. Never imported. See PRODUCTION_CATALOG_WAVE_1B_REAL_DATA.md."
+    },
+    {
+      "source_evidence_id": "pc-perfectly-balanced-cleanser",
+      "brand": "Paula's Choice",
+      "product_name": "RESIST Perfectly Balanced Foaming Cleanser",
+      "category": "cleanser",
+      "url": "https://www.paulaschoice.com/resist-perfectly-balanced-foaming-cleanser/783.html",
+      "_note": "Same paulaschoice.com client-side-rendered-ingredients limitation -- fetched successfully, ingredients not present in server-rendered HTML, never imported."
+    }
+  ]
+}

@@ -273,6 +273,13 @@ class CatalogPublicationService:
                     "ingredient_id": resolved["id"], "position": ingredient["position"],
                     "declared_concentration": ingredient.get("declared_concentration"),
                     "concentration_unit": ingredient.get("concentration_unit"),
+                    # Provenance hardening (independent review): forwarded
+                    # verbatim onto formulation_ingredients.notes -- see
+                    # NormalizedIngredient.notes' own docstring for why
+                    # this is where source-faithful disclosure text and
+                    # Drug Facts active/inactive section labels durably
+                    # land, per ingredient, on the published row itself.
+                    "notes": ingredient.get("notes"),
                 })
 
         violations = _run_structural_backstop(normalized, resolved_ids)

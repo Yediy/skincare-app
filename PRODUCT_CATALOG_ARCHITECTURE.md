@@ -215,7 +215,22 @@ tests.
   brief, so one was not fabricated.
 - **Production Catalog Wave 1** (`PRODUCTION_CATALOG_WAVE_1.md`) built a
   controlled acquisition/verification/reformulation pipeline on top of
-  this exact schema, reusing it unmodified (no migration) — but shipped
-  **zero real commercial product records**. This schema, as of this
-  document, still contains only synthetic/test data outside of whatever
-  an operator has separately imported.
+  this exact schema, reusing it unmodified (no migration), shipping
+  zero real commercial product records itself. **Production Catalog
+  Wave 1B** (`PRODUCTION_CATALOG_WAVE_1B_REAL_DATA.md`) is the
+  follow-up pass that actually populated it: 11 real products (9
+  CeraVe, 2 The Ordinary), acquired from official manufacturer product
+  pages through a narrow, domain-allowlisted acquisition boundary
+  (`app/domain/catalog_acquisition.py`), imported and published through
+  this exact, unmodified pipeline via a reproducible, idempotent
+  population orchestrator (`app/domain/catalog_wave1b_population.py`)
+  driven by a committed ingredient dictionary — no schema change, still
+  no migration (declared concentration and Drug-Facts section labeling
+  reuse `formulation_ingredients`' own pre-existing `declared_
+  concentration`/`concentration_unit`/`notes` columns). Two of the four
+  domains Wave 1B was authorized to acquire
+  from (`laroche-posay.us`, `paulaschoice.com`) yielded no usable
+  products that pass (an active bot challenge and a client-side-
+  rendered ingredient disclosure, respectively — both documented, real
+  limitations, not a scope choice); those brands' candidate products
+  remain unacquired.
