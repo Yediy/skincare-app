@@ -21,6 +21,17 @@ from app.domain.revenuecat_reconciliation_service import (
 
 PROJECT_ID = "proj_test123"
 API_KEY = "sk_test_only_never_a_real_revenuecat_key_0123456789"
+# RevenueCat's own internal entitlement resource ID -- what
+# active_entitlements[].entitlement_id ACTUALLY contains on a real
+# response. Never the human/business lookup key ("premium") -- see
+# app/domain/revenuecat_reconciliation_service.py's module docstring
+# and Settings.revenuecat_entitlement_resource_id. This file tests only
+# RevenueCatAPIClient's HTTP/parsing contract (not entitlement
+# matching), but its fixtures must still use a real-shaped value so a
+# fabricated "premium" fixture can never mask the entitlement-id/
+# resource-id conflation bug again.
+ENTITLEMENT_LOOKUP_KEY = "premium"
+ENTITLEMENT_RESOURCE_ID = "entl_test_premium_123"
 
 
 def _client(handler) -> RevenueCatAPIClient:
@@ -69,7 +80,11 @@ async def test_parses_the_real_documented_response_shape():
             json={
                 "object": "list",
                 "items": [
-                    {"object": "customer.active_entitlement", "entitlement_id": "premium", "expires_at": 1658399423658},
+                    {
+                        "object": "customer.active_entitlement",
+                        "entitlement_id": ENTITLEMENT_RESOURCE_ID,
+                        "expires_at": 1658399423658,
+                    },
                 ],
                 "next_page": None,
                 "url": "/v2/projects/proj_test123/customers/user-abc-123/active_entitlements",
@@ -80,7 +95,7 @@ async def test_parses_the_real_documented_response_shape():
     items = await client.get_active_entitlements("user-abc-123")
 
     assert len(items) == 1
-    assert items[0]["entitlement_id"] == "premium"
+    assert items[0]["entitlement_id"] == ENTITLEMENT_RESOURCE_ID
     assert items[0]["expires_at"] == 1658399423658
 
 
@@ -101,17 +116,22 @@ async def test_follows_pagination_via_next_page():
         if str(request.url) == page_1_url:
             return httpx.Response(
                 200,
-                json={"object": "list", "items": [{"entitlement_id": "other_ent"}], "next_page": relative_next_page},
+                json={"object": "list", "items": [{"entitlement_id": "entl_other_product"}], "next_page": relative_next_page},
             )
         return httpx.Response(
-            200, json={"object": "list", "items": [{"entitlement_id": "premium", "expires_at": None}], "next_page": None},
+            200,
+            json={
+                "object": "list",
+                "items": [{"entitlement_id": ENTITLEMENT_RESOURCE_ID, "expires_at": None}],
+                "next_page": None,
+            },
         )
 
     client = _client(handler)
     items = await client.get_active_entitlements("user-abc-123")
 
     assert requested_urls == [page_1_url, page_2_url]
-    assert [item["entitlement_id"] for item in items] == ["other_ent", "premium"]
+    assert [item["entitlement_id"] for item in items] == ["entl_other_product", ENTITLEMENT_RESOURCE_ID]
 
 
 async def test_pagination_is_bounded_by_a_maximum_page_count():
@@ -147,7 +167,7 @@ async def test_cross_origin_next_page_is_rejected_without_leaking_authorization(
             200,
             json={
                 "object": "list",
-                "items": [{"entitlement_id": "other_ent"}],
+                "items": [{"entitlement_id": "entl_other_ent"}],
                 "next_page": "https://evil.example/steal",
             },
         )
@@ -175,7 +195,7 @@ async def test_repeating_next_page_loop_is_detected_and_fails_closed():
         call_count["n"] += 1
         return httpx.Response(
             200,
-            json={"object": "list", "items": [{"entitlement_id": "other_ent"}], "next_page": relative_next_page},
+            json={"object": "list", "items": [{"entitlement_id": "entl_other_ent"}], "next_page": relative_next_page},
         )
 
     client = _client(handler)

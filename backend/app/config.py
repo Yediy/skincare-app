@@ -186,7 +186,35 @@ class Settings(BaseSettings):
     # RevenueCatEntitlementService's own docstring for why every event
     # is projected under this single configured identifier rather than
     # whatever entitlement_ids a given event happens to carry.
+    #
+    # This is the human/business LOOKUP KEY (RevenueCat dashboard
+    # "identifier", e.g. "premium") -- used for webhook
+    # `entitlement_ids` gating, the local `user_entitlements.
+    # entitlement_identifier` projection key, and RevenueCat mobile
+    # `requiredEntitlementIdentifier` parity. It is NOT the same value
+    # RevenueCat API v2's `active_entitlements` resource returns as
+    # `entitlement_id` -- see revenuecat_entitlement_resource_id below.
     revenuecat_entitlement_id: str = "premium"
+    # RevenueCat API v2's INTERNAL entitlement resource ID (e.g.
+    # "entla1b2c3d4e5") -- a distinct value from
+    # revenuecat_entitlement_id above, obtained from the RevenueCat
+    # dashboard/API for this project's "premium" entitlement resource,
+    # never invented or defaulted to "premium" here (independent-review
+    # fix: the original code compared
+    # `active_entitlements[].entitlement_id` -- always an "entl..."
+    # resource ID on the real API -- against the lookup key, which can
+    # never match). Used ONLY when interpreting that one RevenueCat v2
+    # response shape (see
+    # app/domain/revenuecat_reconciliation_service.py::
+    # _find_active_entitlement_by_resource_id); never used for webhook
+    # gating, the local projection key, or anything mobile-facing --
+    # never bundled into the mobile client. Required whenever
+    # REVENUECAT_BILLING_ENABLED=true in production -- see
+    # _reject_unsafe_production_config below -- and the sync route
+    # fails closed (503) rather than calling RevenueCat with an
+    # ambiguous entitlement configuration if it's unset while billing
+    # is enabled.
+    revenuecat_entitlement_resource_id: Optional[str] = None
     # RevenueCat's own docs suggest ~5 minutes as a reasonable replay
     # tolerance for HMAC signature timestamps -- not a fabricated
     # number, see REVENUECAT_INTEGRATION_NOTES.md section 1.
@@ -323,6 +351,13 @@ class Settings(BaseSettings):
                 ("REVENUECAT_WEBHOOK_SIGNING_SECRET", self.revenuecat_webhook_signing_secret),
                 ("REVENUECAT_API_KEY", self.revenuecat_api_key),
                 ("REVENUECAT_PROJECT_ID", self.revenuecat_project_id),
+                # Distinct from REVENUECAT_ENTITLEMENT_ID (the lookup
+                # key, which always has a default and so is never
+                # blank) -- this is the v2 internal resource ID, which
+                # must never silently default to the lookup key. See
+                # revenuecat_entitlement_resource_id's own comment
+                # above.
+                ("REVENUECAT_ENTITLEMENT_RESOURCE_ID", self.revenuecat_entitlement_resource_id),
             ):
                 if not value or value.strip().lower() in _PLACEHOLDER_SECRET_VALUES:
                     errors.append(

@@ -73,6 +73,7 @@ npm run release:check -- --platform=android
 - Replace it with platform-specific RevenueCat keys in production.
 - Configure Apple and Google subscription products and connect them to RevenueCat.
 - Configure the production webhook, backend RevenueCat API credentials, billing database credential, and webhook worker.
+- Obtain the `premium` entitlement's actual internal resource ID (e.g. `entla1b2c3d4e5`, distinct from the `premium` lookup key above) from the RevenueCat dashboard/API for this project, and set backend-only `REVENUECAT_ENTITLEMENT_RESOURCE_ID` to it — production startup refuses to boot with `REVENUECAT_BILLING_ENABLED=true` and this unset, and `POST /api/v2/billing/sync` will not reconcile any user without it. Never invent this value or default it to `"premium"`; never bundle it into the mobile client.
 
 ### D. Native validation
 Before release, run at minimum:

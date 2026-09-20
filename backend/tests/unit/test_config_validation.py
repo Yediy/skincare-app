@@ -88,6 +88,12 @@ _REVENUECAT_SAFE_KWARGS = dict(
     revenuecat_api_key="a-real-configured-api-key",
     revenuecat_project_id="a-real-configured-project-id",
     revenuecat_billing_database_url="postgresql://skincare_billing_runtime:REDACTED@db.internal.example.com:5432/skincare",
+    # RevenueCat API v2's internal entitlement resource ID -- a
+    # distinct config value from revenuecat_entitlement_id (the lookup
+    # key, which always has a default and so was never covered by this
+    # required-secrets validation). Required whenever billing is
+    # enabled in production -- see the dedicated rejection test below.
+    revenuecat_entitlement_resource_id="entl_a_real_configured_resource_id",
 )
 
 
@@ -107,6 +113,19 @@ def test_production_rejects_revenuecat_billing_enabled_with_only_some_secrets_co
             revenuecat_billing_database_url=_REVENUECAT_SAFE_KWARGS["revenuecat_billing_database_url"],
             # api_key/project_id left unset
         )
+
+
+def test_production_rejects_revenuecat_billing_enabled_without_entitlement_resource_id():
+    """Regression for the entitlement-id/resource-id conflation bug:
+    REVENUECAT_ENTITLEMENT_RESOURCE_ID must never silently default to
+    the lookup key ("premium") or be left unset in production while
+    billing is enabled -- fails closed like every other required
+    RevenueCat secret."""
+    kwargs = {**_REVENUECAT_SAFE_KWARGS}
+    kwargs.pop("revenuecat_entitlement_resource_id")
+    with pytest.raises(ValueError) as exc_info:
+        Settings(_env_file=None, **_SAFE_PROD_KWARGS, **kwargs)
+    assert "REVENUECAT_ENTITLEMENT_RESOURCE_ID" in str(exc_info.value)
 
 
 def test_production_rejects_revenuecat_billing_enabled_without_billing_database_url():

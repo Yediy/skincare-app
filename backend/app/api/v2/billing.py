@@ -162,6 +162,16 @@ async def sync_billing_status(
     if not settings.revenuecat_billing_enabled:
         raise HTTPException(status_code=503, detail="RevenueCat billing is not enabled on this deployment.")
 
+    if not settings.revenuecat_entitlement_resource_id:
+        # Fail closed rather than call RevenueCat with an ambiguous
+        # entitlement configuration -- see Settings.
+        # revenuecat_entitlement_resource_id's own comment. Production
+        # startup already refuses to boot in this state (app/config.py),
+        # so this branch is realistically only reachable in a
+        # misconfigured non-production deployment.
+        logger.error("billing_sync_misconfigured: REVENUECAT_ENTITLEMENT_RESOURCE_ID is unset while billing is enabled")
+        raise HTTPException(status_code=503, detail="RevenueCat billing is misconfigured on this deployment.")
+
     billing_pool = get_billing_db_pool()
     environment = "PRODUCTION" if settings.is_production else "SANDBOX"
     api_client = RevenueCatAPIClient(
@@ -169,7 +179,9 @@ async def sync_billing_status(
     )
     reconciliation_service = RevenueCatReconciliationService(
         billing_pool, api_client,
-        entitlement_identifier=settings.revenuecat_entitlement_id, environment=environment,
+        entitlement_identifier=settings.revenuecat_entitlement_id,
+        entitlement_resource_id=settings.revenuecat_entitlement_resource_id,
+        environment=environment,
     )
 
     try:
