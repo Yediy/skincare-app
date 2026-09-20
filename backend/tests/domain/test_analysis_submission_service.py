@@ -468,7 +468,7 @@ async def test_same_request_id_is_independent_across_users(db_pool, app_db_pool)
 
     usage_a = UsagePolicyService(app_db_pool, FreeTierEntitlementService(monthly_allowance=5))
     usage_b = UsagePolicyService(app_db_pool, FreeTierEntitlementService(monthly_allowance=5))
-    image_store = FakeImageStore()
+    image_store = EphemeralAnalysisImageStore(FakeObjectStorage())
     queue = PostgresJobQueue(app_db_pool)
 
     service_a = AnalysisSubmissionService(
@@ -481,7 +481,7 @@ async def test_same_request_id_is_independent_across_users(db_pool, app_db_pool)
     )
 
     # Reuse the test suite's known-good small image fixture/helper input.
-    image_base64 = _valid_image_base64()
+    image_base64 = VALID_IMAGE_B64
     a = await service_a.submit(user_a, request_id, image_base64)
     b = await service_b.submit(user_b, request_id, image_base64)
 
