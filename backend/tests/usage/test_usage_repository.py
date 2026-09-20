@@ -259,3 +259,22 @@ async def test_different_users_have_independent_allowances(db_pool, app_db_pool)
     # user_a is now at their limit -- user_b, same period, is unaffected.
     result_b = await usage_repository.reserve(app_db_pool, user_b, str(uuid.uuid4()), "2026-09", allowance=2)
     assert result_b.status == usage_repository.RESERVED
+
+
+async def test_same_request_id_is_scoped_per_user(db_pool, app_db_pool):
+    """A client-generated idempotency key belongs to the authenticated
+    user namespace. One user must not be able to reserve another
+    user's future key or cause their request to fail."""
+    user_a = await _create_user(db_pool, "usage-scope-a@test.com")
+    user_b = await _create_user(db_pool, "usage-scope-b@test.com")
+    request_id = str(uuid.uuid4())
+
+    a = await usage_repository.reserve(app_db_pool, user_a, request_id, "2026-09", allowance=3)
+    b = await usage_repository.reserve(app_db_pool, user_b, request_id, "2026-09", allowance=3)
+
+    assert a.id != b.id
+    assert a.replay is False
+    assert b.replay is False
+    assert await db_pool.fetchval(
+        "SELECT COUNT(*) FROM analysis_usage WHERE request_id = $1", request_id
+    ) == 2
