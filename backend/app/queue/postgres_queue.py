@@ -81,17 +81,31 @@ class PostgresJobQueue(JobQueue):
     async def _enqueue_with_conn(
         self, conn: asyncpg.Connection, job_type: str, payload: Dict[str, Any], request_id: Optional[str]
     ) -> Job:
-        row = await conn.fetchrow(
-            """
-            INSERT INTO jobs (job_type, payload, request_id)
-            VALUES ($1, $2::jsonb, $3)
-            ON CONFLICT (job_type, request_id) WHERE request_id IS NOT NULL DO NOTHING
-            RETURNING id, job_type, payload, request_id, status, created_at
-            """,
-            job_type,
-            json.dumps(payload),
-            request_id,
-        )
+        payload_json = json.dumps(payload)
+        if job_type == "analysis" and request_id is not None:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO jobs (job_type, payload, request_id)
+                VALUES ($1, $2::jsonb, $3)
+                ON CONFLICT (job_type, (payload->>'user_id'), request_id)
+                    WHERE request_id IS NOT NULL AND job_type = 'analysis'
+                DO NOTHING
+                RETURNING id, job_type, payload, request_id, status, created_at
+                """,
+                job_type, payload_json, request_id,
+            )
+        else:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO jobs (job_type, payload, request_id)
+                VALUES ($1, $2::jsonb, $3)
+                ON CONFLICT (job_type, request_id)
+                    WHERE request_id IS NOT NULL AND job_type <> 'analysis'
+                DO NOTHING
+                RETURNING id, job_type, payload, request_id, status, created_at
+                """,
+                job_type, payload_json, request_id,
+            )
         if row is not None:
             return _row_to_job(row)
 
@@ -99,12 +113,18 @@ class PostgresJobQueue(JobQueue):
         # exact (job_type, request_id) already exists. Fetch and
         # return it: the idempotency contract is "one logical job
         # per request_id", not "the first caller wins silently".
-        existing = await conn.fetchrow(
-            "SELECT id, job_type, payload, request_id, status, created_at "
-            "FROM jobs WHERE job_type = $1 AND request_id = $2",
-            job_type,
-            request_id,
-        )
+        if job_type == "analysis":
+            existing = await conn.fetchrow(
+                "SELECT id, job_type, payload, request_id, status, created_at "
+                "FROM jobs WHERE job_type = $1 AND request_id = $2 AND payload->>'user_id' = $3",
+                job_type, request_id, str(payload.get("user_id")),
+            )
+        else:
+            existing = await conn.fetchrow(
+                "SELECT id, job_type, payload, request_id, status, created_at "
+                "FROM jobs WHERE job_type = $1 AND request_id = $2",
+                job_type, request_id,
+            )
         return _row_to_job(existing)
 
     async def claim(self, job_type: str, *, visibility_timeout_seconds: int = 300) -> Optional[Job]:
