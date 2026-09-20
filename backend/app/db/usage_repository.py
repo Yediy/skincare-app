@@ -106,7 +106,8 @@ async def reserve(
             )
 
             existing = await conn.fetchrow(
-                "SELECT id, status, attempt_count FROM analysis_usage WHERE request_id = $1", request_id
+                "SELECT id, status, attempt_count FROM analysis_usage WHERE user_id = $1 AND request_id = $2",
+                user_id, request_id,
             )
             if existing is not None:
                 if existing["status"] in (RESERVED, CONSUMED):
@@ -174,7 +175,8 @@ async def reserve(
                 # lock keys, so not serialized against each other, but
                 # the schema's own UNIQUE(request_id) still catches it.
                 existing = await conn.fetchrow(
-                    "SELECT id, status, attempt_count FROM analysis_usage WHERE request_id = $1", request_id
+                    "SELECT id, status, attempt_count FROM analysis_usage WHERE user_id = $1 AND request_id = $2",
+                    user_id, request_id,
                 )
                 return Reservation(
                     id=existing["id"], status=existing["status"], replay=True,
