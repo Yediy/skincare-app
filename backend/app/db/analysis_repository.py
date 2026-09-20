@@ -78,7 +78,7 @@ async def create_request(
                 INSERT INTO analysis_requests
                     (user_id, request_id, status, usage_reservation_id, home_region, cell_id)
                 VALUES ($1, $2, 'RECEIVED', $3, $4, $5)
-                ON CONFLICT (request_id) DO NOTHING
+                ON CONFLICT (user_id, request_id) DO NOTHING
                 RETURNING id, user_id, request_id, status, attempt_count, created_at
                 """,
                 user_id, request_id, usage_reservation_id, home_region, cell_id,
@@ -86,8 +86,8 @@ async def create_request(
             if row is None:
                 row = await conn.fetchrow(
                     "SELECT id, user_id, request_id, status, attempt_count, created_at "
-                    "FROM analysis_requests WHERE request_id = $1",
-                    request_id,
+                    "FROM analysis_requests WHERE user_id = $1 AND request_id = $2",
+                    user_id, request_id,
                 )
     return dict(row)
 
@@ -154,7 +154,7 @@ async def get_request_by_request_id(pool: asyncpg.Pool, user_id: UUID, request_i
         async with conn.transaction():
             await conn.execute("SELECT set_config('app.current_user_id', $1, true)", str(user_id))
             row = await conn.fetchrow(
-                "SELECT * FROM analysis_requests WHERE request_id = $1", request_id
+                "SELECT * FROM analysis_requests WHERE user_id = $1 AND request_id = $2", user_id, request_id
             )
     return dict(row) if row is not None else None
 
