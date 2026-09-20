@@ -457,3 +457,40 @@ async def test_ordinary_1600px_jpeg_is_accepted(db_pool, app_db_pool):
     result = await service.submit(user_id, request_id, normal_b64)
 
     assert result.status == "QUEUED"
+
+
+async def test_same_request_id_is_independent_across_users(db_pool, app_db_pool):
+    """Client request IDs are per-account idempotency keys, not global
+    names that one account can squat to interfere with another."""
+    user_a = await _create_user_with_consent(db_pool, "sub-scope-a@test.com")
+    user_b = await _create_user_with_consent(db_pool, "sub-scope-b@test.com")
+    request_id = str(uuid.uuid4())
+
+    usage_a = UsagePolicyService(app_db_pool, FreeTierEntitlementService(monthly_allowance=5))
+    usage_b = UsagePolicyService(app_db_pool, FreeTierEntitlementService(monthly_allowance=5))
+    image_store = EphemeralAnalysisImageStore(FakeObjectStorage())
+    queue = PostgresJobQueue(app_db_pool)
+
+    service_a = AnalysisSubmissionService(
+        app_db_pool, usage_policy_service=usage_a, image_store=image_store,
+        job_queue=queue, async_image_storage_enabled=True,
+    )
+    service_b = AnalysisSubmissionService(
+        app_db_pool, usage_policy_service=usage_b, image_store=image_store,
+        job_queue=queue, async_image_storage_enabled=True,
+    )
+
+    # Reuse the test suite's known-good small image fixture/helper input.
+    image_base64 = VALID_IMAGE_B64
+    a = await service_a.submit(user_a, request_id, image_base64)
+    b = await service_b.submit(user_b, request_id, image_base64)
+
+    assert a.analysis_request_id != b.analysis_request_id
+    assert a.replay is False
+    assert b.replay is False
+    assert await db_pool.fetchval(
+        "SELECT COUNT(*) FROM analysis_requests WHERE request_id = $1", request_id
+    ) == 2
+    assert await db_pool.fetchval(
+        "SELECT COUNT(*) FROM jobs WHERE job_type = 'analysis' AND request_id = $1", request_id
+    ) == 2
