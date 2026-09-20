@@ -27,18 +27,18 @@ async def test_enqueue_with_same_request_id_returns_the_same_job(queue):
     """Phase 16's idempotency guarantee: the same logical request,
     submitted twice, produces one logical job -- not two rows."""
     request_id = str(uuid.uuid4())
-    first = await queue.enqueue("analysis", {"attempt": 1}, request_id=request_id)
-    second = await queue.enqueue("analysis", {"attempt": 2}, request_id=request_id)
+    first = await queue.enqueue("analysis", {"user_id": "u1", "attempt": 1}, request_id=request_id)
+    second = await queue.enqueue("analysis", {"user_id": "u1", "attempt": 2}, request_id=request_id)
 
     assert first.id == second.id
     # The second call's differing payload is discarded -- the first
     # enqueue is authoritative, matching ON CONFLICT DO NOTHING.
-    assert second.payload == {"attempt": 1}
+    assert second.payload == {"user_id": "u1", "attempt": 1}
 
 
 async def test_enqueue_with_same_request_id_but_different_job_type_are_independent(queue):
     request_id = str(uuid.uuid4())
-    a = await queue.enqueue("analysis", {}, request_id=request_id)
+    a = await queue.enqueue("analysis", {"user_id": "u1"}, request_id=request_id)
     b = await queue.enqueue("export", {}, request_id=request_id)
     assert a.id != b.id
 
@@ -156,11 +156,11 @@ async def test_reenqueue_after_failure_with_same_request_id_returns_the_failed_j
     wanting a genuinely new attempt after a failure must use a new
     request_id -- retry policy is deliberately left to the caller."""
     request_id = str(uuid.uuid4())
-    job = await queue.enqueue("analysis", {}, request_id=request_id)
+    job = await queue.enqueue("analysis", {"user_id": "u1"}, request_id=request_id)
     claimed = await queue.claim("analysis")
     await queue.fail(job.id, claimed.claim_token, "boom")
 
-    retried = await queue.enqueue("analysis", {}, request_id=request_id)
+    retried = await queue.enqueue("analysis", {"user_id": "u1"}, request_id=request_id)
     assert retried.id == job.id
     assert retried.status == "failed"
 
