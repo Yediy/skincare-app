@@ -228,9 +228,20 @@ class RevenueCatAPIClient:
         return items
 
 
-def _find_entitlement(items: List[Dict[str, Any]], entitlement_identifier: str) -> Optional[Dict[str, Any]]:
+def _find_active_entitlement_by_resource_id(
+    items: List[Dict[str, Any]], entitlement_resource_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Matches against RevenueCat API v2's `entitlement_id` field, which
+    is RevenueCat's INTERNAL entitlement resource ID (e.g.
+    "entla1b2c3d4e5") -- never the human/business lookup key (e.g.
+    "premium", `settings.revenuecat_entitlement_id`). The two are
+    distinct RevenueCat identifiers for the same entitlement resource;
+    a lookup key can never legitimately appear in this field on a real
+    RevenueCat response, so this function must never be called with
+    one -- see the module docstring and Settings.
+    revenuecat_entitlement_resource_id."""
     for item in items:
-        if isinstance(item, dict) and item.get("entitlement_id") == entitlement_identifier:
+        if isinstance(item, dict) and item.get("entitlement_id") == entitlement_resource_id:
             return item
     return None
 
@@ -268,11 +279,25 @@ class RevenueCatReconciliationService:
         api_client: RevenueCatAPIClient,
         *,
         entitlement_identifier: str,
+        entitlement_resource_id: str,
         environment: str,
     ):
+        # entitlement_identifier: the local/business lookup key (e.g.
+        # "premium") -- used ONLY for reading/writing the local
+        # `user_entitlements` projection, never for interpreting a
+        # RevenueCat v2 API response.
+        #
+        # entitlement_resource_id: RevenueCat's own internal entitlement
+        # resource ID (e.g. "entla1b2c3d4e5") -- used ONLY to match
+        # against `active_entitlements[].entitlement_id` in the remote
+        # response. Deliberately a required, separate parameter (not
+        # defaulted to entitlement_identifier) so this constructor can
+        # never be called with an ambiguous single identifier again --
+        # see _find_active_entitlement_by_resource_id.
         self._pool = pool
         self._api_client = api_client
         self._entitlement_identifier = entitlement_identifier
+        self._entitlement_resource_id = entitlement_resource_id
         self._environment = environment
 
     async def reconcile_user(self, user_id: UUID) -> ReconciliationOutcome:
@@ -311,7 +336,7 @@ class RevenueCatReconciliationService:
             observability_events.reconciliation_failure(user_id=str(user_id), error_code=e.error_code)
             raise
 
-        remote_entitlement = _find_entitlement(items, self._entitlement_identifier)
+        remote_entitlement = _find_active_entitlement_by_resource_id(items, self._entitlement_resource_id)
         remote_active = remote_entitlement is not None
 
         if local_active == remote_active:

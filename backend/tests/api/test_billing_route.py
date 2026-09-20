@@ -22,6 +22,12 @@ from app.domain.entitlement import current_period_key
 from app.domain.revenuecat_reconciliation_service import ReconciliationAPIError
 
 ENTITLEMENT_ID = "premium"
+# RevenueCat's own internal entitlement resource ID -- distinct from
+# ENTITLEMENT_ID (the lookup key). Used only in fake RevenueCat v2
+# responses below and as the configured
+# settings.revenuecat_entitlement_resource_id, never for local
+# reads/writes.
+ENTITLEMENT_RESOURCE_ID = "entl_test_premium_123"
 
 
 async def _signup_login(client, email):
@@ -45,9 +51,10 @@ def _default_billing_disabled(monkeypatch):
     monkeypatch.setattr(settings, "revenuecat_billing_enabled", False)
 
 
-def _enable_billing(monkeypatch, *, free_allowance=3, paid_allowance=100):
+def _enable_billing(monkeypatch, *, free_allowance=3, paid_allowance=100, entitlement_resource_id=ENTITLEMENT_RESOURCE_ID):
     monkeypatch.setattr(settings, "revenuecat_billing_enabled", True)
     monkeypatch.setattr(settings, "revenuecat_entitlement_id", ENTITLEMENT_ID)
+    monkeypatch.setattr(settings, "revenuecat_entitlement_resource_id", entitlement_resource_id)
     monkeypatch.setattr(settings, "revenuecat_api_key", "test-only-key")
     monkeypatch.setattr(settings, "revenuecat_project_id", "test-only-project")
     monkeypatch.setattr(settings, "revenuecat_free_tier_allowance", free_allowance)
@@ -220,6 +227,31 @@ async def test_sync_disabled_returns_503(client):
     assert response.status_code == 503
 
 
+async def test_sync_fails_closed_when_entitlement_resource_id_is_unset(client, monkeypatch):
+    """Billing enabled but REVENUECAT_ENTITLEMENT_RESOURCE_ID missing
+    must never fall back to calling RevenueCat with an ambiguous
+    entitlement configuration (e.g. the lookup key) -- it fails closed
+    with a controlled 503 instead, before any RevenueCat call is made."""
+    _enable_billing(monkeypatch, entitlement_resource_id=None)
+    headers = await _signup_login(client, "billing-sync-resource-id-unset@test.com")
+    response = await client.post("/api/v2/billing/sync", headers=headers)
+    assert response.status_code == 503
+
+
+async def test_sync_wrong_resource_id_does_not_grant_access(client, monkeypatch, billing_db_pool):
+    """A remote active entitlement for an unrelated internal RevenueCat
+    resource ID must not activate local premium access through the
+    sync route."""
+    _enable_billing(monkeypatch, paid_allowance=100)
+    fake = _FakeAPIClient(items=[{"entitlement_id": "entl_other_product", "expires_at": None}])
+    _patch_fake_api_client(monkeypatch, fake)
+    headers = await _signup_login(client, "billing-sync-wrong-resource-id@test.com")
+
+    response = await client.post("/api/v2/billing/sync", headers=headers)
+    assert response.status_code == 200
+    assert response.json()["has_premium_access"] is False
+
+
 async def test_sync_accepts_no_arbitrary_user_id(client, monkeypatch):
     """The route has no body schema that accepts a user/app_user_id
     field at all -- any JSON body sent is simply ignored, never
@@ -241,7 +273,7 @@ async def test_sync_accepts_no_arbitrary_user_id(client, monkeypatch):
 
 async def test_sync_reconciles_only_the_authenticated_user(client, monkeypatch, billing_db_pool):
     _enable_billing(monkeypatch, paid_allowance=100)
-    fake = _FakeAPIClient(items=[{"entitlement_id": ENTITLEMENT_ID, "expires_at": None}])
+    fake = _FakeAPIClient(items=[{"entitlement_id": ENTITLEMENT_RESOURCE_ID, "expires_at": None}])
     _patch_fake_api_client(monkeypatch, fake)
 
     headers_a = await _signup_login(client, "billing-sync-target-a@test.com")
@@ -266,7 +298,7 @@ async def test_sync_uses_the_billing_pool(client, monkeypatch, billing_db_pool):
     separate write path -- the route never constructs its own
     connection to a different role."""
     _enable_billing(monkeypatch, paid_allowance=100)
-    fake = _FakeAPIClient(items=[{"entitlement_id": ENTITLEMENT_ID, "expires_at": None}])
+    fake = _FakeAPIClient(items=[{"entitlement_id": ENTITLEMENT_RESOURCE_ID, "expires_at": None}])
     _patch_fake_api_client(monkeypatch, fake)
     headers = await _signup_login(client, "billing-sync-uses-pool@test.com")
     user_id = await _user_id_for(client, headers)

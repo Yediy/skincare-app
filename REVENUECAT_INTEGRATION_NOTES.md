@@ -276,13 +276,33 @@ documented resource is a separate, dedicated endpoint:
   that don't -- since every request carries the RevenueCat API key in
   an `Authorization` header, a malformed or compromised response must
   never be able to redirect pagination, and that header, to an
-  arbitrary host. The configured entitlement is "active" iff its
-  `entitlement_id` appears in `items`; `expires_at` (milliseconds) is
-  the only other field this pass relies on. **Does not** depend on
-  fabricated fields the previous version assumed -- `active_entitlements.
-  items` (wrong nesting), `expiration_at_ms` (wrong key), `gives_access`,
-  or `auto_renewal_status` -- none of those exist on this endpoint's
-  documented response.
+  arbitrary host.
+- **`entitlement_id` on this endpoint is RevenueCat's INTERNAL
+  entitlement resource ID, e.g. `"entla1b2c3d4e5"` -- never the human/
+  business lookup key (`settings.revenuecat_entitlement_id`, e.g.
+  `"premium"`).** These are two distinct RevenueCat identifiers for the
+  same entitlement resource (the entitlement resource itself has both
+  `id` = `"entla1b2c3d4e5"` and `lookup_key` = `"premium"`). Independent
+  review found the original version of this pass compared this field
+  directly against `settings.revenuecat_entitlement_id` -- comparing
+  `entla...` against `"premium"`, which can never match, so
+  reconciliation could never actually detect an active entitlement
+  through this endpoint. Fixed: `settings.
+  revenuecat_entitlement_resource_id` (a separate, required-when-
+  billing-enabled config value, obtained from the RevenueCat dashboard/
+  API, never defaulted to `"premium"`) is what this endpoint's
+  `entitlement_id` is compared against
+  (`_find_active_entitlement_by_resource_id` in
+  `app/domain/revenuecat_reconciliation_service.py`); the local
+  `user_entitlements` projection continues to be read/written keyed by
+  `settings.revenuecat_entitlement_id` exactly as before. The configured
+  entitlement is "active" iff `active_entitlements[].entitlement_id`
+  equals `settings.revenuecat_entitlement_resource_id`; `expires_at`
+  (milliseconds) is the only other field this pass relies on. **Does
+  not** depend on fabricated fields the previous version assumed --
+  `active_entitlements.items` (wrong nesting), `expiration_at_ms` (wrong
+  key), `gives_access`, or `auto_renewal_status` -- none of those exist
+  on this endpoint's documented response.
 - **Renewal state (`will_renew`) is not in this response at all.**
   Reconciliation never fabricates `will_renew=true` from a response
   that doesn't say so -- correcting a projection to `ACTIVE` preserves

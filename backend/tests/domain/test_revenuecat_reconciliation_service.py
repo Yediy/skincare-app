@@ -22,6 +22,11 @@ from app.domain.revenuecat_reconciliation_service import (
 )
 
 ENTITLEMENT_ID = "premium"
+# RevenueCat's own internal entitlement resource ID -- a distinct value
+# from ENTITLEMENT_ID (the lookup key) used ONLY in the fake remote
+# API responses below (matching the real active_entitlements shape),
+# never for local reads/writes.
+ENTITLEMENT_RESOURCE_ID = "entl_test_premium_123"
 T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
@@ -54,20 +59,23 @@ class FakeAPIClient:
         return self._items
 
 
-def _active_entitlement_item(expires_at: datetime) -> dict:
+def _active_entitlement_item(expires_at: datetime, *, entitlement_id: str = ENTITLEMENT_RESOURCE_ID) -> dict:
     """Real documented shape: entitlement_id + expires_at (ms) --
     never gives_access/auto_renewal_status, which the real endpoint
-    does not document."""
+    does not document. `entitlement_id` here is RevenueCat's own
+    internal resource ID on a real response, so it defaults to
+    ENTITLEMENT_RESOURCE_ID, never the lookup key."""
     return {
         "object": "customer.active_entitlement",
-        "entitlement_id": ENTITLEMENT_ID,
+        "entitlement_id": entitlement_id,
         "expires_at": int(expires_at.timestamp() * 1000),
     }
 
 
-def _service(pool, api_client):
+def _service(pool, api_client, *, entitlement_resource_id=ENTITLEMENT_RESOURCE_ID):
     return RevenueCatReconciliationService(
-        pool, api_client, entitlement_identifier=ENTITLEMENT_ID, environment="PRODUCTION",
+        pool, api_client, entitlement_identifier=ENTITLEMENT_ID,
+        entitlement_resource_id=entitlement_resource_id, environment="PRODUCTION",
     )
 
 
@@ -115,6 +123,72 @@ async def test_reconciliation_detects_and_repairs_missed_purchase(db_pool, billi
     row = await revenuecat_repository.get_entitlement(billing_db_pool, user_id, ENTITLEMENT_ID, "revenuecat", "PRODUCTION")
     assert row["status"] == "ACTIVE"
     assert row["expires_at"] == expires
+
+
+async def test_real_v2_resource_id_shape_activates_local_lookup_key_projection(db_pool, billing_db_pool):
+    """Regression for the entitlement-id/resource-id conflation bug:
+    a real documented v2 response (`entitlement_id` = RevenueCat's
+    internal resource ID, e.g. "entl_test_premium_123") must activate
+    the local projection, which stays keyed by the lookup key
+    ("premium"), never by the resource ID itself."""
+    user_id = await _create_user(db_pool, "recon-real-v2-shape@test.com")
+    expires = T0 + timedelta(days=30)
+    api_client = FakeAPIClient(
+        items=[_active_entitlement_item(expires, entitlement_id=ENTITLEMENT_RESOURCE_ID)]
+    )
+
+    outcome = await _service(
+        billing_db_pool, api_client, entitlement_resource_id=ENTITLEMENT_RESOURCE_ID,
+    ).reconcile_user(user_id)
+
+    assert outcome.remote_active is True
+    assert outcome.corrected is True
+
+    row = await revenuecat_repository.get_entitlement(billing_db_pool, user_id, ENTITLEMENT_ID, "revenuecat", "PRODUCTION")
+    assert row is not None  # local row is keyed by the lookup key, "premium"
+    assert row["status"] == "ACTIVE"
+
+
+async def test_lookup_key_in_remote_entitlement_id_field_is_not_accepted(db_pool, billing_db_pool):
+    """Guards against the fake HTTP-contract fixture creeping back in:
+    a remote item whose `entitlement_id` is the lookup key itself
+    ("premium") -- never a real shape RevenueCat's v2 API actually
+    returns -- must NOT match the configured resource ID, even though
+    it's the correct entitlement's identifier under the OTHER
+    (lookup-key) identity system."""
+    user_id = await _create_user(db_pool, "recon-lookup-key-not-accepted@test.com")
+    api_client = FakeAPIClient(
+        items=[_active_entitlement_item(T0 + timedelta(days=30), entitlement_id=ENTITLEMENT_ID)]
+    )
+
+    outcome = await _service(
+        billing_db_pool, api_client, entitlement_resource_id=ENTITLEMENT_RESOURCE_ID,
+    ).reconcile_user(user_id)
+
+    assert outcome.remote_active is False
+
+    row = await revenuecat_repository.get_entitlement(billing_db_pool, user_id, ENTITLEMENT_ID, "revenuecat", "PRODUCTION")
+    assert row is None  # no access was granted
+
+
+async def test_wrong_internal_entitlement_resource_id_does_not_grant_access(db_pool, billing_db_pool):
+    """A remote active entitlement for an unrelated RevenueCat product
+    (a different internal resource ID) must not activate local
+    "premium" access, even though some entitlement is active for this
+    customer."""
+    user_id = await _create_user(db_pool, "recon-wrong-resource-id@test.com")
+    api_client = FakeAPIClient(
+        items=[_active_entitlement_item(T0 + timedelta(days=30), entitlement_id="entl_other_product")]
+    )
+
+    outcome = await _service(
+        billing_db_pool, api_client, entitlement_resource_id=ENTITLEMENT_RESOURCE_ID,
+    ).reconcile_user(user_id)
+
+    assert outcome.remote_active is False
+
+    row = await revenuecat_repository.get_entitlement(billing_db_pool, user_id, ENTITLEMENT_ID, "revenuecat", "PRODUCTION")
+    assert row is None
 
 
 async def test_reconciliation_preserves_existing_will_renew_never_fabricates_true(db_pool, billing_db_pool):
